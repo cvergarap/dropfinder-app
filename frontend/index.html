@@ -13,6 +13,7 @@
     <button class="tab active" data-view="search">Buscar productos</button>
     <button class="tab" data-view="imports">Mis productos <span id="importsCount" class="pill">0</span></button>
     <button class="tab" data-view="alerts">Alertas <span id="alertsCount" class="pill warn">0</span></button>
+    <button class="tab" data-view="suppliers">Proveedores</button>
     <button class="tab" data-view="settings">Reglas de precio</button>
   </nav>
 </header>
@@ -40,6 +41,7 @@
     <div class="layout">
       <aside id="filters" class="filters">
         <div class="filters-head"><h3>Filtros</h3><button type="button" id="resetFilters" class="link">Limpiar</button></div>
+        <details open><summary>Origen</summary><div id="f-source" class="checks"></div></details>
         <details open><summary>Categoría</summary><div id="f-category" class="checks"></div></details>
         <details open><summary>Proveedor</summary><div id="f-supplier" class="checks"></div></details>
         <details><summary>Almacén (país)</summary><div id="f-warehouse" class="checks"></div></details>
@@ -86,6 +88,33 @@
       <button id="markRead" class="ghost">Marcar todo como leído</button>
     </div>
     <ul id="alertsList" class="alerts"></ul>
+  </section>
+
+  <!-- ======= PROVEEDORES ======= -->
+  <section id="view-suppliers" class="view">
+    <h2>Proveedores</h2>
+    <p class="muted">Catálogos cargados en DropFinder. Los productos <b>Demo</b> son ficticios y sirven solo para probar la app.</p>
+    <div class="table-wrap" style="margin-top:14px"><table class="table">
+      <thead><tr><th>Proveedor</th><th>Origen</th><th class="num">Productos</th><th class="num">Importados</th><th>Actualizado</th><th></th></tr></thead>
+      <tbody id="suppliersBody"></tbody>
+    </table></div>
+    <div class="row-actions"><button id="deleteDemo" class="ghost danger">Eliminar productos de demostración</button></div>
+
+    <div class="panel">
+      <h3>Cargar catálogo desde CSV</h3>
+      <p class="muted">Sirve para el archivo que te envía un mayorista o para un Excel exportado como CSV.
+        Obligatorias: <code>sku</code>, <code>titulo</code>, <code>costo</code>. Opcionales: <code>categoria</code>, <code>costo_envio</code>,
+        <code>dias_envio</code>, <code>almacen</code>, <code>stock</code>, <code>pedidos</code>, <code>rating</code>, <code>imagen</code>, <code>url</code>, <code>etiquetas</code>.
+        Acepta separador <code>,</code> o <code>;</code> y decimales con coma o punto.
+        <a href="plantilla-proveedor.csv" download>Descargar plantilla</a>.</p>
+      <form id="csvForm" class="csv-form">
+        <label class="field">Nombre del proveedor<input name="supplier" required maxlength="60" placeholder="ej. Mayorista Andes"></label>
+        <label class="field">Archivo CSV<input name="file" type="file" accept=".csv,text/csv,text/plain" required></label>
+        <label class="toggle"><input type="checkbox" name="replace"> Reemplazar catálogo (quita los productos que ya no estén en el archivo)</label>
+        <button class="primary" type="submit">Cargar catálogo</button>
+      </form>
+      <div id="csvResult"></div>
+    </div>
   </section>
 
   <!-- ======= REGLAS ======= -->

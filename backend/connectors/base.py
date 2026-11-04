@@ -22,6 +22,7 @@ class NormalizedProduct:
     rating: float
     reviews: int
     image: str = ""
+    product_url: str = ""      # ficha original del producto en el proveedor
     tags: list[str] = field(default_factory=list)
 
     def to_row(self) -> dict:

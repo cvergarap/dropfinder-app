@@ -86,7 +86,23 @@ El vendedor necesita responder rápido: *"¿qué producto puedo vender con marge
 | Punto de equilibrio | `(costo_total + 0,30) / (1 − 0,029)` |
 | Score ganador (0–100) | Ponderación de pedidos (log), tendencia 7 días, rating, margen y velocidad de envío |
 
-### 2.4 Riesgos / decisiones
+### 2.4 Acceso a datos de proveedores
+
+| Fuente | Costo de la API | Condición |
+|---|---|---|
+| CJ Dropshipping | Gratis | Registro y API key; se paga solo al comprar productos |
+| AliExpress Open Platform | Gratis | Requiere aprobación como desarrollador |
+| Amazon PA‑API | Gratis | Requiere ser afiliado con ventas calificadas |
+| APIs de terceros (RapidAPI, Apify…) | De pago | Datos ya extraídos de AliExpress/Amazon/TikTok |
+| CSV / Excel de un mayorista | Gratis | El proveedor envía su catálogo |
+
+**Scraping**: técnicamente posible, pero AliExpress y Amazon lo prohíben en sus términos de uso, tienen
+protección anti‑bots (captchas, bloqueo de IPs) y los scrapers se rompen con cada cambio de diseño.
+No se adopta como fuente principal. Casos aceptables: sitios que lo permiten (robots.txt y términos)
+o catálogos que se publican a propósito, como `/products.json` de tiendas Shopify. La legalidad
+depende del país y del uso; validar con el área legal.
+
+### 2.5 Riesgos / decisiones
 - **Acceso a datos**: AliExpress/Amazon restringen scraping; usar APIs oficiales (AliExpress Open Platform, CJ Dropshipping API, Amazon PA‑API) o feeds de proveedores privados. **Este es el principal riesgo legal y técnico.**
 - **Escala de búsqueda**: SQLite basta para un MVP; para millones de productos se requiere Elasticsearch/OpenSearch o Postgres + `pg_trgm`.
 - **Frescura**: el monitoreo requiere colas (Celery/BullMQ) y límites de tasa por proveedor.
@@ -107,15 +123,19 @@ El vendedor necesita responder rápido: *"¿qué producto puedo vender con marge
 | RF‑07 | Importar producto a "Mis productos" (drafts) con precio de venta editable. | ✅ |
 | RF‑08 | Monitor de precio/stock: job que re‑consulta al proveedor y genera alertas (subida de costo, sin stock, margen negativo). | ✅ (proveedor simulado) |
 | RF‑09 | Capa de conectores de proveedor intercambiable (`SupplierConnector`). | ✅ (mock + esqueleto CJ) |
+| RF‑13 | Cargar catálogo de un proveedor desde CSV (alta, actualización, reemplazo) con alertas sobre productos importados. | ✅ |
+| RF‑14 | Enlace a la ficha original del producto en el proveedor e imagen real (o ilustración local). | ✅ |
+| RF‑15 | Identificar y eliminar productos de demostración; filtro por origen (demo / CSV / API). | ✅ |
 | RF‑10 | Publicación en tiendas (Shopify) y fulfillment automático de pedidos. | ⏳ Fase 2 |
 | RF‑11 | Señales de demanda externas (TikTok/Facebook ads). | ⏳ Fase 3 |
 | RF‑12 | Autenticación multiusuario y planes. | ⏳ Fase 2 |
 
 ### 3.2 Modelo de datos
 ```
-products(id, supplier, supplier_sku, title, category, tags, image,
-         cost, shipping_cost, shipping_days, warehouse, stock,
+products(id, supplier, supplier_sku, source[mock|csv|api], title, category, tags, image,
+         product_url, cost, shipping_cost, shipping_days, warehouse, stock,
          orders, orders_7d, orders_prev_7d, rating, reviews, updated_at)
+         UNIQUE(supplier, supplier_sku)
 
 imported_products(id, product_id → products.id, title, sell_price,
                   last_cost, last_stock, status[draft|active], created_at)
@@ -138,6 +158,9 @@ settings(key, value)   -- multiplier, fixed_add, fee_pct, fee_fixed
 | DELETE | `/api/imports/{id}` | Quitar |
 | POST | `/api/monitor/run` | Ejecuta el monitor de precio/stock |
 | GET | `/api/alerts` | Alertas |
+| GET | `/api/suppliers` | Proveedores cargados (origen, cantidad, importados) |
+| POST | `/api/catalog/csv` `{supplier, csv, replace?}` | Cargar o actualizar catálogo CSV |
+| DELETE | `/api/catalog?source=mock` · `?source=csv&supplier=` | Eliminar demo o catálogo de un proveedor (conserva importados) |
 
 ### 3.4 Arquitectura del MVP
 - **Backend**: Python 3 (solo librería estándar) — `http.server` + `sqlite3`. Cero dependencias para que corra en cualquier lado.

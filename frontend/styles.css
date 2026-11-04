@@ -110,3 +110,23 @@ dialog::backdrop { background: rgb(0 0 0 / .45); }
   .detail { grid-template-columns: 1fr; } .detail img { max-height: 240px; }
   .grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
 }
+
+/* ---- v2: demo, enlaces al proveedor, pestaña Proveedores ---- */
+a { color: var(--primary); }
+.badge.demo { left: auto; right: 8px; bottom: 8px; top: auto; background: rgb(100 116 139 / .85); letter-spacing: .05em; }
+.chip.demo-chip { background: #f1f5f9; color: #475569; }
+a.btn { display: inline-block; text-align: center; text-decoration: none; color: var(--primary); font-weight: 600; align-self: flex-start;
+  background: var(--surface); border: 1px solid var(--primary); padding: 7px 14px; border-radius: 8px; }
+a.btn:hover { background: var(--chip); }
+.note { margin: 0; padding: 8px 10px; border-radius: 8px; background: var(--chip); font-size: 13px; color: var(--muted); }
+button.danger { color: var(--bad); border-color: var(--bad); }
+.row-actions { display: flex; justify-content: flex-end; margin: 10px 0 24px; }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; }
+.panel h3 { margin-bottom: 6px; }
+.csv-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; align-items: end; margin-top: 14px; }
+.csv-form .toggle { grid-column: 1 / -1; }
+.csv-form button { justify-self: start; }
+.result { margin-top: 14px; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border); }
+.result.ok { border-color: var(--good); } .result.err { border-color: var(--bad); color: var(--bad); }
+.result small { color: var(--muted); } .result ul { margin: 6px 0 0; font-size: 13px; }
+code { background: var(--chip); padding: 0 4px; border-radius: 4px; font-size: 12px; }

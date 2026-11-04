@@ -93,5 +93,54 @@ class ApiTest(unittest.TestCase):
         self.assertTrue(alerts)
 
 
+    def test_csv_upload_replace_and_alerts(self):
+        csv1 = ("sku;titulo;costo;categoria;stock;url;imagen\n"
+                "T-1;Taza térmica;5,50;Hogar;10;https://prov.example/t1;javascript:alert(1)\n"
+                "T-2;Plato hondo;3;Hogar;5;;\n"
+                "T-3;;3;Hogar;5;;\n")
+        status, r = call("POST", "/api/catalog/csv", {"supplier": "Mayorista Test", "csv": csv1})
+        self.assertEqual(status, 200, r)
+        self.assertEqual((r["new"], r["updated"]), (2, 0))
+        self.assertEqual(len(r["errors"]), 1)                     # fila sin título
+        _, d = call("GET", "/api/products?q=taza%20termica&source=csv&in_stock=0")
+        self.assertEqual(d["total"], 1)
+        p = d["items"][0]
+        self.assertEqual(p["product_url"], "https://prov.example/t1")
+        self.assertEqual(p["image"], "")                          # URL no http(s) descartada
+        call("POST", "/api/imports", {"product_id": p["id"], "sell_price": 20})
+
+        # Re-subida: T-1 sube de costo, T-2 desaparece (se borra), T-9 es nuevo
+        csv2 = "sku,titulo,costo,stock\nT-1,Taza térmica,9.00,10\nT-9,Vaso,2,3\n"
+        _, r = call("POST", "/api/catalog/csv", {"supplier": "Mayorista Test", "csv": csv2, "replace": True})
+        self.assertEqual((r["new"], r["updated"], r["removed"]), (1, 1, 1))
+        self.assertGreaterEqual(r["alerts"], 1)
+        _, alerts = call("GET", "/api/alerts")
+        self.assertTrue(any(a["type"] == "price_up" and "Taza" in a["title"] for a in alerts))
+
+        # El monitor no simula productos CSV
+        _, m = call("POST", "/api/monitor/run")
+        self.assertGreaterEqual(m["skipped"], 1)
+
+        # Borrar el catálogo conserva el producto importado
+        _, r = call("DELETE", "/api/catalog?source=csv&supplier=Mayorista%20Test")
+        self.assertEqual(r["deleted"], 1)
+        _, sups = call("GET", "/api/suppliers")
+        self.assertIn(("Mayorista Test", 1), [(s["supplier"], s["products"]) for s in sups])
+
+    def test_csv_missing_columns(self):
+        status, r = call("POST", "/api/catalog/csv", {"supplier": "X", "csv": "nombre;stock\na;1\n"})
+        self.assertEqual(status, 400)
+        self.assertIn("sku", r["error"])
+
+    def test_zz_delete_demo_not_reseeded(self):
+        _, r = call("DELETE", "/api/catalog?source=mock")
+        self.assertGreater(r["deleted"], 0)
+        db.init_db(seed_size=400)                                 # simula reiniciar el servidor
+        _, d = call("GET", "/api/products?source=mock&in_stock=0&page_size=100")
+        _, imports = call("GET", "/api/imports")
+        mock_imported = sum(1 for i in imports if i["source"] == "mock")
+        self.assertEqual(d["total"], mock_imported)               # solo quedan los importados
+
+
 if __name__ == "__main__":
     unittest.main()

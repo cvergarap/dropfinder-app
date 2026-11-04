@@ -11,17 +11,25 @@ from metrics import DEFAULT_SETTINGS
 
 DB_PATH = os.environ.get("DROPFINDER_DB", os.path.join(os.path.dirname(__file__), "dropfinder.db"))
 
-SCHEMA = """
+SCHEMA_VERSION = 2
+
+PRODUCTS_TABLE = """
 CREATE TABLE IF NOT EXISTS products (
   id INTEGER PRIMARY KEY,
-  supplier TEXT NOT NULL, supplier_sku TEXT NOT NULL UNIQUE,
+  supplier TEXT NOT NULL, supplier_sku TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'mock',          -- mock | csv | api
   title TEXT NOT NULL, category TEXT NOT NULL, tags TEXT, image TEXT,
+  product_url TEXT NOT NULL DEFAULT '',         -- enlace a la ficha original en el proveedor
   cost REAL NOT NULL, shipping_cost REAL NOT NULL, shipping_days INTEGER NOT NULL,
   warehouse TEXT NOT NULL, stock INTEGER NOT NULL,
   orders INTEGER NOT NULL, orders_7d INTEGER NOT NULL, orders_prev_7d INTEGER NOT NULL,
   rating REAL NOT NULL, reviews INTEGER NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  UNIQUE (supplier, supplier_sku)
 );
+"""
+
+SCHEMA = PRODUCTS_TABLE + """
 CREATE INDEX IF NOT EXISTS ix_products_cat ON products(category);
 CREATE INDEX IF NOT EXISTS ix_products_sup ON products(supplier);
 
@@ -40,7 +48,12 @@ CREATE TABLE IF NOT EXISTS alerts (
 );
 
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
+
+PRODUCT_COLS = ["supplier", "supplier_sku", "source", "title", "category", "tags", "image", "product_url",
+                "cost", "shipping_cost", "shipping_days", "warehouse", "stock", "orders", "orders_7d",
+                "orders_prev_7d", "rating", "reviews", "updated_at"]
 
 
 def now() -> str:
@@ -73,22 +86,70 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def _migrate_v1_to_v2(conn) -> None:
+    """v1: supplier_sku UNIQUE global, sin source/product_url. Se reconstruye la tabla conservando los ids
+    (así los productos importados y sus alertas siguen apuntando al mismo producto)."""
+    # Procedimiento recomendado por SQLite: crear nueva → copiar → borrar vieja → renombrar nueva.
+    # (Renombrar la vieja reescribiría los REFERENCES de imported_products.) Requiere foreign_keys OFF.
+    conn.execute(PRODUCTS_TABLE.replace("IF NOT EXISTS products", "products_new"))
+    old = [c for c in ("id", *PRODUCT_COLS) if c not in ("source", "product_url")]
+    conn.execute(f"INSERT INTO products_new({','.join(old)}, source, product_url) "
+                 f"SELECT {','.join(old)}, 'mock', '' FROM products")
+    conn.execute("DROP TABLE products")
+    conn.execute("ALTER TABLE products_new RENAME TO products")
+    # Las imágenes de ejemplo ahora se generan en el navegador (sin depender de internet)
+    conn.execute("UPDATE products SET image = '' WHERE image LIKE 'https://placehold.co/%'")
+
+
+def upsert_products(conn, products, source: str) -> tuple[int, int]:
+    """Inserta o actualiza productos normalizados. Devuelve (nuevos, actualizados)."""
+    ts = now()
+    new = upd = 0
+    for p in products:
+        r = p.to_row()
+        r.update(source=source, updated_at=ts)
+        exists = conn.execute("SELECT 1 FROM products WHERE supplier = ? AND supplier_sku = ?",
+                              (r["supplier"], r["supplier_sku"])).fetchone()
+        conn.execute(
+            f"INSERT INTO products({','.join(PRODUCT_COLS)}) VALUES ({','.join(':' + c for c in PRODUCT_COLS)}) "
+            f"ON CONFLICT(supplier, supplier_sku) DO UPDATE SET "
+            + ", ".join(f"{c} = excluded.{c}" for c in PRODUCT_COLS if c not in ("supplier", "supplier_sku")),
+            r)
+        if exists:
+            upd += 1
+        else:
+            new += 1
+    return new, upd
+
+
 def init_db(seed_size: int = 1500) -> None:
-    with connect() as conn:
+    conn = connect()
+    try:
+        has_products = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'products'").fetchone()
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if has_products and version < 2:
+            conn.execute("PRAGMA foreign_keys = OFF")   # debe hacerse fuera de una transacción
+            try:
+                _migrate_v1_to_v2(conn)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(SCHEMA)
-        for k, v in DEFAULT_SETTINGS.items():
-            conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, json.dumps(v)))
-        if conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
-            ts = now()
-            rows = []
-            for p in MockSupplierConnector(size=seed_size).iter_catalog():
-                r = p.to_row()
-                r["updated_at"] = ts
-                rows.append(r)
-            cols = list(rows[0])
-            conn.executemany(
-                f"INSERT INTO products({','.join(cols)}) VALUES ({','.join(':' + c for c in cols)})", rows
-            )
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        with conn:
+            for k, v in DEFAULT_SETTINGS.items():
+                conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, json.dumps(v)))
+            # La demo se carga una sola vez: si el usuario la elimina, no vuelve a aparecer al reiniciar.
+            seeded = conn.execute("SELECT 1 FROM meta WHERE key = 'demo_seeded'").fetchone()
+            if not seeded:
+                if conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
+                    upsert_products(conn, MockSupplierConnector(size=seed_size).iter_catalog(), "mock")
+                conn.execute("INSERT INTO meta(key, value) VALUES ('demo_seeded', '1')")
+    finally:
+        conn.close()
 
 
 def get_settings(conn) -> dict:

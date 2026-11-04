@@ -39,8 +39,6 @@ CATALOG = {
                            "Anillo ajustable"], ["de acero", "unisex", "de cuero", "vintage"], (2, 22)),
 }
 
-COLORS = ["e0f2fe", "fce7f3", "dcfce7", "fef9c3", "ede9fe", "ffedd5", "e2e8f0"]
-
 
 class MockSupplierConnector(SupplierConnector):
     name = "mock"
@@ -65,8 +63,6 @@ class MockSupplierConnector(SupplierConnector):
             orders = max(0, min(orders, 250_000))
             base_week = max(0, int(orders * rng.uniform(0.005, 0.04)))
             trend = rng.choice([0.4, 0.7, 0.9, 1.0, 1.1, 1.3, 1.8, 2.6])
-            initials = "".join(w[0] for w in noun.split()[:2]).upper()
-            color = COLORS[i % len(COLORS)]
             yield NormalizedProduct(
                 supplier=supplier,
                 supplier_sku=f"{supplier[:2].upper()}-{100000 + i}",
@@ -82,7 +78,8 @@ class MockSupplierConnector(SupplierConnector):
                 orders_prev_7d=base_week,
                 rating=round(min(5.0, max(2.8, rng.gauss(4.5, 0.35))), 1),
                 reviews=int(orders * rng.uniform(0.05, 0.3)),
-                image=f"https://placehold.co/300x300/{color}/334155?text={initials}",
+                image="",          # la demo no tiene fotos: el navegador genera una ilustración
+                product_url="",    # ni ficha real en el proveedor
                 tags=[category.lower(), noun.lower(), adj.lower()],
             )
 

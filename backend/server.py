@@ -14,7 +14,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import db
-from connectors import MockSupplierConnector
+from connectors import CsvSupplierConnector, MockSupplierConnector
 from connectors.base import PriceStock
 from metrics import DEFAULT_SETTINGS, enrich, profit_for
 
@@ -24,7 +24,9 @@ SORTS = {
     "margin": ("margin", True), "profit": ("profit", True), "price_asc": ("suggested_price", False),
     "price_desc": ("suggested_price", True), "shipping": ("shipping_days", False), "rating": ("rating", True),
 }
-monitor_connector = MockSupplierConnector()
+MAX_BODY = 20 * 1024 * 1024   # 20 MB (catálogos CSV grandes)
+# Fuentes con consulta en vivo de precio/stock. Los CSV se actualizan volviendo a subir el archivo.
+LIVE_CONNECTORS = {"mock": MockSupplierConnector()}
 
 
 class ApiError(Exception):
@@ -52,7 +54,7 @@ def search_products(qs: dict) -> dict:
         for term in q.split():
             where.append("(unaccent(p.title) LIKE ? OR unaccent(p.tags) LIKE ?)")
             args += [f"%{term}%", f"%{term}%"]
-    for key in ("category", "supplier", "warehouse"):
+    for key in ("category", "supplier", "warehouse", "source"):
         vals = [v for v in qs.get(key, []) if v]
         if vals:
             where.append(f"p.{key} IN ({','.join('?' * len(vals))})")
@@ -114,6 +116,7 @@ def facets() -> dict:
             return [{"value": r[0], "count": r[1]} for r in
                     conn.execute(f"SELECT {c}, COUNT(*) FROM products GROUP BY {c} ORDER BY COUNT(*) DESC")]
         return {"category": col("category"), "supplier": col("supplier"), "warehouse": col("warehouse"),
+                "source": col("source"),
                 "total": conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]}
 
 
@@ -148,8 +151,8 @@ def _imported_view(conn, r, s) -> dict:
     return d
 
 
-IMPORT_SQL = ("SELECT i.*, p.cost, p.shipping_cost, p.stock, p.supplier, p.image, p.category, p.shipping_days "
-              "FROM imported_products i JOIN products p ON p.id = i.product_id")
+IMPORT_SQL = ("SELECT i.*, p.cost, p.shipping_cost, p.stock, p.supplier, p.image, p.category, p.shipping_days, "
+              "p.source, p.product_url FROM imported_products i JOIN products p ON p.id = i.product_id")
 
 
 def list_imports() -> list:
@@ -202,39 +205,111 @@ def delete_import(iid: int) -> dict:
     return {"ok": True}
 
 
+def _check_imported(conn, r, new: PriceStock, s: dict, created: list) -> None:
+    """Compara el último estado conocido de un producto importado con el nuevo y genera alertas."""
+    msgs = []
+    if new.cost > r["last_cost"] * 1.05:
+        pct = (new.cost / r["last_cost"] - 1) * 100
+        msgs.append(("price_up", f"El costo subió {pct:.0f}% (${r['last_cost']:.2f} → ${new.cost:.2f})"))
+    elif new.cost < r["last_cost"] * 0.95:
+        msgs.append(("price_down", f"El costo bajó (${r['last_cost']:.2f} → ${new.cost:.2f})"))
+    if new.stock == 0 and r["last_stock"] > 0:
+        msgs.append(("out_of_stock", "El proveedor se quedó sin stock"))
+    elif new.stock > 0 and r["last_stock"] == 0:
+        msgs.append(("back_in_stock", "El producto volvió a tener stock"))
+    profit, _ = profit_for(r["sell_price"], new.cost + new.shipping_cost, s)
+    if profit < 0:
+        msgs.append(("negative_margin", f"Vendes a pérdida: ganancia ${profit:.2f}. Ajusta el precio."))
+    for t, m in msgs:
+        conn.execute("INSERT INTO alerts(imported_id, type, message, created_at) VALUES (?, ?, ?, ?)",
+                     (r["id"], t, m, db.now()))
+        created.append({"imported_id": r["id"], "title": r["title"], "type": t, "message": m})
+    conn.execute("UPDATE imported_products SET last_cost = ?, last_stock = ? WHERE id = ?",
+                 (new.cost, new.stock, r["id"]))
+
+
 def run_monitor() -> dict:
     """Re-consulta precio/stock en el proveedor para cada producto importado y genera alertas."""
-    created = []
+    created, checked, skipped = [], 0, 0
     with db.connect() as conn:
         s = db.get_settings(conn)
-        rows = conn.execute(IMPORT_SQL).fetchall()
-        for r in rows:
-            cur = PriceStock(r["cost"], r["shipping_cost"], r["stock"])
-            new = monitor_connector.get_price_stock(r["supplier"], current=cur)
-            if new is None:
+        for r in conn.execute(IMPORT_SQL).fetchall():
+            connector = LIVE_CONNECTORS.get(r["source"])
+            if connector is None:
+                skipped += 1
                 continue
+            cur = PriceStock(r["cost"], r["shipping_cost"], r["stock"])
+            new = connector.get_price_stock(r["supplier"], current=cur)
+            if new is None:
+                skipped += 1
+                continue
+            checked += 1
             conn.execute("UPDATE products SET cost = ?, shipping_cost = ?, stock = ?, updated_at = ? WHERE id = ?",
                          (new.cost, new.shipping_cost, new.stock, db.now(), r["product_id"]))
-            msgs = []
-            if new.cost > r["last_cost"] * 1.05:
-                pct = (new.cost / r["last_cost"] - 1) * 100
-                msgs.append(("price_up", f"El costo subió {pct:.0f}% (${r['last_cost']:.2f} → ${new.cost:.2f})"))
-            elif new.cost < r["last_cost"] * 0.95:
-                msgs.append(("price_down", f"El costo bajó (${r['last_cost']:.2f} → ${new.cost:.2f})"))
-            if new.stock == 0 and r["last_stock"] > 0:
-                msgs.append(("out_of_stock", "El proveedor se quedó sin stock"))
-            elif new.stock > 0 and r["last_stock"] == 0:
-                msgs.append(("back_in_stock", "El producto volvió a tener stock"))
-            profit, _ = profit_for(r["sell_price"], new.cost + new.shipping_cost, s)
-            if profit < 0:
-                msgs.append(("negative_margin", f"Vendes a pérdida: ganancia ${profit:.2f}. Ajusta el precio."))
-            for t, m in msgs:
-                conn.execute("INSERT INTO alerts(imported_id, type, message, created_at) VALUES (?, ?, ?, ?)",
-                             (r["id"], t, m, db.now()))
-                created.append({"imported_id": r["id"], "title": r["title"], "type": t, "message": m})
-            conn.execute("UPDATE imported_products SET last_cost = ?, last_stock = ? WHERE id = ?",
-                         (new.cost, new.stock, r["id"]))
-    return {"checked": len(rows), "alerts": created}
+            _check_imported(conn, r, new, s, created)
+    return {"checked": checked, "skipped": skipped, "alerts": created}
+
+
+# ---------------------------------------------------------------- proveedores / catálogo
+
+def list_suppliers() -> list:
+    with db.connect() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT p.supplier, p.source, COUNT(*) AS products, COUNT(i.id) AS imported, MAX(p.updated_at) AS updated_at "
+            "FROM products p LEFT JOIN imported_products i ON i.product_id = p.id "
+            "GROUP BY p.supplier, p.source ORDER BY p.source, p.supplier")]
+
+
+def upload_csv(body: dict) -> dict:
+    supplier = str(body.get("supplier") or "").strip()
+    text = body.get("csv")
+    if not supplier or len(supplier) > 60:
+        raise ApiError(400, "Indica el nombre del proveedor (máx. 60 caracteres)")
+    if not isinstance(text, str) or not text.strip():
+        raise ApiError(400, "El archivo CSV está vacío")
+    parsed = CsvSupplierConnector(supplier, text).result
+    if not parsed.products:
+        raise ApiError(400, "; ".join(parsed.errors[:5]) or "No se encontraron productos")
+
+    created_alerts: list = []
+    removed = 0
+    with db.connect() as conn:
+        s = db.get_settings(conn)
+        new, updated = db.upsert_products(conn, parsed.products, "csv")
+        if body.get("replace"):
+            skus = [p.supplier_sku for p in parsed.products]
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS _skus(sku TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM _skus")
+            conn.executemany("INSERT OR IGNORE INTO _skus VALUES (?)", [(k,) for k in skus])
+            gone = "supplier = ? AND source = 'csv' AND supplier_sku NOT IN (SELECT sku FROM _skus)"
+            # Los que ya importaste no se borran: quedan sin stock (y el monitor lo avisa)
+            conn.execute(f"UPDATE products SET stock = 0, updated_at = ? WHERE {gone} "
+                         "AND id IN (SELECT product_id FROM imported_products)", (db.now(), supplier))
+            removed = conn.execute(f"DELETE FROM products WHERE {gone} "
+                                   "AND id NOT IN (SELECT product_id FROM imported_products)", (supplier,)).rowcount
+        # Alertas para los productos importados de este proveedor cuyo costo/stock cambió
+        for r in conn.execute(IMPORT_SQL + " WHERE p.supplier = ? AND p.source = 'csv'", (supplier,)).fetchall():
+            _check_imported(conn, r, PriceStock(r["cost"], r["shipping_cost"], r["stock"]), s, created_alerts)
+    return {"supplier": supplier, "new": new, "updated": updated, "removed": removed,
+            "errors": parsed.errors, "columns": parsed.columns, "alerts": len(created_alerts)}
+
+
+def delete_supplier_catalog(qs: dict) -> dict:
+    """Elimina el catálogo de un proveedor (o la demo completa). Conserva los productos ya importados."""
+    source = qs.get("source", [""])[0]
+    supplier = qs.get("supplier", [""])[0]
+    if source not in ("mock", "csv"):
+        raise ApiError(400, "source debe ser mock o csv")
+    where, args = "source = ?", [source]
+    if supplier:
+        where += " AND supplier = ?"
+        args.append(supplier)
+    elif source != "mock":
+        raise ApiError(400, "Indica el proveedor")
+    with db.connect() as conn:
+        n = conn.execute(f"DELETE FROM products WHERE {where} "
+                         "AND id NOT IN (SELECT product_id FROM imported_products)", args).rowcount
+    return {"deleted": n}
 
 
 def list_alerts() -> list:
@@ -264,6 +339,9 @@ ROUTES = [
     ("DELETE", r"/api/imports/(\d+)", lambda m, qs, b: delete_import(int(m[1]))),
     ("POST", r"/api/monitor/run", lambda m, qs, b: run_monitor()),
     ("GET", r"/api/alerts", lambda m, qs, b: list_alerts()),
+    ("GET", r"/api/suppliers", lambda m, qs, b: list_suppliers()),
+    ("POST", r"/api/catalog/csv", lambda m, qs, b: upload_csv(b)),
+    ("DELETE", r"/api/catalog", lambda m, qs, b: delete_supplier_catalog(qs)),
     ("POST", r"/api/alerts/read", lambda m, qs, b: mark_alerts_read()),
 ]
 
@@ -291,6 +369,8 @@ class Handler(SimpleHTTPRequestHandler):
                 try:
                     body = {}
                     length = int(self.headers.get("Content-Length") or 0)
+                    if length > MAX_BODY:
+                        raise ApiError(413, "Archivo demasiado grande (máx. 20 MB)")
                     if length:
                         body = json.loads(self.rfile.read(length) or b"{}")
                     return self._send_json(200, fn(match, parse_qs(url.query), body))

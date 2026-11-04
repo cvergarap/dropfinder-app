@@ -1,0 +1,4 @@
+sku;titulo;costo;categoria;costo_envio;dias_envio;almacen;stock;pedidos;rating;imagen;url;etiquetas
+MA-001;Lámpara de escritorio LED plegable;8,90;Hogar y cocina;2,50;4;CL;120;350;4,6;;https://ejemplo.com/productos/MA-001;lampara,led,escritorio
+MA-002;Botella térmica de acero 750 ml;5,40;Hogar y cocina;0;3;CL;300;1200;4,8;;https://ejemplo.com/productos/MA-002;botella,termica
+MA-003;Arnés reflectante para perro talla M;4,10;Mascotas;1,90;5;AR;0;80;4,3;;;perro,arnes
