@@ -130,3 +130,58 @@ button.danger { color: var(--bad); border-color: var(--bad); }
 .result.ok { border-color: var(--good); } .result.err { border-color: var(--bad); color: var(--bad); }
 .result small { color: var(--muted); } .result ul { margin: 6px 0 0; font-size: 13px; }
 code { background: var(--chip); padding: 0 4px; border-radius: 4px; font-size: 12px; }
+
+/* ---- v3: moneda, autocompletado, relevancia ---- */
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+.topbar-tools { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.topbar-tools select { padding: 6px 8px; font-weight: 600; }
+.rate-badge { font-size: 12px; white-space: nowrap; }
+.rate-badge.warn { color: var(--warn); }
+
+.ac-wrap { position: relative; flex: 1; min-width: 0; display: flex; }
+.ac-wrap input { flex: 1; min-width: 0; width: 100%; }
+.suggest { position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 20; list-style: none; margin: 0; padding: 4px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 10px 30px rgb(0 0 0 / .14);
+  max-height: 320px; overflow-y: auto; }
+.suggest li { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 7px; cursor: pointer; min-width: 0; }
+.suggest li[aria-selected="true"] { background: var(--chip); }
+.suggest .sg-icon { flex: none; width: 20px; text-align: center; }
+.suggest .sg-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.suggest mark { background: none; color: inherit; font-weight: 700; }
+.suggest .sg-type { flex: none; font-size: 11px; color: var(--muted); background: var(--chip); padding: 1px 7px; border-radius: 999px; }
+
+.search-hint { margin-bottom: 10px; padding: 8px 12px; border-radius: 8px; background: var(--chip); }
+.search-hint a { font-weight: 600; }
+.took { color: var(--muted); font-size: 12px; }
+
+small.vat { display: block; font-size: 11px; font-weight: 400; color: var(--muted); }
+.table td.num small.vat { margin-top: 2px; }
+.table input.price { width: 110px; }
+
+.currency-card { margin-top: 24px; max-width: 900px; }
+.currency-form { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; align-items: end; margin-top: 14px; }
+.currency-form .span-all { grid-column: 1 / -1; }
+.currency-form .small { font-size: 12px; margin-top: -4px; }
+.currency-form .field { margin-bottom: 0; }
+.vat-row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+.field.inline { flex-direction: row; align-items: center; gap: 8px; }
+.field.inline input { width: 90px; }
+.form-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.rate-status { margin-top: 12px; font-size: 13px; }
+.rate-status.warn { color: var(--warn); } .rate-status.info { color: var(--muted); }
+input:disabled, select:disabled { opacity: .55; }
+
+@media (max-width: 800px) {
+  .topbar { gap: 8px 16px; }
+  .topbar nav { order: 3; width: 100%; }
+  .searchbar .ac-wrap { flex-basis: 100%; }
+}
+.kpis b { white-space: nowrap; font-size: 13px; }
+.kpi-label { display: none; font-style: normal; }
+@media (max-width: 420px) { .rate-badge { display: none; } }
+/* Tarjetas angostas (2 columnas en móvil): KPIs en filas para que quepan montos en COP */
+@media (max-width: 520px) {
+  .kpis { grid-template-columns: 1fr; gap: 2px; text-align: left; }
+  .kpis div { display: flex; flex-direction: row-reverse; justify-content: space-between; align-items: baseline; gap: 4px; }
+  .kpi-label { display: inline; }
+}

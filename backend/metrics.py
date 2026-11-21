@@ -44,21 +44,32 @@ def winning_score(orders: int, trend: float, rating: float, margin: float, shipp
     return round(100 * (0.35 * demand + 0.25 * tr + 0.15 * rt + 0.15 * mg + 0.10 * sh))
 
 
-def enrich(p: dict, s: dict) -> dict:
+# Columnas precalculadas en `products`. Cambiar FORMULA_VERSION obliga a recalcularlas al arrancar.
+METRIC_COLS = ("total_cost", "suggested_price", "profit", "margin", "break_even", "trend", "trending", "score")
+FORMULA_VERSION = "1"
+
+
+def compute(p, s: dict) -> dict:
+    """Única fuente de verdad de las métricas de un producto (fila de la BD o dict) según las reglas de precio.
+    `p` necesita cost, shipping_cost, orders, orders_7d, orders_prev_7d, rating y shipping_days."""
     total = round(p["cost"] + p["shipping_cost"], 2)
     price = suggested_price(total, s)
     profit, margin = profit_for(price, total, s)
     tr = trend_pct(p["orders_7d"], p["orders_prev_7d"])
+    return {
+        "total_cost": total,
+        "suggested_price": price,
+        "profit": profit,
+        "margin": margin,
+        "break_even": break_even(total, s),
+        "trend": tr,
+        "trending": tr >= 30 and p["orders_7d"] >= 20,
+        "score": winning_score(p["orders"], tr, p["rating"], margin, p["shipping_days"]),
+    }
+
+
+def enrich(p: dict, s: dict) -> dict:
     p = dict(p)
     p["tags"] = [t for t in (p.get("tags") or "").split(",") if t]
-    p.update(
-        total_cost=total,
-        suggested_price=price,
-        profit=profit,
-        margin=margin,
-        break_even=break_even(total, s),
-        trend=tr,
-        trending=tr >= 30 and p["orders_7d"] >= 20,
-        score=winning_score(p["orders"], tr, p["rating"], margin, p["shipping_days"]),
-    )
+    p.update(compute(p, s))
     return p

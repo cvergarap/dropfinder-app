@@ -142,5 +142,49 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(d["total"], mock_imported)               # solo quedan los importados
 
 
+class CurrencyApiTest(unittest.TestCase):
+    """Rutas /api/currency. La TRM se simula: las pruebas nunca salen a internet."""
+
+    @classmethod
+    def setUpClass(cls):
+        global BASE
+        db.init_db(seed_size=50)
+        cls.srv = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        BASE = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def test_get_put_and_validation(self):
+        status, st = call("GET", "/api/currency")
+        self.assertEqual(status, 200)
+        self.assertIn("COP", st["rates"])
+        status, st = call("PUT", "/api/currency", {"display_currency": "COP", "rate_mode": "manual",
+                                                   "manual_rate": 4000, "hedge_pct": 3})
+        self.assertEqual(status, 200, st)
+        self.assertEqual(st["settings"]["display_currency"], "COP")
+        self.assertAlmostEqual(st["rates"]["COP"], 4120.0, places=2)
+        status, err = call("PUT", "/api/currency", {"display_currency": "EUR"})
+        self.assertEqual(status, 400)
+        self.assertIn("error", err)
+
+    def test_refresh_with_fake_trm(self):
+        import currency
+        original = currency.fetch_trm
+        currency.fetch_trm = lambda *a, **k: {"rate": 3950.5, "date": "2026-11-20",
+                                              "valid_until": "2026-11-20", "source": "trm"}
+        try:
+            call("PUT", "/api/currency", {"rate_mode": "trm", "hedge_pct": 0})
+            status, st = call("POST", "/api/currency/refresh")
+        finally:
+            currency.fetch_trm = original
+        self.assertEqual(status, 200, st)
+        self.assertEqual(st["rate_info"]["source"], "trm")
+        self.assertAlmostEqual(st["rates"]["COP"], 3950.5, places=2)
+
+
 if __name__ == "__main__":
     unittest.main()

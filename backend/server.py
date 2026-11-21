@@ -9,17 +9,25 @@ import json
 import math
 import os
 import re
+import sqlite3
+import threading
+import time
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+import currency
 import db
+import search
 from connectors import CsvSupplierConnector, MockSupplierConnector
 from connectors.base import PriceStock
-from metrics import DEFAULT_SETTINGS, enrich, profit_for
+from metrics import DEFAULT_SETTINGS, profit_for
 
 FRONTEND = os.path.join(os.path.dirname(__file__), "..", "frontend")
+# sort -> (columna, descendente). "relevance" (orden por BM25) solo aplica cuando hay texto de búsqueda;
+# es el orden por defecto si hay `q` y no se pide otro. Sin `q` el orden por defecto es "score".
 SORTS = {
+    "relevance": (None, False),
     "score": ("score", True), "orders": ("orders", True), "trend": ("trend", True),
     "margin": ("margin", True), "profit": ("profit", True), "price_asc": ("suggested_price", False),
     "price_desc": ("suggested_price", True), "shipping": ("shipping_days", False), "rating": ("rating", True),
@@ -47,22 +55,27 @@ def _num(qs, key, cast=float):
 
 # ---------------------------------------------------------------- handlers
 
-def search_products(qs: dict) -> dict:
+def _item(r) -> dict:
+    """Fila de products (con métricas precalculadas) → JSON de la API (mismo formato que antes)."""
+    d = dict(r)
+    d["tags"] = [t for t in (d.get("tags") or "").split(",") if t]
+    d["trending"] = bool(d["trending"])
+    return d
+
+
+def _filters(qs: dict) -> tuple[list, list]:
+    """Filtros de la búsqueda como SQL sobre las columnas (indexadas) de products."""
     where, args = [], []
-    q = db.unaccent(qs.get("q", [""])[0].strip())
-    if q:
-        for term in q.split():
-            where.append("(unaccent(p.title) LIKE ? OR unaccent(p.tags) LIKE ?)")
-            args += [f"%{term}%", f"%{term}%"]
     for key in ("category", "supplier", "warehouse", "source"):
         vals = [v for v in qs.get(key, []) if v]
         if vals:
             where.append(f"p.{key} IN ({','.join('?' * len(vals))})")
             args += vals
     for key, col, op, cast in [
-        ("min_cost", "p.cost + p.shipping_cost", ">=", float), ("max_cost", "p.cost + p.shipping_cost", "<=", float),
+        ("min_cost", "p.total_cost", ">=", float), ("max_cost", "p.total_cost", "<=", float),
         ("min_orders", "p.orders", ">=", int), ("min_rating", "p.rating", ">=", float),
-        ("max_ship_days", "p.shipping_days", "<=", int),
+        ("max_ship_days", "p.shipping_days", "<=", int), ("min_margin", "p.margin", ">=", float),
+        ("min_score", "p.score", ">=", float),
     ]:
         v = _num(qs, key, cast)
         if v is not None:
@@ -70,35 +83,121 @@ def search_products(qs: dict) -> dict:
             args.append(v)
     if qs.get("in_stock", ["0"])[0] == "1":
         where.append("p.stock > 0")
-
-    sql = "SELECT p.*, i.id AS imported_id FROM products p LEFT JOIN imported_products i ON i.product_id = p.id"
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-
-    with db.connect() as conn:
-        s = db.get_settings(conn)
-        items = [enrich(dict(r), s) for r in conn.execute(sql, args)]
-
-    # Filtros sobre métricas derivadas
-    min_margin = _num(qs, "min_margin")
-    if min_margin is not None:
-        items = [p for p in items if p["margin"] >= min_margin]
-    min_score = _num(qs, "min_score")
-    if min_score is not None:
-        items = [p for p in items if p["score"] >= min_score]
     if qs.get("trending", ["0"])[0] == "1":
-        items = [p for p in items if p["trending"]]
+        where.append("p.trending = 1")
+    return where, args
 
-    key, desc = SORTS.get(qs.get("sort", ["score"])[0], SORTS["score"])
-    items.sort(key=lambda p: (p[key], p["id"]), reverse=desc)
 
-    page = max(1, _num(qs, "page", int) or 1)
+def _query(conn, tokens, use_fts, where, args, sort, page, size, count_only=False):
+    """Ejecuta la búsqueda en SQL: devuelve (total, items de la página)."""
+    where, args = list(where), list(args)
+    source = "products p"
+    if tokens and use_fts:
+        source = "products_fts JOIN products p ON p.id = products_fts.rowid"
+        where.insert(0, "products_fts MATCH ?")
+        args.insert(0, search.build_match(tokens))
+    elif tokens:   # SQLite sin FTS5: búsqueda simple como en la versión anterior
+        for t in tokens:
+            where.append("(unaccent(p.title) LIKE ? OR unaccent(p.tags) LIKE ?)")
+            args += [f"%{t}%", f"%{t}%"]
+    cond = (" WHERE " + " AND ".join(where)) if where else ""
+    if tokens and use_fts and len(where) == 1:      # solo texto: se cuenta directo en el índice
+        total = conn.execute("SELECT COUNT(*) FROM products_fts WHERE products_fts MATCH ?", args).fetchone()[0]
+    else:
+        total = conn.execute(f"SELECT COUNT(*) FROM {source}{cond}", args).fetchone()[0]
+    if count_only or not total:
+        return total, []
+    if sort == "relevance":
+        order = f"{search.rank_sql()}, p.id DESC"
+    else:
+        col, desc = SORTS[sort]
+        order = f"p.{col} DESC, p.id DESC" if desc else f"p.{col}, p.id"
+    rows = conn.execute(
+        f"SELECT p.*, i.id AS imported_id FROM {source} LEFT JOIN imported_products i ON i.product_id = p.id"
+        f"{cond} ORDER BY {order} LIMIT ? OFFSET ?", args + [size, (page - 1) * size]).fetchall()
+    return total, [_item(r) for r in rows]
+
+
+MAX_PAGE = 100_000            # evita OFFSET fuera de rango en SQLite
+
+
+def _best_effort(conn, fn, *args) -> None:
+    """Escrituras secundarias de una búsqueda (indexar pendientes, registrar la consulta).
+    Si otra escritura larga tiene la base bloqueada (carga de CSV, monitor), se omiten en vez de
+    hacer esperar la búsqueda 5 s y fallar con 500: la búsqueda es lectura y debe responder siempre."""
+    conn.execute("PRAGMA busy_timeout = 200")
+    try:
+        conn.execute("SAVEPOINT best_effort")
+        fn(conn, *args)
+        conn.execute("RELEASE best_effort")
+    except sqlite3.OperationalError:
+        conn.execute("ROLLBACK TO best_effort")
+        conn.execute("RELEASE best_effort")
+    finally:
+        conn.execute("PRAGMA busy_timeout = 5000")
+
+
+def search_products(qs: dict) -> dict:
+    """Búsqueda con texto completo, filtros, orden y paginación en SQL.
+
+    Además de total/page/page_size/pages/items devuelve:
+      query           texto efectivamente buscado (el corregido si hubo autocorrección)
+      sort            orden aplicado
+      corrected_from  si `q` no dio resultados y se encontró una corrección que sí da, se muestran los
+                      resultados de la corrección y aquí va el `q` original ("Mostrando resultados para …")
+      suggestion      si hay pocos resultados (1 o 2) y existe una consulta parecida con más resultados:
+                      "¿Quisiste decir …?" (no se aplica sola). null en otro caso.
+      took_ms         tiempo de la consulta en el servidor (milisegundos)
+
+    Con `exact=1` no se autocorrige (el usuario pidió buscar su texto tal cual).
+    """
+    started = time.perf_counter()
+    exact = qs.get("exact", ["0"])[0] == "1"
+    q = qs.get("q", [""])[0].strip()[:200]
+    page = min(MAX_PAGE, max(1, _num(qs, "page", int) or 1))
     size = min(100, max(1, _num(qs, "page_size", int) or 24))
-    total = len(items)
+    where, args = _filters(qs)
+    tokens = search.query_tokens(q)
+    sort = qs.get("sort", [""])[0]
+    if sort not in SORTS:
+        sort = "relevance" if tokens else "score"
+    if sort == "relevance" and not tokens:
+        sort = "score"
+
+    suggestion = corrected_from = None
+    effective = q
+    with db.connect() as conn:
+        use_fts = search.fts_enabled(conn)
+        if sort == "relevance" and not use_fts:
+            sort = "score"             # sin FTS5 no hay ranking de relevancia
+        if use_fts:
+            _best_effort(conn, search.sync)    # por si alguna escritura dejó productos sin indexar
+        total, items = _query(conn, tokens, use_fts, where, args, sort, page, size)
+        if tokens and use_fts and not exact and total < search.FEW_RESULTS:
+            fix = search.correct(conn, q, current_total=total)
+            if fix and fix != q:
+                fix_tokens = search.query_tokens(fix)
+                if total == 0:
+                    t2, i2 = _query(conn, fix_tokens, use_fts, where, args, sort, page, size)
+                    if t2:
+                        total, items, corrected_from, effective = t2, i2, q, fix
+                elif _query(conn, fix_tokens, use_fts, where, args, sort, page, size, count_only=True)[0] > total:
+                    suggestion = fix
+        if tokens and page == 1:      # para el autocompletado se guarda la consulta ya corregida
+            _best_effort(conn, search.log_search, effective, total, db.now())
     return {
         "total": total, "page": page, "page_size": size, "pages": math.ceil(total / size) if total else 0,
-        "items": items[(page - 1) * size: page * size],
+        "items": items, "query": effective, "sort": sort,
+        "suggestion": suggestion, "corrected_from": corrected_from,
+        "took_ms": round((time.perf_counter() - started) * 1000, 1),
     }
+
+
+def suggest(qs: dict) -> dict:
+    q = qs.get("q", [""])[0][:100]
+    limit = min(20, max(1, _num(qs, "limit", int) or 8))
+    with db.connect() as conn:
+        return {"items": search.suggest(conn, q, limit)}
 
 
 def get_product(pid: int) -> dict:
@@ -107,17 +206,20 @@ def get_product(pid: int) -> dict:
                          "LEFT JOIN imported_products i ON i.product_id = p.id WHERE p.id = ?", (pid,)).fetchone()
         if not r:
             raise ApiError(404, "Producto no encontrado")
-        return enrich(dict(r), db.get_settings(conn))
+        return _item(r)
 
 
 def facets() -> dict:
-    with db.connect() as conn:
-        def col(c):
-            return [{"value": r[0], "count": r[1]} for r in
-                    conn.execute(f"SELECT {c}, COUNT(*) FROM products GROUP BY {c} ORDER BY COUNT(*) DESC")]
-        return {"category": col("category"), "supplier": col("supplier"), "warehouse": col("warehouse"),
-                "source": col("source"),
-                "total": conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]}
+    """Conteos por categoría, proveedor, almacén y fuente (en caché hasta que cambie el catálogo)."""
+    def build():
+        with db.connect() as conn:
+            def col(c):
+                return [{"value": r[0], "count": r[1]} for r in
+                        conn.execute(f"SELECT {c}, COUNT(*) FROM products GROUP BY {c} ORDER BY COUNT(*) DESC")]
+            return {"category": col("category"), "supplier": col("supplier"), "warehouse": col("warehouse"),
+                    "source": col("source"),
+                    "total": conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]}
+    return search.cached("facets", build)
 
 
 def get_settings() -> dict:
@@ -138,7 +240,9 @@ def update_settings(body: dict) -> dict:
                 if v < 0 or (k == "fee_pct" and v >= 100):
                     raise ApiError(400, f"Valor fuera de rango: {k}")
                 conn.execute("UPDATE settings SET value = ? WHERE key = ?", (json.dumps(v), k))
-        return db.get_settings(conn)
+        s = db.get_settings(conn)
+        db.recompute_metrics(conn, s)      # precio, margen y score precalculados con las nuevas reglas
+        return s
 
 
 def _imported_view(conn, r, s) -> dict:
@@ -230,7 +334,7 @@ def _check_imported(conn, r, new: PriceStock, s: dict, created: list) -> None:
 
 def run_monitor() -> dict:
     """Re-consulta precio/stock en el proveedor para cada producto importado y genera alertas."""
-    created, checked, skipped = [], 0, 0
+    created, checked, skipped, changed = [], 0, 0, []
     with db.connect() as conn:
         s = db.get_settings(conn)
         for r in conn.execute(IMPORT_SQL).fetchall():
@@ -246,7 +350,9 @@ def run_monitor() -> dict:
             checked += 1
             conn.execute("UPDATE products SET cost = ?, shipping_cost = ?, stock = ?, updated_at = ? WHERE id = ?",
                          (new.cost, new.shipping_cost, new.stock, db.now(), r["product_id"]))
+            changed.append(r["product_id"])
             _check_imported(conn, r, new, s, created)
+        db.recompute_metrics(conn, s, ids=changed)
     return {"checked": checked, "skipped": skipped, "alerts": created}
 
 
@@ -287,6 +393,7 @@ def upload_csv(body: dict) -> dict:
                          "AND id IN (SELECT product_id FROM imported_products)", (db.now(), supplier))
             removed = conn.execute(f"DELETE FROM products WHERE {gone} "
                                    "AND id NOT IN (SELECT product_id FROM imported_products)", (supplier,)).rowcount
+            search.invalidate(conn)
         # Alertas para los productos importados de este proveedor cuyo costo/stock cambió
         for r in conn.execute(IMPORT_SQL + " WHERE p.supplier = ? AND p.source = 'csv'", (supplier,)).fetchall():
             _check_imported(conn, r, PriceStock(r["cost"], r["shipping_cost"], r["stock"]), s, created_alerts)
@@ -309,6 +416,7 @@ def delete_supplier_catalog(qs: dict) -> dict:
     with db.connect() as conn:
         n = conn.execute(f"DELETE FROM products WHERE {where} "
                          "AND id NOT IN (SELECT product_id FROM imported_products)", args).rowcount
+    search.invalidate()
     return {"deleted": n}
 
 
@@ -325,10 +433,41 @@ def mark_alerts_read() -> dict:
     return {"ok": True}
 
 
+# ---------------------------------------------------------------- moneda
+
+def currency_state() -> dict:
+    with db.connect() as conn:
+        return currency.get_state(conn)
+
+
+def currency_update(body: dict) -> dict:
+    with db.connect() as conn:
+        try:
+            currency.update_settings(conn, body)
+        except ValueError as e:
+            raise ApiError(400, str(e))
+        return currency.get_state(conn)
+
+
+def currency_refresh() -> dict:
+    with db.connect() as conn:
+        return currency.refresh_trm(conn)
+
+
+def _auto_refresh_trm() -> None:
+    """Actualiza la TRM al arrancar, en segundo plano: si datos.gov.co no responde, el servidor no espera."""
+    try:
+        with db.connect() as conn:
+            currency.maybe_auto_refresh(conn)
+    except Exception:  # noqa: BLE001 — nunca debe tumbar el servidor
+        pass
+
+
 # ---------------------------------------------------------------- routing
 
 ROUTES = [
     ("GET", r"/api/products", lambda m, qs, b: search_products(qs)),
+    ("GET", r"/api/suggest", lambda m, qs, b: suggest(qs)),
     ("GET", r"/api/products/(\d+)", lambda m, qs, b: get_product(int(m[1]))),
     ("GET", r"/api/facets", lambda m, qs, b: facets()),
     ("GET", r"/api/settings", lambda m, qs, b: get_settings()),
@@ -343,6 +482,9 @@ ROUTES = [
     ("POST", r"/api/catalog/csv", lambda m, qs, b: upload_csv(b)),
     ("DELETE", r"/api/catalog", lambda m, qs, b: delete_supplier_catalog(qs)),
     ("POST", r"/api/alerts/read", lambda m, qs, b: mark_alerts_read()),
+    ("GET", r"/api/currency", lambda m, qs, b: currency_state()),
+    ("PUT", r"/api/currency", lambda m, qs, b: currency_update(b)),
+    ("POST", r"/api/currency/refresh", lambda m, qs, b: currency_refresh()),
 ]
 
 
@@ -407,6 +549,7 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     args = ap.parse_args()
     db.init_db()
+    threading.Thread(target=_auto_refresh_trm, daemon=True).start()
     print(f"DropFinder en http://{args.host}:{args.port}")
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
 
