@@ -3,15 +3,18 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import unicodedata
 from datetime import datetime, timezone
 
+import currency
+import metrics
+import search
 from connectors import MockSupplierConnector
-from metrics import DEFAULT_SETTINGS
+from metrics import DEFAULT_SETTINGS, METRIC_COLS
+from search import unaccent  # noqa: F401  (se mantiene db.unaccent por compatibilidad)
 
 DB_PATH = os.environ.get("DROPFINDER_DB", os.path.join(os.path.dirname(__file__), "dropfinder.db"))
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 PRODUCTS_TABLE = """
 CREATE TABLE IF NOT EXISTS products (
@@ -25,14 +28,40 @@ CREATE TABLE IF NOT EXISTS products (
   orders INTEGER NOT NULL, orders_7d INTEGER NOT NULL, orders_prev_7d INTEGER NOT NULL,
   rating REAL NOT NULL, reviews INTEGER NOT NULL,
   updated_at TEXT NOT NULL,
+  -- Métricas precalculadas (v3): se recalculan al cambiar las reglas de precio o los datos del producto
+  total_cost REAL NOT NULL DEFAULT 0, suggested_price REAL NOT NULL DEFAULT 0, profit REAL NOT NULL DEFAULT 0,
+  margin REAL NOT NULL DEFAULT 0, break_even REAL NOT NULL DEFAULT 0, trend REAL NOT NULL DEFAULT 0,
+  trending INTEGER NOT NULL DEFAULT 0, score INTEGER NOT NULL DEFAULT 0,
   UNIQUE (supplier, supplier_sku)
 );
 """
 
-SCHEMA = PRODUCTS_TABLE + """
+# Columnas agregadas en v3 (ALTER TABLE ADD COLUMN en bases existentes)
+METRIC_DDL = {
+    "total_cost": "REAL NOT NULL DEFAULT 0", "suggested_price": "REAL NOT NULL DEFAULT 0",
+    "profit": "REAL NOT NULL DEFAULT 0", "margin": "REAL NOT NULL DEFAULT 0", "break_even": "REAL NOT NULL DEFAULT 0",
+    "trend": "REAL NOT NULL DEFAULT 0", "trending": "INTEGER NOT NULL DEFAULT 0", "score": "INTEGER NOT NULL DEFAULT 0",
+}
+
+# Índices para filtrar y ordenar en SQL. Los de una columna sirven también para ORDER BY col, id
+# (SQLite agrega el rowid al final de cada índice).
+INDEXES = """
 CREATE INDEX IF NOT EXISTS ix_products_cat ON products(category);
 CREATE INDEX IF NOT EXISTS ix_products_sup ON products(supplier);
+CREATE INDEX IF NOT EXISTS ix_products_source ON products(source);
+CREATE INDEX IF NOT EXISTS ix_products_wh ON products(warehouse);
+CREATE INDEX IF NOT EXISTS ix_products_score ON products(score);
+CREATE INDEX IF NOT EXISTS ix_products_margin ON products(margin);
+CREATE INDEX IF NOT EXISTS ix_products_orders ON products(orders);
+CREATE INDEX IF NOT EXISTS ix_products_trend ON products(trend);
+CREATE INDEX IF NOT EXISTS ix_products_price ON products(suggested_price);
+CREATE INDEX IF NOT EXISTS ix_products_ship ON products(shipping_days);
+CREATE INDEX IF NOT EXISTS ix_products_rating ON products(rating);
+CREATE INDEX IF NOT EXISTS ix_products_total ON products(total_cost);
+CREATE INDEX IF NOT EXISTS ix_products_cat_sup ON products(category, supplier);
+"""
 
+SCHEMA = PRODUCTS_TABLE + """
 CREATE TABLE IF NOT EXISTS imported_products (
   id INTEGER PRIMARY KEY,
   product_id INTEGER NOT NULL UNIQUE REFERENCES products(id),
@@ -49,6 +78,13 @@ CREATE TABLE IF NOT EXISTS alerts (
 
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+-- Búsquedas realizadas (para sugerir las populares en el autocompletado)
+CREATE TABLE IF NOT EXISTS search_log (
+  id INTEGER PRIMARY KEY, q TEXT NOT NULL, q_norm TEXT NOT NULL,
+  results INTEGER NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_search_log_q ON search_log(q_norm);
 """
 
 PRODUCT_COLS = ["supplier", "supplier_sku", "source", "title", "category", "tags", "image", "product_url",
@@ -58,14 +94,6 @@ PRODUCT_COLS = ["supplier", "supplier_sku", "source", "title", "category", "tags
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def unaccent(text: str | None) -> str:
-    """Minúsculas y sin tildes, para búsquedas en español ("magnetico" == "magnético")."""
-    if not text:
-        return ""
-    nfkd = unicodedata.normalize("NFKD", text.lower())
-    return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
 class _Conn(sqlite3.Connection):
@@ -83,6 +111,7 @@ def connect() -> sqlite3.Connection:
     conn.create_function("unaccent", 1, unaccent, deterministic=True)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA synchronous = NORMAL")   # seguro con WAL y mucho más rápido al escribir
     return conn
 
 
@@ -101,30 +130,93 @@ def _migrate_v1_to_v2(conn) -> None:
     conn.execute("UPDATE products SET image = '' WHERE image LIKE 'https://placehold.co/%'")
 
 
+def _migrate_v2_to_v3(conn) -> None:
+    """v3: agrega las columnas de métricas precalculadas (los valores se calculan después en init_db)."""
+    have = {r[1] for r in conn.execute("PRAGMA table_info(products)")}
+    for col, ddl in METRIC_DDL.items():
+        if col not in have:
+            conn.execute(f"ALTER TABLE products ADD COLUMN {col} {ddl}")
+
+
+_METRIC_INPUTS = "id, cost, shipping_cost, orders, orders_7d, orders_prev_7d, rating, shipping_days"
+_UPDATE_METRICS = ("UPDATE products SET " + ", ".join(f"{c} = ?" for c in METRIC_COLS) + " WHERE id = ?")
+
+
+def recompute_metrics(conn, s: dict | None = None, ids=None) -> int:
+    """Recalcula las métricas precalculadas (todas o las de `ids`) con metrics.compute en una sola
+    transacción (executemany). Devuelve cuántas filas cambiaron."""
+    s = s or get_settings(conn)
+    sql = f"SELECT {_METRIC_INPUTS}, {', '.join(METRIC_COLS)} FROM products"
+    if ids is not None:
+        ids = list(ids)
+        if not ids:
+            return 0
+        sql += f" WHERE id IN ({','.join('?' * len(ids))})"
+    cur = conn.execute(sql, ids or [])
+    n = 0
+    for chunk in iter(lambda: cur.fetchmany(5000), []):
+        updates = []
+        for r in chunk:
+            m = metrics.compute(r, s)
+            vals = tuple(m[c] for c in METRIC_COLS)
+            if vals != tuple(r[c] for c in METRIC_COLS):      # solo escribe lo que cambió
+                updates.append((*vals, r["id"]))
+        conn.executemany(_UPDATE_METRICS, updates)
+        n += len(updates)
+    if n:
+        search.invalidate()
+    return n
+
+
+_UPSERT_COLS = PRODUCT_COLS + list(METRIC_COLS)
+_UPSERT = (f"INSERT INTO products({','.join(_UPSERT_COLS)}) VALUES ({','.join(':' + c for c in _UPSERT_COLS)}) "
+           "ON CONFLICT(supplier, supplier_sku) DO UPDATE SET "
+           + ", ".join(f"{c} = excluded.{c}" for c in _UPSERT_COLS if c not in ("supplier", "supplier_sku")))
+
+
 def upsert_products(conn, products, source: str) -> tuple[int, int]:
-    """Inserta o actualiza productos normalizados. Devuelve (nuevos, actualizados)."""
+    """Inserta o actualiza productos normalizados (con sus métricas y el índice de búsqueda).
+    Devuelve (nuevos, actualizados)."""
     ts = now()
-    new = upd = 0
-    for p in products:
-        r = p.to_row()
-        r.update(source=source, updated_at=ts)
-        exists = conn.execute("SELECT 1 FROM products WHERE supplier = ? AND supplier_sku = ?",
-                              (r["supplier"], r["supplier_sku"])).fetchone()
-        conn.execute(
-            f"INSERT INTO products({','.join(PRODUCT_COLS)}) VALUES ({','.join(':' + c for c in PRODUCT_COLS)}) "
-            f"ON CONFLICT(supplier, supplier_sku) DO UPDATE SET "
-            + ", ".join(f"{c} = excluded.{c}" for c in PRODUCT_COLS if c not in ("supplier", "supplier_sku")),
-            r)
-        if exists:
-            upd += 1
-        else:
-            new += 1
-    return new, upd
+    s = get_settings(conn)
+    count = [0]
+
+    def rows():
+        for p in products:
+            if hasattr(p, "__dict__") and isinstance(getattr(p, "tags", None), list):
+                r = dict(p.__dict__)                 # mucho más rápido que dataclasses.asdict (to_row)
+                r["tags"] = ",".join(p.tags)
+            else:
+                r = p.to_row()
+            r.update(source=source, updated_at=ts)
+            r.update(metrics.compute(r, s))
+            count[0] += 1
+            yield r
+
+    before = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+    conn.executemany(_UPSERT, rows())
+    new = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] - before
+    if search.fts_enabled(conn):
+        search.sync(conn)
+    search.invalidate()
+    return new, count[0] - new
+
+
+def _meta(conn, key: str):
+    r = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return r[0] if r else None
+
+
+def _set_meta(conn, key: str, value: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, value))
 
 
 def init_db(seed_size: int = 1500) -> None:
+    """Crea o migra la base (v1 → v2 → v3, conservando ids, importados y alertas) y carga la demo.
+    Es idempotente: se puede llamar en cada arranque."""
     conn = connect()
     try:
+        conn.execute("PRAGMA journal_mode = WAL")    # lecturas sin bloquear durante las escrituras
         has_products = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'products'").fetchone()
         version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -138,19 +230,41 @@ def init_db(seed_size: int = 1500) -> None:
                 raise
             conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(SCHEMA)
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        with conn:
+        conn.execute("BEGIN")
+        try:
+            _migrate_v2_to_v3(conn)
+            fts = search.create_schema(conn)
+            currency.ensure_schema(conn)
             for k, v in DEFAULT_SETTINGS.items():
                 conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, json.dumps(v)))
+            # Métricas e índice de búsqueda: se recalculan si la base viene de una versión anterior
+            if _meta(conn, "metrics_version") != metrics.FORMULA_VERSION:
+                recompute_metrics(conn)
+                _set_meta(conn, "metrics_version", metrics.FORMULA_VERSION)
+            if fts and _meta(conn, "fts_version") != search.STEMMER_VERSION:
+                search.reindex_all(conn)
+                _set_meta(conn, "fts_version", search.STEMMER_VERSION)
             # La demo se carga una sola vez: si el usuario la elimina, no vuelve a aparecer al reiniciar.
-            seeded = conn.execute("SELECT 1 FROM meta WHERE key = 'demo_seeded'").fetchone()
-            if not seeded:
+            if not _meta(conn, "demo_seeded"):
                 if conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
                     upsert_products(conn, MockSupplierConnector(size=seed_size).iter_catalog(), "mock")
-                conn.execute("INSERT INTO meta(key, value) VALUES ('demo_seeded', '1')")
+                _set_meta(conn, "demo_seeded", "1")
+            # Índices al final: en una base nueva se construyen de una vez tras la carga masiva (más rápido)
+            for stmt in INDEXES.strip().split(";"):
+                if stmt.strip():
+                    conn.execute(stmt)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.execute("PRAGMA optimize")
     finally:
         conn.close()
+    search.invalidate()
 
 
 def get_settings(conn) -> dict:
-    return {r["key"]: json.loads(r["value"]) for r in conn.execute("SELECT key, value FROM settings")}
+    s = dict(DEFAULT_SETTINGS)
+    s.update({r["key"]: json.loads(r["value"]) for r in conn.execute("SELECT key, value FROM settings")})
+    return s
