@@ -117,7 +117,16 @@
 
     async load() {
       try { this.apply(await api("/api/currency")); }
-      catch (e) { this.available = false; listeners.forEach((fn) => fn()); }
+      catch (e) {
+        // 404 = el servidor aún no tiene la API de moneda; otro error con datos previos = se conservan
+        if (e.status === 404 || !this.available) {
+          this.available = false;
+          this.settings = { ...DEFAULT_SETTINGS };
+          this.rates = { USD: 1 };
+          this.rateInfo = null;
+        }
+        listeners.forEach((fn) => { try { fn(); } catch (err) { console.error(err); } });
+      }
     },
     async save(partial) { this.apply(await api("/api/currency", { method: "PUT", body: partial })); },
     async refresh() { this.apply(await api("/api/currency/refresh", { method: "POST" })); },

@@ -1,6 +1,6 @@
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
-const money = (n) => `$${Number(n).toFixed(2)}`;
+/* money(), moneyValue(), moneyToUsd() y Currency vienen de js/currency.js */
 const fmt = (n) => Number(n).toLocaleString("es");
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const FLAGS = { CN: "🇨🇳", US: "🇺🇸", ES: "🇪🇸", DE: "🇩🇪", MX: "🇲🇽", AR: "🇦🇷", CL: "🇨🇱", CO: "🇨🇴", PE: "🇵🇪", BR: "🇧🇷", UY: "🇺🇾" };
@@ -40,8 +40,13 @@ async function api(path, opts = {}) {
     headers: { "Content-Type": "application/json" },
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || res.statusText);
+  let data = {};
+  try { data = await res.json(); } catch { /* respuesta sin JSON */ }
+  if (!res.ok) {
+    const err = new Error((data && data.error) || res.statusText || `Error ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
   return data;
 }
 
@@ -59,40 +64,93 @@ function show(view) {
   $$(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${view}`));
   if (view === "imports") loadImports();
   if (view === "alerts") loadAlerts();
-  if (view === "settings") loadSettings();
+  if (view === "settings") { loadSettings(); Currency.load(); }
   if (view === "suppliers") loadSuppliers();
 }
 $$(".tab").forEach((b) => b.addEventListener("click", () => show(b.dataset.view)));
 
 /* ---------------- Búsqueda ---------------- */
 let page = 1;
+let lastData = null;       // última respuesta de /api/products (para re-renderizar al cambiar de moneda)
+let sortTouched = false;   // el usuario eligió un orden a mano
+let exactSearch = false;   // "Buscar en cambio X": pedir la búsqueda sin corrección
+const COST_FIELDS = new Set(["min_cost", "max_cost"]);
+
+/* Con texto y sin orden elegido → Relevancia. Sin texto, Relevancia no aplica → Mejor score. */
+function syncSort() {
+  const q = $("#q").value.trim();
+  const sel = $("#sort");
+  if (q && !sortTouched) sel.value = "relevance";
+  else if (!q && sel.value === "relevance") { sel.value = "score"; sortTouched = false; }
+}
 
 function buildQuery() {
   const p = new URLSearchParams();
   const q = $("#q").value.trim();
   if (q) p.set("q", q);
+  if (q && exactSearch) p.set("exact", "1");
   p.set("sort", $("#sort").value);
   for (const key of ["source", "category", "supplier", "warehouse"]) {
     $$(`#f-${key} input:checked`).forEach((i) => p.append(key, i.value));
   }
   $$("#filters input[name], #filters select[name]").forEach((el) => {
     if (el.type === "checkbox") { if (el.checked) p.set(el.name, "1"); }
-    else if (el.value !== "") p.set(el.name, el.value);
+    else if (COST_FIELDS.has(el.name)) {
+      // Los costos se escriben en la moneda mostrada; la API filtra en USD
+      const usd = moneyToUsd(el.value);
+      if (usd !== null) p.set(el.name, usd);
+    } else if (el.value !== "") p.set(el.name, el.value);
   });
   p.set("page", page);
   return p;
 }
 
+let searchSeq = 0;
 async function search() {
+  syncSort();
   const params = buildQuery();
+  const seq = ++searchSeq;
   $("#resultsInfo").textContent = "Buscando…";
   try {
     const data = await api(`/api/products?${params}`);
+    if (seq !== searchSeq) return;   // llegó una búsqueda más nueva
+    lastData = data;
     renderGrid(data);
   } catch (e) {
+    if (seq !== searchSeq) return;
     $("#resultsInfo").textContent = `Error: ${e.message}`;
+    $("#tookMs").textContent = "";
   }
 }
+
+/* Lanza una búsqueda de texto desde una sugerencia o corrección */
+function searchFor(text, { exact = false } = {}) {
+  $("#q").value = text;
+  exactSearch = exact;
+  page = 1;
+  search();
+}
+
+function renderHint(data) {
+  const box = $("#searchHint");
+  const qLink = (t, extra = "") => `<a href="#" data-q="${esc(t)}"${extra}>${esc(t)}</a>`;
+  let html = "";
+  if (data.corrected_from) {
+    const used = data.corrected_query || data.q_used || data.query || data.suggestion;
+    html = (used ? `Mostrando resultados para <b>${esc(used)}</b>. ` : "Mostrando resultados con la búsqueda corregida. ") +
+      `Buscar en cambio ${qLink(data.corrected_from, ' data-exact="1"')}`;
+  } else if (data.suggestion) {
+    html = `¿Quisiste decir ${qLink(data.suggestion)}?`;
+  }
+  box.innerHTML = html;
+  box.classList.toggle("hidden", !html);
+}
+$("#searchHint").addEventListener("click", (e) => {
+  const a = e.target.closest("a[data-q]");
+  if (!a) return;
+  e.preventDefault();
+  searchFor(a.dataset.q, { exact: a.dataset.exact === "1" });
+});
 
 function card(p) {
   return `<article class="card" data-id="${p.id}">
@@ -107,7 +165,7 @@ function card(p) {
       <div class="meta">${fmt(p.orders)} pedidos · ${p.stock > 0 ? `stock ${fmt(p.stock)}` : '<b class="bad">sin stock</b>'}</div>
       <div class="kpis">
         <div><b>${money(p.total_cost)}</b><span>Costo</span></div>
-        <div><b>${money(p.suggested_price)}</b><span>Venta</span></div>
+        <div><b>${money(p.suggested_price, { kind: "price" })}</b><span>Venta</span></div>
         <div><b class="${p.profit >= 0 ? "good" : "bad"}">${money(p.profit)}</b><span>${p.margin}%</span></div>
       </div>
       <div class="actions">${p.imported_id
@@ -120,6 +178,8 @@ function renderGrid(data) {
   const from = data.total ? (data.page - 1) * data.page_size + 1 : 0;
   const to = Math.min(data.total, data.page * data.page_size);
   $("#resultsInfo").textContent = data.total ? `${fmt(data.total)} productos · mostrando ${from}–${to}` : "Sin resultados";
+  $("#tookMs").textContent = Number.isFinite(data.took_ms) ? `· ${fmt(Math.round(data.took_ms))} ms` : "";
+  renderHint(data);
   $("#grid").innerHTML = data.items.length
     ? data.items.map(card).join("")
     : `<p class="empty">No hay productos que cumplan los filtros. Prueba a relajar alguno.</p>`;
@@ -143,17 +203,28 @@ $("#grid").addEventListener("click", async (e) => {
   const imp = e.target.closest("button.import");
   if (imp) {
     e.stopPropagation();
-    await importProduct(Number(imp.dataset.id), imp);
+    const p = lastData && lastData.items.find((x) => x.id === Number(imp.dataset.id));
+    await importProduct(Number(imp.dataset.id), imp, p);
     return;
   }
   const c = e.target.closest(".card");
   if (c) openDetail(Number(c.dataset.id));
 });
 
-async function importProduct(id, btn) {
+/* En moneda local se guarda el precio redondeado que el usuario ve en la tarjeta (convertido a USD) */
+function importBody(id, p) {
+  const body = { product_id: id };
+  if (p && Currency.isLocal()) {
+    const usd = moneyToUsd(moneyValue(p.suggested_price, { kind: "price" }));
+    if (usd) body.sell_price = usd;
+  }
+  return body;
+}
+
+async function importProduct(id, btn, p) {
   try {
     if (btn) btn.disabled = true;
-    await api("/api/imports", { method: "POST", body: { product_id: id } });
+    await api("/api/imports", { method: "POST", body: importBody(id, p) });
     if (btn) { btn.textContent = "✓ Importado"; btn.className = "ghost"; }
     toast("Producto importado a Mis productos");
     refreshCounts();
@@ -163,8 +234,13 @@ async function importProduct(id, btn) {
   }
 }
 
-$("#searchForm").addEventListener("submit", (e) => { e.preventDefault(); page = 1; search(); });
-$("#sort").addEventListener("change", () => { page = 1; search(); });
+$("#searchForm").addEventListener("submit", (e) => { e.preventDefault(); exactSearch = false; page = 1; search(); });
+$("#sort").addEventListener("change", () => { sortTouched = true; page = 1; search(); });
+$("#q").addEventListener("input", () => {
+  exactSearch = false;
+  // Al borrar el texto (también con la ✕ del campo) se vuelve al listado completo
+  if (!$("#q").value.trim() && lastData) { page = 1; search(); }
+});
 let debounce;
 $("#filters").addEventListener("input", () => { clearTimeout(debounce); debounce = setTimeout(() => { page = 1; search(); }, 300); });
 $("#resetFilters").addEventListener("click", () => {
@@ -188,9 +264,35 @@ async function loadFacets() {
 }
 
 /* ---------------- Detalle ---------------- */
+let lastDetail = null;
+
+/* Línea "con IVA" bajo un precio de venta (vacía si el IVA está desactivado) */
+function vatLine(usd, kind = "price") {
+  const vat = Currency.vat();
+  if (!vat) return "";
+  const v = moneyValue(usd, { kind });
+  if (v === null) return "";
+  return moneyLocal(Currency.isLocal() ? Math.round(v * (1 + vat / 100)) : Math.round(v * (1 + vat / 100) * 100) / 100);
+}
+
+/* Atributos del <input> de precio de venta en la moneda mostrada */
+function priceInputAttrs(value) {
+  const local = Currency.isLocal();
+  return `type="number" inputmode="decimal" step="${local ? 100 : 0.01}" min="${local ? 0 : 0.01}" value="${value ?? ""}"`;
+}
+
 async function openDetail(id) {
   const p = await api(`/api/products/${id}`);
+  lastDetail = p;
+  $("#detail").innerHTML = "";   // no arrastrar el precio escrito para otro producto
+  renderDetail(p);
+  $("#detail").showModal();
+}
+
+function renderDetail(p) {
   const dlg = $("#detail");
+  const typed = $("#dPrice", dlg);
+  const vat = vatLine(p.suggested_price);
   const link = p.product_url
     ? `<a class="btn ghost" href="${esc(p.product_url)}" target="_blank" rel="noopener noreferrer">Ver en ${esc(p.supplier)} ↗</a>`
     : p.source === "mock"
@@ -212,49 +314,79 @@ async function openDetail(id) {
         <dt>Rating</dt><dd>⭐ ${p.rating} (${fmt(p.reviews)} reseñas)</dd>
         <dt>Costo producto</dt><dd>${money(p.cost)}</dd>
         <dt>Envío</dt><dd>${p.shipping_cost ? money(p.shipping_cost) : "Gratis"} · ${p.shipping_days} días desde ${FLAGS[p.warehouse] || ""} ${p.warehouse}</dd>
-        <dt>Precio sugerido</dt><dd>${money(p.suggested_price)}</dd>
+        <dt>Precio sugerido</dt><dd>${money(p.suggested_price, { kind: "price" })}${vat ? `<small class="vat">con IVA: ${vat}</small>` : ""}</dd>
         <dt>Punto de equilibrio</dt><dd>${money(p.break_even)}</dd>
         <dt>Ganancia estimada</dt><dd class="${p.profit >= 0 ? "good" : "bad"}">${money(p.profit)} (${p.margin}%)</dd>
         <dt>Stock</dt><dd>${p.stock > 0 ? fmt(p.stock) : '<span class="bad">Sin stock</span>'}</dd>
       </dl>
       <div class="meta">${p.tags.map((t) => `<span class="chip">#${esc(t)}</span>`).join("")}</div>
       ${p.imported_id ? `<button class="ghost" disabled>✓ Ya importado</button>`
-        : `<label class="field">Precio de venta<input id="dPrice" type="number" step="0.01" min="0.01" value="${p.suggested_price}"></label>
+        : `<label class="field">Precio de venta (${Currency.code()})<input id="dPrice" ${priceInputAttrs(moneyValue(p.suggested_price, { kind: "price" }))}>
+             <small id="dPriceVat" class="vat"></small></label>
            <button class="primary" id="dImport">Importar a Mis productos</button>`}
     </div></div>`;
-  dlg.showModal();
   $(".close", dlg).onclick = () => dlg.close();
+  const input = $("#dPrice", dlg);
+  if (input) {
+    // Si el usuario ya había escrito un precio y luego cambió la moneda, se conserva convertido
+    if (typed && typed.dataset.usd) {
+      input.dataset.usd = typed.dataset.usd;
+      input.value = moneyValue(Number(typed.dataset.usd));
+    }
+    const showVat = () => {
+      const usd = moneyToUsd(input.value);
+      const v = usd !== null ? vatLine(usd, "amount") : "";
+      $("#dPriceVat", dlg).textContent = v ? `con IVA: ${v}` : "";
+    };
+    input.addEventListener("input", () => { input.dataset.usd = moneyToUsd(input.value) ?? ""; showVat(); });
+    showVat();
+  }
   const b = $("#dImport", dlg);
   if (b) b.onclick = async () => {
+    const usd = moneyToUsd(input.value);
+    if (!usd || usd <= 0) { toast("Escribe un precio de venta válido"); return; }
     try {
-      await api("/api/imports", { method: "POST", body: { product_id: p.id, sell_price: Number($("#dPrice").value) } });
+      await api("/api/imports", { method: "POST", body: { product_id: p.id, sell_price: usd } });
       dlg.close(); toast("Producto importado"); refreshCounts(); search();
     } catch (e) { toast(e.message); }
   };
 }
 $("#detail").addEventListener("click", (e) => { if (e.target.id === "detail") e.target.close(); });
+$("#detail").addEventListener("close", () => { lastDetail = null; });
 
 /* ---------------- Mis productos ---------------- */
+let lastImports = null;
 async function loadImports() {
   const rows = await api("/api/imports");
+  lastImports = rows;
+  renderImports(rows);
+}
+
+function renderImports(rows) {
   $("#importsEmpty").classList.toggle("hidden", rows.length > 0);
-  $("#importsBody").innerHTML = rows.map((r) => `<tr data-id="${r.id}">
+  $("#importsBody").innerHTML = rows.map((r) => {
+    const vat = vatLine(r.sell_price, "amount");
+    return `<tr data-id="${r.id}">
     <td>${imgTag(r)}${esc(r.title)}${r.alerts ? `<span class="alert-dot" title="Alertas sin leer">⚠ ${r.alerts}</span>` : ""}</td>
     <td>${r.product_url ? `<a href="${esc(r.product_url)}" target="_blank" rel="noopener noreferrer">${esc(r.supplier)} ↗</a>` : esc(r.supplier)}</td>
     <td class="num">${money(r.total_cost)}</td>
-    <td class="num"><input class="price" type="number" step="0.01" min="0.01" value="${r.sell_price}"></td>
+    <td class="num"><input class="price" ${priceInputAttrs(moneyValue(r.sell_price))} aria-label="Precio de venta (${Currency.code()})"
+      ${vat ? `title="Con IVA: ${esc(vat)}"` : ""}>${vat ? `<small class="vat">con IVA ${vat}</small>` : ""}</td>
     <td class="num ${r.profit >= 0 ? "good" : "bad"}">${money(r.profit)}</td>
     <td class="num ${r.margin >= 0 ? "good" : "bad"}">${r.margin}%</td>
     <td class="num ${r.stock ? "" : "bad"}">${r.stock ? fmt(r.stock) : "0"}</td>
     <td><button class="status ${r.status}">${r.status === "active" ? "Activo" : "Draft"}</button></td>
-    <td><button class="link del">Quitar</button></td></tr>`).join("");
+    <td><button class="link del">Quitar</button></td></tr>`;
+  }).join("");
   $("#importsCount").textContent = rows.length;
 }
 
 $("#importsBody").addEventListener("change", async (e) => {
   if (!e.target.matches("input.price")) return;
   const id = e.target.closest("tr").dataset.id;
-  try { await api(`/api/imports/${id}`, { method: "PATCH", body: { sell_price: Number(e.target.value) } }); toast("Precio actualizado"); }
+  const usd = moneyToUsd(e.target.value);
+  if (!usd || usd <= 0) { toast("Escribe un precio de venta válido"); loadImports(); return; }
+  try { await api(`/api/imports/${id}`, { method: "PATCH", body: { sell_price: usd } }); toast("Precio actualizado"); }
   catch (err) { toast(err.message); }
   loadImports();
 });
@@ -380,6 +512,156 @@ $("#settingsForm").addEventListener("submit", async (e) => {
   } catch (err) { $("#settingsMsg").textContent = err.message; }
 });
 
+/* ---------------- Moneda ---------------- */
+const fmtRate = (n) => new Intl.NumberFormat("es-CO", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n);
+const fmtIsoDate = (iso) => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || ""); return m ? `${m[3]}/${m[2]}/${m[1]}` : String(iso || ""); };
+let shown = { code: "USD", rate: 1 };   // moneda/tasa con que están escritos los filtros de costo
+
+/* Texto de estado de la tasa: {text, level: "ok" | "info" | "warn"} */
+function rateStatus() {
+  const i = Currency.rateInfo;
+  if (!Currency.available) return { text: "", level: "ok" };
+  if (!i || i.source === "none" || !(Number(i.base_rate) > 0)) {
+    return { text: `⚠ Sin tasa de cambio disponible: los precios se muestran en USD.${i && i.error ? ` (${i.error})` : ""}`, level: "warn" };
+  }
+  let text; let level = "ok";
+  if (i.source === "manual") {
+    text = `ℹ Tasa manual: $ ${fmtRate(i.base_rate)} por USD`; level = "info";
+  } else {
+    text = `TRM $ ${fmtRate(i.base_rate)}${i.date ? ` del ${fmtIsoDate(i.date)}` : ""} · fuente: datos.gov.co`;
+    if (i.stale) { text = `⚠ ${text} · desactualizada`; level = "warn"; }
+  }
+  if (Number(i.hedge_pct) > 0 && Number(i.effective_rate) > 0) {
+    text += ` · con cobertura +${i.hedge_pct} %: $ ${fmtRate(i.effective_rate)}`;
+  }
+  if (i.error) { text += ` · ⚠ No se pudo actualizar la TRM: ${i.error}`; level = "warn"; }
+  return { text, level };
+}
+
+function fillCurrencyForm() {
+  const f = $("#currencyForm");
+  const st = Currency.settings;
+  f.display_currency.value = st.display_currency || "USD";
+  f.rate_mode.value = st.rate_mode || "trm";
+  f.manual_rate.value = st.manual_rate ?? "";
+  f.hedge_pct.value = st.hedge_pct ?? 0;
+  f.cop_rounding.value = String(st.cop_rounding ?? "900");
+  f.vat_enabled.checked = !!st.vat_enabled;
+  f.vat_pct.value = st.vat_pct ?? 19;
+  syncCurrencyForm();
+}
+function syncCurrencyForm() {
+  const f = $("#currencyForm");
+  $$("input, select, button", f).forEach((el) => (el.disabled = !Currency.available));
+  if (!Currency.available) return;
+  f.manual_rate.disabled = f.rate_mode.value !== "manual";
+  f.vat_pct.disabled = !f.vat_enabled.checked;
+  $("#hedgeEcho").textContent = f.hedge_pct.value || 0;
+}
+
+function onCurrencyChange() {
+  const code = Currency.code();
+  const rate = Currency.rate();
+  const sel = $("#currencySel");
+  sel.value = Currency.available ? (Currency.settings.display_currency || "USD") : "USD";
+  [...sel.options].forEach((o) => (o.disabled = o.value !== "USD" && !Currency.available));
+  sel.title = Currency.available ? "Moneda en la que se muestran los precios" : "Conversión de moneda no disponible";
+
+  // Filtros de costo: etiqueta en la moneda mostrada y valores convertidos si cambió la moneda
+  $("#costLabel").textContent = `Costo total (${code})`;
+  let costFilters = false;
+  $$("#filters input[name=min_cost], #filters input[name=max_cost]").forEach((i) => {
+    i.step = code === "USD" ? "1" : "1000";
+    if (i.value === "") return;
+    costFilters = true;
+    if (shown.code !== code) {
+      const v = (Number(i.value) / shown.rate) * rate;
+      i.value = code === "USD" ? Math.round(v * 100) / 100 : Math.round(v);
+    }
+  });
+  const rateChanged = shown.code === code && shown.rate !== rate;
+  shown = { code, rate };
+
+  // Tasa visible
+  const st = rateStatus();
+  const status = $("#rateStatus");
+  status.textContent = st.text;
+  status.className = `rate-status ${st.level}`;
+  const badge = $("#rateBadge");
+  badge.textContent = code !== "USD" ? `1 USD = ${moneyLocal(Math.round(rate))}` : "";
+  badge.title = st.text;
+  badge.classList.toggle("warn", code !== "USD" && st.level === "warn");
+  $("#currencyUnavailable").classList.toggle("hidden", Currency.available);
+  fillCurrencyForm();
+
+  // Re-renderizar todo lo que muestra dinero
+  if (costFilters && rateChanged) search();
+  else if (lastData) renderGrid(lastData);
+  if (lastImports) renderImports(lastImports);
+  if (lastDetail && $("#detail").open) renderDetail(lastDetail);
+}
+Currency.onChange(onCurrencyChange);
+
+$("#currencySel").addEventListener("change", async (e) => {
+  const prev = Currency.settings.display_currency || "USD";
+  e.target.disabled = true;
+  try { await Currency.save({ display_currency: e.target.value }); }
+  catch (err) {
+    e.target.value = prev;
+    toast(err.status === 404 ? "La conversión de moneda aún no está disponible en el servidor" : err.message);
+  } finally { e.target.disabled = false; }
+});
+
+$("#currencyForm").addEventListener("input", syncCurrencyForm);
+$("#currencyForm").addEventListener("change", syncCurrencyForm);
+$("#currencyForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  const msg = $("#currencyMsg");
+  const body = {
+    display_currency: f.display_currency.value, rate_mode: f.rate_mode.value,
+    hedge_pct: Number(f.hedge_pct.value || 0), cop_rounding: f.cop_rounding.value,
+    vat_enabled: f.vat_enabled.checked, vat_pct: Number(f.vat_pct.value || 0),
+  };
+  if (f.manual_rate.value !== "") body.manual_rate = Number(f.manual_rate.value);
+  else if (body.rate_mode === "manual") { msg.textContent = "Escribe la tasa manual (COP por 1 USD)."; return; }
+  try {
+    await Currency.save(body);
+    msg.textContent = "Guardado ✓";
+  } catch (err) { msg.textContent = `⚠ ${err.message}`; }
+});
+$("#refreshRate").addEventListener("click", async (e) => {
+  const msg = $("#currencyMsg");
+  e.target.disabled = true;
+  msg.textContent = "Consultando la TRM…";
+  try {
+    await Currency.refresh();
+    const err = Currency.rateInfo && Currency.rateInfo.error;
+    msg.textContent = err ? "⚠ No se pudo obtener la TRM; se usa la última guardada." : "TRM actualizada ✓";
+  } catch (err) { msg.textContent = `⚠ ${err.message}`; }
+  finally { e.target.disabled = !Currency.available; }
+});
+
+/* ---------------- Autocompletado ---------------- */
+const norm = (s) => String(s).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+initSuggest({
+  input: $("#q"),
+  onSelect(item) {
+    // Una categoría se aplica como filtro (si existe en las facetas); lo demás se busca como texto
+    if (item.type === "categoria") {
+      const box = $$("#f-category input").find((i) => norm(i.value) === norm(item.text));
+      if (box) {
+        box.checked = true;
+        $("#q").value = "";
+        exactSearch = false; page = 1; search();
+        toast(`Filtro de categoría: ${box.value}`);
+        return;
+      }
+    }
+    searchFor(item.text);
+  },
+});
+
 /* ---------------- Inicio ---------------- */
-loadFacets().then(search);
+Promise.allSettled([loadFacets(), Currency.load()]).then(search);
 refreshCounts();
