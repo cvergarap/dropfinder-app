@@ -6,6 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 import currency
+import hooks
 import metrics
 import search
 from connectors import MockSupplierConnector
@@ -14,7 +15,7 @@ from search import unaccent  # noqa: F401  (se mantiene db.unaccent por compatib
 
 DB_PATH = os.environ.get("DROPFINDER_DB", os.path.join(os.path.dirname(__file__), "dropfinder.db"))
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 PRODUCTS_TABLE = """
 CREATE TABLE IF NOT EXISTS products (
@@ -32,6 +33,7 @@ CREATE TABLE IF NOT EXISTS products (
   total_cost REAL NOT NULL DEFAULT 0, suggested_price REAL NOT NULL DEFAULT 0, profit REAL NOT NULL DEFAULT 0,
   margin REAL NOT NULL DEFAULT 0, break_even REAL NOT NULL DEFAULT 0, trend REAL NOT NULL DEFAULT 0,
   trending INTEGER NOT NULL DEFAULT 0, score INTEGER NOT NULL DEFAULT 0,
+  match_key TEXT NOT NULL DEFAULT '',           -- v4: clave para agrupar el mismo producto entre proveedores
   UNIQUE (supplier, supplier_sku)
 );
 """
@@ -59,6 +61,18 @@ CREATE INDEX IF NOT EXISTS ix_products_ship ON products(shipping_days);
 CREATE INDEX IF NOT EXISTS ix_products_rating ON products(rating);
 CREATE INDEX IF NOT EXISTS ix_products_total ON products(total_cost);
 CREATE INDEX IF NOT EXISTS ix_products_cat_sup ON products(category, supplier);
+CREATE INDEX IF NOT EXISTS ix_products_match ON products(match_key);
+"""
+
+# v4: una alerta puede venir de un producto importado (monitor) o de una búsqueda guardada
+ALERTS_TABLE = """
+CREATE TABLE IF NOT EXISTS alerts (
+  id INTEGER PRIMARY KEY,
+  imported_id INTEGER REFERENCES imported_products(id) ON DELETE CASCADE,
+  saved_search_id INTEGER REFERENCES saved_searches(id) ON DELETE CASCADE,
+  product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+  type TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL, read INTEGER NOT NULL DEFAULT 0
+);
 """
 
 SCHEMA = PRODUCTS_TABLE + """
@@ -70,11 +84,8 @@ CREATE TABLE IF NOT EXISTS imported_products (
   status TEXT NOT NULL DEFAULT 'draft', created_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS alerts (
-  id INTEGER PRIMARY KEY,
-  imported_id INTEGER NOT NULL REFERENCES imported_products(id) ON DELETE CASCADE,
-  type TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL, read INTEGER NOT NULL DEFAULT 0
-);
+ALERTS_TABLE_DEF
+
 
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -85,7 +96,31 @@ CREATE TABLE IF NOT EXISTS search_log (
   results INTEGER NOT NULL, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_search_log_q ON search_log(q_norm);
+
+-- v4: historial diario por producto (pedidos acumulados, pedidos del día, costo, stock)
+CREATE TABLE IF NOT EXISTS product_snapshots (
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  date TEXT NOT NULL,                 -- YYYY-MM-DD
+  orders INTEGER NOT NULL,            -- pedidos acumulados a esa fecha
+  orders_day INTEGER NOT NULL,        -- pedidos de ese día
+  cost REAL NOT NULL, shipping_cost REAL NOT NULL, stock INTEGER NOT NULL,
+  PRIMARY KEY (product_id, date)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS ix_snapshots_date ON product_snapshots(date);
+
+-- v4: búsquedas guardadas (params = parámetros de /api/products en JSON)
+CREATE TABLE IF NOT EXISTS saved_searches (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, params TEXT NOT NULL,
+  notify INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, last_checked_at TEXT
+);
+CREATE TABLE IF NOT EXISTS saved_search_hits (     -- productos ya vistos por cada búsqueda guardada
+  saved_search_id INTEGER NOT NULL REFERENCES saved_searches(id) ON DELETE CASCADE,
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  first_seen_at TEXT NOT NULL,
+  PRIMARY KEY (saved_search_id, product_id)
+) WITHOUT ROWID;
 """
+SCHEMA = SCHEMA.replace("ALERTS_TABLE_DEF", ALERTS_TABLE)
 
 PRODUCT_COLS = ["supplier", "supplier_sku", "source", "title", "category", "tags", "image", "product_url",
                 "cost", "shipping_cost", "shipping_days", "warehouse", "stock", "orders", "orders_7d",
@@ -131,6 +166,21 @@ def _migrate_v1_to_v2(conn) -> None:
     conn.execute("ALTER TABLE products_new RENAME TO products")
     # Las imágenes de ejemplo ahora se generan en el navegador (sin depender de internet)
     conn.execute("UPDATE products SET image = '' WHERE image LIKE 'https://placehold.co/%'")
+
+
+def _migrate_v3_to_v4(conn) -> None:
+    """v4: products.match_key (mismo producto en varios proveedores) y alertas que pueden venir de
+    búsquedas guardadas (imported_id deja de ser obligatorio: se reconstruye la tabla conservando todo)."""
+    have = {r[1] for r in conn.execute("PRAGMA table_info(products)")}
+    if "match_key" not in have:
+        conn.execute("ALTER TABLE products ADD COLUMN match_key TEXT NOT NULL DEFAULT ''")
+    cols = {r[1]: r for r in conn.execute("PRAGMA table_info(alerts)")}
+    if cols and "saved_search_id" not in cols:
+        conn.execute(ALERTS_TABLE.replace("IF NOT EXISTS alerts", "alerts_v4"))
+        conn.execute("INSERT INTO alerts_v4(id, imported_id, type, message, created_at, read) "
+                     "SELECT id, imported_id, type, message, created_at, read FROM alerts")
+        conn.execute("DROP TABLE alerts")
+        conn.execute("ALTER TABLE alerts_v4 RENAME TO alerts")
 
 
 def _migrate_v2_to_v3(conn) -> None:
@@ -202,6 +252,7 @@ def upsert_products(conn, products, source: str) -> tuple[int, int]:
     if search.fts_enabled(conn):
         search.sync(conn)
     search.invalidate(conn)
+    hooks.run_catalog_write(conn, None)     # módulos (historial, comparador, búsquedas guardadas…)
     return new, count[0] - new
 
 
@@ -236,6 +287,7 @@ def init_db(seed_size: int = 1500) -> None:
         conn.execute("BEGIN")
         try:
             _migrate_v2_to_v3(conn)
+            _migrate_v3_to_v4(conn)
             fts = search.create_schema(conn)
             currency.ensure_schema(conn)
             for k, v in DEFAULT_SETTINGS.items():

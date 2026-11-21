@@ -16,8 +16,12 @@ from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+import compare
 import currency
 import db
+import history
+import hooks
+import saved_searches
 import search
 from connectors import CsvSupplierConnector, MockSupplierConnector
 from connectors.base import PriceStock
@@ -353,6 +357,7 @@ def run_monitor() -> dict:
             changed.append(r["product_id"])
             _check_imported(conn, r, new, s, created)
         db.recompute_metrics(conn, s, ids=changed)
+        hooks.run_catalog_write(conn, changed)
     return {"checked": checked, "skipped": skipped, "alerts": created}
 
 
@@ -423,7 +428,10 @@ def delete_supplier_catalog(qs: dict) -> dict:
 def list_alerts() -> list:
     with db.connect() as conn:
         return [dict(r) for r in conn.execute(
-            "SELECT a.*, i.title FROM alerts a JOIN imported_products i ON i.id = a.imported_id "
+            "SELECT a.*, COALESCE(i.title, p.title, s.name, '') AS title, s.name AS saved_search_name "
+            "FROM alerts a LEFT JOIN imported_products i ON i.id = a.imported_id "
+            "LEFT JOIN products p ON p.id = a.product_id "
+            "LEFT JOIN saved_searches s ON s.id = a.saved_search_id "
             "ORDER BY a.id DESC LIMIT 200")]
 
 
@@ -486,6 +494,10 @@ ROUTES = [
     ("PUT", r"/api/currency", lambda m, qs, b: currency_update(b)),
     ("POST", r"/api/currency/refresh", lambda m, qs, b: currency_refresh()),
 ]
+
+# Rutas de los módulos de funcionalidades (cada uno define su propia lista ROUTES)
+for _module in (history, compare, saved_searches):
+    ROUTES.extend(_module.ROUTES)
 
 
 class Handler(SimpleHTTPRequestHandler):
