@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 import compare
 import currency
 import db
+from errors import ApiError  # noqa: F401  (los módulos y pruebas usan server.ApiError)
 import history
 import hooks
 import saved_searches
@@ -39,12 +40,6 @@ SORTS = {
 MAX_BODY = 20 * 1024 * 1024   # 20 MB (catálogos CSV grandes)
 # Fuentes con consulta en vivo de precio/stock. Los CSV se actualizan volviendo a subir el archivo.
 LIVE_CONNECTORS = {"mock": MockSupplierConnector()}
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message)
-        self.status = status
 
 
 def _num(qs, key, cast=float):
@@ -386,7 +381,8 @@ def upload_csv(body: dict) -> dict:
     removed = 0
     with db.connect() as conn:
         s = db.get_settings(conn)
-        new, updated = db.upsert_products(conn, parsed.products, "csv")
+        touched: list = []
+        new, updated = db.upsert_products(conn, parsed.products, "csv", run_hooks=False, collect_ids=touched)
         if body.get("replace"):
             skus = [p.supplier_sku for p in parsed.products]
             conn.execute("CREATE TEMP TABLE IF NOT EXISTS _skus(sku TEXT PRIMARY KEY)")
@@ -394,11 +390,15 @@ def upload_csv(body: dict) -> dict:
             conn.executemany("INSERT OR IGNORE INTO _skus VALUES (?)", [(k,) for k in skus])
             gone = "supplier = ? AND source = 'csv' AND supplier_sku NOT IN (SELECT sku FROM _skus)"
             # Los que ya importaste no se borran: quedan sin stock (y el monitor lo avisa)
+            touched += [r[0] for r in conn.execute(
+                f"SELECT id FROM products WHERE {gone} AND id IN (SELECT product_id FROM imported_products)", (supplier,))]
             conn.execute(f"UPDATE products SET stock = 0, updated_at = ? WHERE {gone} "
                          "AND id IN (SELECT product_id FROM imported_products)", (db.now(), supplier))
             removed = conn.execute(f"DELETE FROM products WHERE {gone} "
                                    "AND id NOT IN (SELECT product_id FROM imported_products)", (supplier,)).rowcount
             search.invalidate(conn)
+        # Los módulos ven el catálogo ya completo (después del reemplazo), una sola vez
+        hooks.run_catalog_write(conn, touched)
         # Alertas para los productos importados de este proveedor cuyo costo/stock cambió
         for r in conn.execute(IMPORT_SQL + " WHERE p.supplier = ? AND p.source = 'csv'", (supplier,)).fetchall():
             _check_imported(conn, r, PriceStock(r["cost"], r["shipping_cost"], r["stock"]), s, created_alerts)
@@ -423,6 +423,11 @@ def delete_supplier_catalog(qs: dict) -> dict:
                          "AND id NOT IN (SELECT product_id FROM imported_products)", args).rowcount
     search.invalidate()
     return {"deleted": n}
+
+
+def alerts_count() -> dict:
+    with db.connect() as conn:
+        return {"unread": conn.execute("SELECT COUNT(*) FROM alerts WHERE read = 0").fetchone()[0]}
 
 
 def list_alerts() -> list:
@@ -490,6 +495,7 @@ ROUTES = [
     ("POST", r"/api/catalog/csv", lambda m, qs, b: upload_csv(b)),
     ("DELETE", r"/api/catalog", lambda m, qs, b: delete_supplier_catalog(qs)),
     ("POST", r"/api/alerts/read", lambda m, qs, b: mark_alerts_read()),
+    ("GET", r"/api/alerts/count", lambda m, qs, b: alerts_count()),
     ("GET", r"/api/currency", lambda m, qs, b: currency_state()),
     ("PUT", r"/api/currency", lambda m, qs, b: currency_update(b)),
     ("POST", r"/api/currency/refresh", lambda m, qs, b: currency_refresh()),

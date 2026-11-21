@@ -62,6 +62,11 @@ CREATE INDEX IF NOT EXISTS ix_products_rating ON products(rating);
 CREATE INDEX IF NOT EXISTS ix_products_total ON products(total_cost);
 CREATE INDEX IF NOT EXISTS ix_products_cat_sup ON products(category, supplier);
 CREATE INDEX IF NOT EXISTS ix_products_match ON products(match_key);
+CREATE INDEX IF NOT EXISTS ix_products_updated ON products(updated_at);
+CREATE INDEX IF NOT EXISTS ix_hits_product ON saved_search_hits(product_id);
+CREATE INDEX IF NOT EXISTS ix_alerts_product ON alerts(product_id);
+CREATE INDEX IF NOT EXISTS ix_alerts_saved ON alerts(saved_search_id);
+CREATE INDEX IF NOT EXISTS ix_alerts_imported ON alerts(imported_id);
 """
 
 # v4: una alerta puede venir de un producto importado (monitor) o de una búsqueda guardada
@@ -177,8 +182,10 @@ def _migrate_v3_to_v4(conn) -> None:
     cols = {r[1]: r for r in conn.execute("PRAGMA table_info(alerts)")}
     if cols and "saved_search_id" not in cols:
         conn.execute(ALERTS_TABLE.replace("IF NOT EXISTS alerts", "alerts_v4"))
+        # Se omiten alertas huérfanas (sin producto importado): con FOREIGN KEYS activas impedirían migrar
         conn.execute("INSERT INTO alerts_v4(id, imported_id, type, message, created_at, read) "
-                     "SELECT id, imported_id, type, message, created_at, read FROM alerts")
+                     "SELECT id, imported_id, type, message, created_at, read FROM alerts "
+                     "WHERE imported_id IN (SELECT id FROM imported_products)")
         conn.execute("DROP TABLE alerts")
         conn.execute("ALTER TABLE alerts_v4 RENAME TO alerts")
 
@@ -227,9 +234,14 @@ _UPSERT = (f"INSERT INTO products({','.join(_UPSERT_COLS)}) VALUES ({','.join(':
            + ", ".join(f"{c} = excluded.{c}" for c in _UPSERT_COLS if c not in ("supplier", "supplier_sku")))
 
 
-def upsert_products(conn, products, source: str) -> tuple[int, int]:
+def upsert_products(conn, products, source: str, *, run_hooks: bool = True,
+                    collect_ids: list | None = None) -> tuple[int, int]:
     """Inserta o actualiza productos normalizados (con sus métricas y el índice de búsqueda).
-    Devuelve (nuevos, actualizados)."""
+    Devuelve (nuevos, actualizados).
+
+    run_hooks=False: el llamador ejecuta hooks.run_catalog_write al terminar su operación completa
+    (p. ej. carga CSV con reemplazo), así los módulos no ven un catálogo a medio escribir.
+    collect_ids: si se pasa una lista, se le agregan los ids de los productos insertados/actualizados."""
     ts = now()
     s = get_settings(conn)
     count = [0]
@@ -252,7 +264,11 @@ def upsert_products(conn, products, source: str) -> tuple[int, int]:
     if search.fts_enabled(conn):
         search.sync(conn)
     search.invalidate(conn)
-    hooks.run_catalog_write(conn, None)     # módulos (historial, comparador, búsquedas guardadas…)
+    ids = [r[0] for r in conn.execute("SELECT id FROM products WHERE updated_at = ? AND source = ?", (ts, source))]
+    if collect_ids is not None:
+        collect_ids.extend(ids)
+    if run_hooks:
+        hooks.run_catalog_write(conn, ids)  # módulos (historial, comparador, búsquedas guardadas…)
     return new, count[0] - new
 
 
