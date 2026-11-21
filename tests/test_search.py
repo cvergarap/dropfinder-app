@@ -137,6 +137,10 @@ class SearchApiTest(unittest.TestCase):
         self.assertIsNone(d["suggestion"])
         self.assertGreater(d["total"], 0)
         self.assertEqual(d["total"], self.search("q=cargador")["total"])
+        self.assertIn("took_ms", d)
+        # exact=1: el usuario pidió buscar su texto tal cual, sin autocorrección
+        e = self.search("q=cargdor&exact=1")
+        self.assertEqual((e["total"], e["corrected_from"], e["query"]), (0, None, "cargdor"))
 
     def test_quisiste_decir_sugerencia_con_pocos_resultados(self):
         d = self.search("q=proyectr")                         # 1 producto escrito así, muchos "proyector"

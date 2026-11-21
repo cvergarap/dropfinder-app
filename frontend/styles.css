@@ -176,4 +176,12 @@ input:disabled, select:disabled { opacity: .55; }
   .topbar nav { order: 3; width: 100%; }
   .searchbar .ac-wrap { flex-basis: 100%; }
 }
+.kpis b { white-space: nowrap; font-size: 13px; }
+.kpi-label { display: none; font-style: normal; }
 @media (max-width: 420px) { .rate-badge { display: none; } }
+/* Tarjetas angostas (2 columnas en móvil): KPIs en filas para que quepan montos en COP */
+@media (max-width: 520px) {
+  .kpis { grid-template-columns: 1fr; gap: 2px; text-align: left; }
+  .kpis div { display: flex; flex-direction: row-reverse; justify-content: space-between; align-items: baseline; gap: 4px; }
+  .kpi-label { display: inline; }
+}

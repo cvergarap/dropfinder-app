@@ -62,7 +62,7 @@
     const d = Number.isInteger(c.decimals) ? c.decimals : 2;
     const num = new Intl.NumberFormat(c.locale || "en-US", { minimumFractionDigits: d, maximumFractionDigits: d })
       .format(Math.abs(Number(value)));
-    return `${Number(value) < 0 ? "-" : ""}${c.symbol} ${num}`;
+    return `${Number(value) < 0 ? "-" : ""}${c.symbol}\u00a0${num}`;   // espacio no separable: "$ 89.900"
   }
 
   function formatMoney(usd, state, kind = "amount") {

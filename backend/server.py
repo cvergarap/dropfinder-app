@@ -10,6 +10,7 @@ import math
 import os
 import re
 import threading
+import time
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -126,7 +127,12 @@ def search_products(qs: dict) -> dict:
                       resultados de la corrección y aquí va el `q` original ("Mostrando resultados para …")
       suggestion      si hay pocos resultados (1 o 2) y existe una consulta parecida con más resultados:
                       "¿Quisiste decir …?" (no se aplica sola). null en otro caso.
+      took_ms         tiempo de la consulta en el servidor (milisegundos)
+
+    Con `exact=1` no se autocorrige (el usuario pidió buscar su texto tal cual).
     """
+    started = time.perf_counter()
+    exact = qs.get("exact", ["0"])[0] == "1"
     q = qs.get("q", [""])[0].strip()[:200]
     page = max(1, _num(qs, "page", int) or 1)
     size = min(100, max(1, _num(qs, "page_size", int) or 24))
@@ -145,7 +151,7 @@ def search_products(qs: dict) -> dict:
         if use_fts:
             search.sync(conn)          # por si alguna escritura dejó productos sin indexar
         total, items = _query(conn, tokens, use_fts, where, args, sort, page, size)
-        if tokens and use_fts and total < search.FEW_RESULTS:
+        if tokens and use_fts and not exact and total < search.FEW_RESULTS:
             fix = search.correct(conn, q, current_total=total)
             if fix and fix != q:
                 fix_tokens = search.query_tokens(fix)
@@ -161,6 +167,7 @@ def search_products(qs: dict) -> dict:
         "total": total, "page": page, "page_size": size, "pages": math.ceil(total / size) if total else 0,
         "items": items, "query": effective, "sort": sort,
         "suggestion": suggestion, "corrected_from": corrected_from,
+        "took_ms": round((time.perf_counter() - started) * 1000, 1),
     }
 
 

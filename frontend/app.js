@@ -135,7 +135,10 @@ function renderHint(data) {
   const box = $("#searchHint");
   const qLink = (t, extra = "") => `<a href="#" data-q="${esc(t)}"${extra}>${esc(t)}</a>`;
   let html = "";
-  if (data.corrected_from) {
+  if (data.corrected_from && exactSearch) {
+    // El servidor volvió a corregir aunque pedimos la búsqueda exacta: no hay resultados exactos
+    html = `No hay resultados para <b>${esc(data.corrected_from)}</b>; se muestran los de <b>${esc(data.query || data.suggestion || "")}</b>.`;
+  } else if (data.corrected_from) {
     const used = data.corrected_query || data.q_used || data.query || data.suggestion;
     html = (used ? `Mostrando resultados para <b>${esc(used)}</b>. ` : "Mostrando resultados con la búsqueda corregida. ") +
       `Buscar en cambio ${qLink(data.corrected_from, ' data-exact="1"')}`;
@@ -166,7 +169,7 @@ function card(p) {
       <div class="kpis">
         <div><b>${money(p.total_cost)}</b><span>Costo</span></div>
         <div><b>${money(p.suggested_price, { kind: "price" })}</b><span>Venta</span></div>
-        <div><b class="${p.profit >= 0 ? "good" : "bad"}">${money(p.profit)}</b><span>${p.margin}%</span></div>
+        <div><b class="${p.profit >= 0 ? "good" : "bad"}">${money(p.profit)}</b><span><i class="kpi-label">Ganancia · </i>${p.margin}%</span></div>
       </div>
       <div class="actions">${p.imported_id
         ? `<button class="ghost" disabled>✓ Importado</button>`
