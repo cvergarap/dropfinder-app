@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import threading
 import time
 from http import HTTPStatus
@@ -117,6 +118,25 @@ def _query(conn, tokens, use_fts, where, args, sort, page, size, count_only=Fals
     return total, [_item(r) for r in rows]
 
 
+MAX_PAGE = 100_000            # evita OFFSET fuera de rango en SQLite
+
+
+def _best_effort(conn, fn, *args) -> None:
+    """Escrituras secundarias de una búsqueda (indexar pendientes, registrar la consulta).
+    Si otra escritura larga tiene la base bloqueada (carga de CSV, monitor), se omiten en vez de
+    hacer esperar la búsqueda 5 s y fallar con 500: la búsqueda es lectura y debe responder siempre."""
+    conn.execute("PRAGMA busy_timeout = 200")
+    try:
+        conn.execute("SAVEPOINT best_effort")
+        fn(conn, *args)
+        conn.execute("RELEASE best_effort")
+    except sqlite3.OperationalError:
+        conn.execute("ROLLBACK TO best_effort")
+        conn.execute("RELEASE best_effort")
+    finally:
+        conn.execute("PRAGMA busy_timeout = 5000")
+
+
 def search_products(qs: dict) -> dict:
     """Búsqueda con texto completo, filtros, orden y paginación en SQL.
 
@@ -134,7 +154,7 @@ def search_products(qs: dict) -> dict:
     started = time.perf_counter()
     exact = qs.get("exact", ["0"])[0] == "1"
     q = qs.get("q", [""])[0].strip()[:200]
-    page = max(1, _num(qs, "page", int) or 1)
+    page = min(MAX_PAGE, max(1, _num(qs, "page", int) or 1))
     size = min(100, max(1, _num(qs, "page_size", int) or 24))
     where, args = _filters(qs)
     tokens = search.query_tokens(q)
@@ -148,8 +168,10 @@ def search_products(qs: dict) -> dict:
     effective = q
     with db.connect() as conn:
         use_fts = search.fts_enabled(conn)
+        if sort == "relevance" and not use_fts:
+            sort = "score"             # sin FTS5 no hay ranking de relevancia
         if use_fts:
-            search.sync(conn)          # por si alguna escritura dejó productos sin indexar
+            _best_effort(conn, search.sync)    # por si alguna escritura dejó productos sin indexar
         total, items = _query(conn, tokens, use_fts, where, args, sort, page, size)
         if tokens and use_fts and not exact and total < search.FEW_RESULTS:
             fix = search.correct(conn, q, current_total=total)
@@ -162,7 +184,7 @@ def search_products(qs: dict) -> dict:
                 elif _query(conn, fix_tokens, use_fts, where, args, sort, page, size, count_only=True)[0] > total:
                     suggestion = fix
         if tokens and page == 1:      # para el autocompletado se guarda la consulta ya corregida
-            search.log_search(conn, effective, total, db.now())
+            _best_effort(conn, search.log_search, effective, total, db.now())
     return {
         "total": total, "page": page, "page_size": size, "pages": math.ceil(total / size) if total else 0,
         "items": items, "query": effective, "sort": sort,
@@ -371,7 +393,7 @@ def upload_csv(body: dict) -> dict:
                          "AND id IN (SELECT product_id FROM imported_products)", (db.now(), supplier))
             removed = conn.execute(f"DELETE FROM products WHERE {gone} "
                                    "AND id NOT IN (SELECT product_id FROM imported_products)", (supplier,)).rowcount
-            search.invalidate()
+            search.invalidate(conn)
         # Alertas para los productos importados de este proveedor cuyo costo/stock cambió
         for r in conn.execute(IMPORT_SQL + " WHERE p.supplier = ? AND p.source = 'csv'", (supplier,)).fetchall():
             _check_imported(conn, r, PriceStock(r["cost"], r["shipping_cost"], r["stock"]), s, created_alerts)

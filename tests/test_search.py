@@ -280,6 +280,62 @@ INSERT INTO settings VALUES ('multiplier', '3.0');
 """
 
 
+class ReviewRegressionTest(unittest.TestCase):
+    """Hallazgos de la revisión del PR #1."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = _TempDb()
+        db.init_db(seed_size=300)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.close()
+
+    def test_search_does_not_fail_while_db_is_locked(self):
+        import time
+        blocker = sqlite3.connect(db.DB_PATH)
+        blocker.execute("BEGIN IMMEDIATE")          # simula una carga de CSV larga
+        try:
+            t0 = time.perf_counter()
+            r = server.search_products({"q": ["cargador nuevo"]})   # página 1: intenta registrar la búsqueda
+            elapsed = time.perf_counter() - t0
+        finally:
+            blocker.rollback()
+            blocker.close()
+        self.assertGreaterEqual(r["total"], 0)
+        self.assertLess(elapsed, 2.0)               # antes: esperaba 5 s y respondía 500
+
+    def test_cache_not_stale_after_concurrent_rebuild(self):
+        before = server.facets()["total"]
+        from connectors import CsvSupplierConnector
+        parsed = CsvSupplierConnector("Prov Cache", "sku;titulo;costo\nC-1;Taza azul;3\n").result
+        with db.connect() as conn:
+            db.upsert_products(conn, parsed.products, "csv")
+            server.facets()                          # otra petición reconstruye la caché antes del commit
+        self.assertEqual(server.facets()["total"], before + 1)
+
+    def test_relevance_falls_back_without_fts(self):
+        original = search.fts_enabled
+        search.fts_enabled = lambda conn: False
+        try:
+            r = server.search_products({"q": ["cargador"]})
+        finally:
+            search.fts_enabled = original
+        self.assertEqual(r["sort"], "score")
+
+    def test_huge_page_number(self):
+        r = server.search_products({"page": ["99999999999999999999"]})
+        self.assertEqual(r["items"], [])
+
+    def test_repeated_search_logged_once(self):
+        for _ in range(5):                           # cambiar filtros/orden repite la página 1
+            server.search_products({"q": ["organizador unico"], "sort": ["orders"]})
+        with db.connect() as conn:
+            n = conn.execute("SELECT COUNT(*) FROM search_log WHERE q_norm = 'organizador unico'").fetchone()[0]
+        self.assertEqual(n, 1)
+
+
 class MigrationTest(unittest.TestCase):
     def setUp(self):
         self.tmp = _TempDb()

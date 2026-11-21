@@ -101,7 +101,10 @@ class _Conn(sqlite3.Connection):
 
     def __exit__(self, *exc):
         try:
-            return super().__exit__(*exc)
+            result = super().__exit__(*exc)
+            if exc[0] is None and getattr(self, "df_invalidate_on_commit", False):
+                search.invalidate()      # ver search.invalidate: evita cachés reconstruidas con datos viejos
+            return result
         finally:
             self.close()
 
@@ -164,7 +167,7 @@ def recompute_metrics(conn, s: dict | None = None, ids=None) -> int:
         conn.executemany(_UPDATE_METRICS, updates)
         n += len(updates)
     if n:
-        search.invalidate()
+        search.invalidate(conn)
     return n
 
 
@@ -198,7 +201,7 @@ def upsert_products(conn, products, source: str) -> tuple[int, int]:
     new = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] - before
     if search.fts_enabled(conn):
         search.sync(conn)
-    search.invalidate()
+    search.invalidate(conn)
     return new, count[0] - new
 
 

@@ -133,9 +133,18 @@ _gen = 0                      # se incrementa cada vez que cambia el catálogo o
 _cache: dict[str, tuple[int, object]] = {}
 
 
-def invalidate() -> None:
-    """Invalida facetas, vocabulario y títulos de autocompletado (llamar tras cambios en el catálogo)."""
+def invalidate(conn=None) -> None:
+    """Invalida facetas, vocabulario y títulos de autocompletado (llamar tras cambios en el catálogo).
+
+    Si se pasa la conexión de una transacción abierta, se vuelve a invalidar al hacer commit
+    (db._Conn): otra petición podría reconstruir la caché con los datos viejos entre este momento
+    y el commit, y quedaría desactualizada hasta la siguiente escritura."""
     global _gen
+    if conn is not None:
+        try:
+            conn.df_invalidate_on_commit = True
+        except AttributeError:      # conexión sqlite3 sin la clase de db: solo se invalida ahora
+            pass
     with _lock:
         _gen += 1
         _cache.clear()
@@ -222,7 +231,7 @@ def sync(conn) -> int:
     conn.executemany("INSERT OR REPLACE INTO products_fts(rowid, title, category, tags) VALUES (?, ?, ?, ?)",
                      map(_doc, rows))
     conn.execute("DELETE FROM fts_dirty")
-    invalidate()
+    invalidate(conn)
     return len(rows)
 
 
@@ -236,7 +245,7 @@ def reindex_all(conn) -> int:
         conn.executemany("INSERT INTO products_fts(rowid, title, category, tags) VALUES (?, ?, ?, ?)",
                          map(_doc, chunk))
         n += len(chunk)
-    invalidate()
+    invalidate(conn)
     return n
 
 
@@ -375,9 +384,23 @@ def correct(conn, q: str, current_total: int = 0) -> str | None:
 
 # ---------------------------------------------------------------- registro de búsquedas y autocompletado
 
+LOG_WINDOW_MINUTES = 30      # la misma búsqueda repetida dentro de la ventana cuenta una sola vez
+LOG_MAX_ROWS = 20_000        # tope del historial de búsquedas (se podan las más antiguas)
+
+
 def log_search(conn, q: str, results: int, ts: str) -> None:
-    conn.execute("INSERT INTO search_log(q, q_norm, results, created_at) VALUES (?, ?, ?, ?)",
-                 (q[:120], " ".join(tokenize(q))[:120], results, ts))
+    """Registra una búsqueda para "búsquedas populares". Cambiar filtros u orden vuelve a la página 1
+    con el mismo texto: esas repeticiones no se cuentan (ventana de LOG_WINDOW_MINUTES)."""
+    q_norm = " ".join(tokenize(q))[:120]
+    recent = conn.execute(
+        "SELECT 1 FROM search_log WHERE q_norm = ? AND created_at >= datetime(?, ?) LIMIT 1",
+        (q_norm, ts, f"-{LOG_WINDOW_MINUTES} minutes")).fetchone()
+    if recent:
+        return
+    cur = conn.execute("INSERT INTO search_log(q, q_norm, results, created_at) VALUES (?, ?, ?, ?)",
+                       (q[:120], q_norm, results, ts))
+    if cur.lastrowid and cur.lastrowid % 500 == 0:
+        conn.execute("DELETE FROM search_log WHERE id <= ?", (cur.lastrowid - LOG_MAX_ROWS,))
     with _lock:
         _cache.pop("popular", None)
 
