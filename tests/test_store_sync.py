@@ -271,7 +271,7 @@ class WorkerTest(Base):
         now = utc().replace(microsecond=0)
         deltas = []
         for attempt in range(1, 6):
-            FakeStore.fail_next.append(sc.StoreError("tienda caída", retryable=True))
+            FakeStore.fail_next.append(sc.StoreError("tienda caída", retryable=True, not_sent=True))
             self.assertEqual(store_sync.run_due_jobs(now=now), {"processed": 1, "failed": 1})
             j = self.jobs(lid)[0]
             if attempt < 5:
@@ -449,7 +449,8 @@ class WorkerTest(Base):
         _, (lid,) = self.queued()
         FakeStore.fail_next.append(RuntimeError("bug"))
         self.assertEqual(store_sync.run_due_jobs()["failed"], 1)
-        self.assertEqual(self.jobs(lid)[0]["status"], "pending")
+        self.assertEqual(self.jobs(lid)[0]["status"], "failed")            # ambiguo y sin idempotencia: no se repite solo
+        self.assertEqual(self.listing(lid)["status"], "error")
 
     def test_log_records_actions(self):
         store, iid, lid = self.published()
@@ -801,15 +802,13 @@ class PublishSaveFailureTest(Base):
         FakeStore.publish = boom
         self.addCleanup(lambda: setattr(FakeStore, "publish", orig))
         store_sync.run_due_jobs()
-        j = self.jobs(lid)[0]
-        self.assertEqual(j["status"], "pending")
-        self.assertIn("_remote_started", j["payload"])                     # requeue conserva la marca
+        self.assertEqual(self.jobs(lid)[0]["status"], "failed")
         FakeStore.publish = orig
         for _ in range(3):
             store_sync.run_due_jobs(now=utc() + timedelta(hours=3))
         self.assertEqual(len(FakeStore.stores[self.domain]["products"]), 1)
         self.assertEqual(self.listing(lid)["status"], "error")
-        self.assertIn("Revisa tu tienda", self.listing(lid)["last_error"])
+        self.assertIn("revisa tu tienda", self.listing(lid)["last_error"].lower())
 
     def test_idempotent_connector_may_retry_and_adopts(self):
         store = self.connect(platform="fakeidem")
@@ -1002,6 +1001,84 @@ class ReviewVisibilityAndPriceTest(ChangeDuringRunningJobTest):
         store_sync.run_due_jobs()
         l = self.listing(lid)
         self.assertEqual((l["status"], l["currency"], self.remote(lid)["price"]), ("published", "COP", 80900.0))
+
+
+class AmbiguousPublishErrorsTest(Base):
+    """Un error ambiguo de publish() en un conector sin idempotent_publish NO se reintenta solo (duplicaría un
+    producto en vivo); solo si la tienda lo rechazó (límite de velocidad) o la petición nunca salió (not_sent)."""
+
+    def setup_publish(self, platform="fake"):
+        store = getattr(self, "_store", None) or self.connect(platform=platform)
+        self._store = store
+        r = store_sync.publish(store["id"], {"imported_ids": [self.imp()]})
+        return r["queued"][0]["listing_id"]
+
+    def creating_then_failing(self, exc):
+        """publish() que SÍ crea el producto en la tienda y luego falla (respuesta perdida)."""
+        orig = FakeStore.publish
+
+        def pub(self_, product):
+            orig(self_, product)
+            raise exc
+        FakeStore.publish = pub
+        self.addCleanup(lambda: setattr(FakeStore, "publish", orig))
+        return lambda: setattr(FakeStore, "publish", orig)
+
+    def test_ambiguous_retryable_error_is_not_retried_and_leaves_one_product(self):
+        for exc in (sc.StoreError("tiempo agotado", retryable=True), sc.StoreError("HTTP 502", retryable=True),
+                    RuntimeError("bug")):
+            lid = self.setup_publish()
+            restore = self.creating_then_failing(exc)
+            store_sync.run_due_jobs()
+            restore()
+            for _ in range(3):
+                store_sync.run_due_jobs(now=utc() + timedelta(hours=5))
+            self.assertEqual(len(FakeStore.stores[self.domain]["products"]), 1, exc)
+            l = self.listing(lid)
+            self.assertEqual(l["status"], "error")
+            self.assertIn("No sabemos si la tienda creó el producto", l["last_error"])
+            self.assertIn("SKU DF-", l["last_error"])
+            self.assertEqual(self.jobs(lid)[0]["status"], "failed")
+            store_sync.delete_listing(lid, {})
+            FakeStore.stores[self.domain]["products"].clear()
+
+    def test_not_sent_and_rate_limited_are_retried(self):
+        for exc in (sc.StoreError("sin DNS", retryable=True, not_sent=True), sc.StoreRateLimited("lento", 5)):
+            lid = self.setup_publish()
+            FakeStore.fail_next.append(exc)
+            store_sync.run_due_jobs()
+            self.assertEqual(self.jobs(lid)[0]["status"], "pending", exc)
+            store_sync.run_due_jobs(now=utc() + timedelta(hours=1))
+            self.assertEqual(self.listing(lid)["status"], "hidden")
+            store_sync.delete_listing(lid, {})
+            FakeStore.stores[self.domain]["products"].clear()
+            with db.connect() as conn:
+                conn.execute("DELETE FROM meta WHERE key LIKE 'ss:pub:%'")
+
+    def test_idempotent_connector_retries_ambiguous_errors_and_adopts(self):
+        lid = self.setup_publish("fakeidem")
+        restore = self.creating_then_failing(sc.StoreError("tiempo agotado", retryable=True))
+        store_sync.run_due_jobs()
+        self.assertEqual(self.jobs(lid)[0]["status"], "pending")
+        restore()
+        store_sync.run_due_jobs(now=utc() + timedelta(hours=1))
+        self.assertEqual(len(FakeStore.stores[self.domain]["products"]), 1)
+        self.assertEqual(self.listing(lid)["status"], "hidden")
+
+    def test_definitive_refusals_keep_their_own_handling(self):
+        lid = self.setup_publish()
+        FakeStore.fail_next.append(sc.StoreValidationError("título inválido"))
+        store_sync.run_due_jobs()
+        self.assertIn("título inválido", self.listing(lid)["last_error"])    # no es el aviso de "no sabemos"
+
+    def test_retry_warns_that_it_may_duplicate(self):
+        lid = self.setup_publish()
+        self.creating_then_failing(sc.StoreError("tiempo agotado", retryable=True))
+        store_sync.run_due_jobs()
+        res = store_sync.listing_action(lid, "retry")
+        self.assertIn("podría duplicarse", res["warning"])
+        with db.connect() as conn:
+            self.assertIn("duplic", conn.execute("SELECT message FROM store_sync_log ORDER BY id DESC").fetchone()[0])
 
 
 class ListingActionsTest(Base):
@@ -1409,7 +1486,7 @@ class ReviewMinorsTest(Base):
         self.assertEqual(store_sync.queue_state(), {"pending": 0, "running": 0, "failed": 0})
 
     def test_exceptions_are_logged_without_foreign_messages_or_tracebacks(self):
-        store = self.connect()
+        store = self.connect(platform="fakeidem")
         store_sync.publish(store["id"], {"imported_ids": [self.imp()]})
         FakeStore.fail_next.append(RuntimeError("token shpat_abcdef0123456789abcdef revocado"))
         with self.assertLogs("dropfinder.store_sync", level="ERROR") as cm:

@@ -34,14 +34,20 @@ la pone en 0).
 Un borrador (`hidden` con hidden_by_rule=0) nunca se muestra solo.
 `meta.ss:base:<listing_id>` guarda precio y costo al publicar (tope de 2x y "el costo subió").
 
-Riesgo residual (caída justo después de crear en la tienda)
------------------------------------------------------------
-El contrato no permite buscar por SKU, así que no se puede comprobar si el producto ya existe. Mitigación: (1) el id
-externo se guarda y el trabajo se marca `done` en UNA sola transacción en cuanto `publish()` responde; (2) antes de
-llamar a la tienda se deja la marca `_remote_started` en el trabajo; si el proceso muere con el trabajo en `running`
-y esa marca puesta, NO se reintenta solo: el anuncio pasa a `error` pidiendo revisar la tienda (SKU `DF-<id>`) y el
-usuario decide con "Reintentar". Queda un riesgo mínimo: que el conector falle con un error `retryable` (p. ej. tiempo
-agotado) cuando la tienda sí creó el producto; ese reintento podría duplicarlo (el SKU DF-<id> permite encontrarlo).
+Riesgo residual (publicación ambigua)
+-------------------------------------
+El contrato no permite buscar por SKU, así que no se puede comprobar si el producto ya existe. Reglas:
+(1) El id externo se guarda y el trabajo se marca `done` en UNA transacción en cuanto `publish()` responde, con
+    reintentos acotados (SAVE_TRIES); por un fallo local jamás se vuelve a llamar a `publish()`.
+(2) Antes de llamar a la tienda se deja la marca `_remote_started`. Si el proceso muere con ella puesta, o si no se
+    pudo guardar el resultado, el anuncio pasa a `error` (aviso con el SKU `DF-<id>`): solo un conector con
+    `idempotent_publish` (Shopify adopta por etiqueta) repite la llamada solo.
+(3) Si `publish()` falla en un conector SIN `idempotent_publish`, solo se reintenta cuando la tienda lo rechazó
+    explícitamente (`StoreRateLimited`) o la petición nunca salió (`StoreError.not_sent`). Cualquier error ambiguo
+    (timeouts, 5xx, conexión cortada tras enviar, errores internos) deja el anuncio en `error` con "No sabemos si la
+    tienda creó el producto…" y el usuario decide con Reintentar (la respuesta de `retry` trae un `warning`: puede
+    duplicar). Credenciales/validación/no encontrado son rechazos definitivos y siguen su política normal.
+Riesgo que queda: el usuario reintenta sin revisar la tienda y el producto ya existía (duplicado, avisado).
 """
 from __future__ import annotations
 
@@ -510,8 +516,9 @@ def listing_action(lid: int, action: str) -> dict:
     with db.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         r = _own_listing(conn, lid, uid)
+        warning = None
         if action == "retry":
-            _retry(conn, r, uid)
+            warning = _retry(conn, r, uid)
         elif action == "sync":
             if not r["external_id"] or r["status"] not in ("published", "hidden", "error"):
                 raise ApiError(409, "El anuncio todavía no está publicado en la tienda: no se puede sincronizar",
@@ -530,7 +537,7 @@ def listing_action(lid: int, action: str) -> dict:
                  "Se pidió ocultar el producto" if action == "hide" else "Se pidió mostrar el producto")
         view = _view(_own_listing(conn, lid, uid))
     _kick()
-    return {"listing": view}
+    return {"listing": view, **({"warning": warning} if warning else {})}
 
 
 def _need_queued(conn, lid: int, action: str) -> None:
@@ -541,7 +548,9 @@ def _need_queued(conn, lid: int, action: str) -> None:
                             "de nuevo.", "action_in_progress")
 
 
-def _retry(conn, r, uid: int) -> None:
+def _retry(conn, r, uid: int) -> str | None:
+    """Devuelve un aviso (o None) para mostrar al usuario."""
+    warning = None
     lid = r["id"]
     active = {x[0] for x in conn.execute("SELECT action FROM store_jobs WHERE listing_id = ? AND status IN "
                                          "('pending', 'running')", (lid,))}
@@ -559,6 +568,9 @@ def _retry(conn, r, uid: int) -> None:
         if not crow or not imp:
             raise ApiError(409, "El producto ya no está en Mis productos: no se puede volver a publicar", "no_product")
         old = _payload(failed) if failed is not None and failed["action"] == "publish" else {}
+        if old.get("_remote_started"):
+            warning = ("Es posible que el producto ya exista en tu tienda: si lo reintentas podría duplicarse. "
+                       f"Revisa el SKU {_sku_of(old)} antes de continuar.")
         as_draft = not old.get("product", {}).get("active", not stores_mod.load_settings(crow)["publish_as_draft"])
         payload, reason, msg = _snapshot(crow, imp, currency.get_state(conn, user_id=uid), as_draft)
         if payload is None:
@@ -566,7 +578,8 @@ def _retry(conn, r, uid: int) -> None:
         conn.execute("UPDATE store_listings SET status = 'pending', external_id = NULL, external_variant_id = NULL, "
                      "external_inventory_id = NULL, external_url = NULL, last_error = NULL WHERE id = ?", (lid,))
         _enqueue(conn, uid, lid, "publish", payload)
-        _log(conn, uid, r["connection_id"], lid, "publish", True, "Nueva publicación en cola (reintento del usuario)")
+        _log(conn, uid, r["connection_id"], lid, "publish", True,
+             "Nueva publicación en cola (reintento del usuario)" + (f". Aviso: {warning}" if warning else ""))
     elif failed is not None:
         payload = _payload(failed)
         payload.pop("_remote_started", None)
@@ -579,6 +592,7 @@ def _retry(conn, r, uid: int) -> None:
         _log(conn, uid, r["connection_id"], lid, "sync", True, "Reintento pedido por el usuario")
     else:
         raise ApiError(409, "Este anuncio no necesita reintento", "no_retry_needed")
+    return warning
 
 
 def delete_listing(lid: int, qs: dict) -> dict:
@@ -769,6 +783,17 @@ def _idempotent(platform: str) -> bool:
         return False
 
 
+def _ambiguous(e: BaseException) -> bool:
+    """¿Pudo la tienda haber creado el producto aunque publish() fallara? No si rechazó explícitamente (límite de
+    velocidad, credenciales, validación, no encontrado, error no reintentable) ni si la petición nunca salió
+    (`not_sent`). Sí: errores reintentables ambiguos (timeouts, 5xx, resets) y cualquier error que no sea de la tienda."""
+    if not isinstance(e, sc.StoreError):
+        return True
+    if isinstance(e, (sc.StoreRateLimited, sc.StoreAuthError, sc.StoreValidationError, sc.StoreNotFound)):
+        return False
+    return bool(e.retryable) and getattr(e, "not_sent", False) is not True
+
+
 def _mark_unsafe(c, job, lst, msg: str, now) -> None:
     """Terminal sin reintento automático: trabajo `failed` y anuncio `error` con el aviso."""
     c.execute("UPDATE store_jobs SET locked_until = NULL, status = 'failed', last_error = ?, updated_at = ? WHERE id = ?",
@@ -906,7 +931,15 @@ def _do_publish(job, lst, crow, connector, payload, now) -> None:
         (json.dumps({**payload, "_remote_started": _ts(now)}), job["id"])).rowcount)
     if not marked:
         return                                   # lo recuperó otro trabajador
-    ref = connector.publish(sp)                  # ← llamada a la tienda: sin transacción abierta
+    try:
+        ref = connector.publish(sp)              # ← llamada a la tienda: sin transacción abierta
+    except Exception as e:  # noqa: BLE001
+        if not getattr(connector, "idempotent_publish", False) and _ambiguous(e):
+            # Tiempo agotado / 5xx / conexión cortada tras enviar / error interno: la tienda pudo crear el producto
+            # y perderse la respuesta. Sin idempotencia NO se repite solo (duplicaría un producto en vivo).
+            raise _Blocked(f"No sabemos si la tienda creó el producto: revisa tu tienda (SKU {sku}) antes de "
+                           "reintentar.") from None
+        raise
     # El resultado se guarda con reintentos acotados (el producto YA existe en la tienda y el id está en memoria):
     # jamás se vuelve a llamar a publish() por un fallo local.
 
