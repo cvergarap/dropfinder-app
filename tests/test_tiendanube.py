@@ -25,6 +25,7 @@ STORE = "123456"
 TOKEN = "tn_token_valido_123"
 EMAIL = "ayuda@dropfinder.test"
 C = tiendanube.TiendanubeConnector
+OWN_TAGS = ("dropfinder", "dfi-abc123")
 
 
 class Base(unittest.TestCase):
@@ -49,7 +50,7 @@ class Base(unittest.TestCase):
     def product(self, **kw):
         d = dict(title="Lámpara <LED> & más", price=19.9, sku="DF-1", stock=7, description="Línea 1\nLínea <b>2</b>",
                  image_urls=["https://cdn.x.com/a.jpg", "http://x.com/b.jpg", "javascript:alert(1)", "https://u:p@x.com/c.jpg"],
-                 compare_at_price=None, vendor="Prov", product_type="Hogar", tags=["a", "b,c"], cost=7.5)
+                 compare_at_price=None, vendor="Prov", product_type="Hogar", tags=list(OWN_TAGS), cost=7.5)
         d.update(kw)
         return StoreProduct(**d)
 
@@ -196,7 +197,7 @@ class PublishTest(Base):
         self.assertEqual(r["body"], {
             "name": {"es": "Lámpara <LED> & más"},
             "description": {"es": "Línea 1<br>Línea &lt;b&gt;2&lt;/b&gt;"},
-            "published": False, "brand": "Prov", "tags": "a,b c",
+            "published": False, "brand": "Prov", "tags": "dropfinder,dfi-abc123",
             "images": [{"src": "https://cdn.x.com/a.jpg"}],
             "variants": [{"price": "19.90", "stock": 7, "stock_management": True, "sku": "DF-1",
                            "cost": "7.50"}]})
@@ -296,13 +297,14 @@ class IdempotentPublishTest(Base):
         self.seed()
         self.fake.stores[STORE]["products"].clear()
         with mock.patch.object(C, "_call", return_value={"id": 5, "variants": [{"id": 6, "sku": "OTRO"}]}) as c:
-            self.assertIsNone(self.conn()._find_existing("DF-1"))
-        with mock.patch.object(C, "_call", return_value=[{"id": 5, "variants": [{"id": 6, "sku": "DF-1"}]}]):
-            self.assertEqual(self.conn()._find_existing("DF-1")["id"], 5)
+            self.assertIsNone(self.conn()._find_existing("DF-1", OWN_TAGS))
+        own = "dropfinder,dfi-abc123"
+        with mock.patch.object(C, "_call", return_value=[{"id": 5, "tags": own, "variants": [{"id": 6, "sku": "DF-1"}]}]):
+            self.assertEqual(self.conn()._find_existing("DF-1", OWN_TAGS)["id"], 5)
         with mock.patch.object(C, "_call", return_value=None):
-            self.assertIsNone(self.conn()._find_existing("DF-1"))
-        with mock.patch.object(C, "_call", return_value={"id": "x", "variants": [{"id": 6, "sku": "DF-1"}]}):
-            self.assertIsNone(self.conn()._find_existing("DF-1"))
+            self.assertIsNone(self.conn()._find_existing("DF-1", OWN_TAGS))
+        with mock.patch.object(C, "_call", return_value={"id": "x", "tags": own, "variants": [{"id": 6, "sku": "DF-1"}]}):
+            self.assertIsNone(self.conn()._find_existing("DF-1", OWN_TAGS))
 
     def test_lost_response_on_create_then_retry_gives_one_product(self):
         self.fake.inject("execute_then_drop", op="product_create")
@@ -1024,10 +1026,10 @@ class SkuLookupFormatsTest(Base):
     def test_list_without_matching_sku_creates(self):
         items = [{"id": 5, "variants": [{"id": 6, "sku": "OTRO"}]}, {"id": 7, "variants": [{"id": 8, "sku": "TAMBIEN-OTRO"}]}]
         with mock.patch.object(C, "_call", return_value=items):
-            self.assertIsNone(self.conn()._find_existing("DF-1"))
-        items.append({"id": 9, "variants": [{"id": 10, "sku": "DF-1"}]})
+            self.assertIsNone(self.conn()._find_existing("DF-1", OWN_TAGS))
+        items.append({"id": 9, "tags": "dropfinder,dfi-abc123", "variants": [{"id": 10, "sku": "DF-1"}]})
         with mock.patch.object(C, "_call", return_value=items):
-            self.assertEqual(self.conn()._find_existing("DF-1")["id"], 9)
+            self.assertEqual(self.conn()._find_existing("DF-1", OWN_TAGS)["id"], 9)
 
 
 class LanguageTest(Base):
