@@ -6,6 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 import currency
+import hooks
 import metrics
 import search
 from connectors import MockSupplierConnector
@@ -14,7 +15,7 @@ from search import unaccent  # noqa: F401  (se mantiene db.unaccent por compatib
 
 DB_PATH = os.environ.get("DROPFINDER_DB", os.path.join(os.path.dirname(__file__), "dropfinder.db"))
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 PRODUCTS_TABLE = """
 CREATE TABLE IF NOT EXISTS products (
@@ -32,6 +33,7 @@ CREATE TABLE IF NOT EXISTS products (
   total_cost REAL NOT NULL DEFAULT 0, suggested_price REAL NOT NULL DEFAULT 0, profit REAL NOT NULL DEFAULT 0,
   margin REAL NOT NULL DEFAULT 0, break_even REAL NOT NULL DEFAULT 0, trend REAL NOT NULL DEFAULT 0,
   trending INTEGER NOT NULL DEFAULT 0, score INTEGER NOT NULL DEFAULT 0,
+  match_key TEXT NOT NULL DEFAULT '',           -- v4: clave para agrupar el mismo producto entre proveedores
   UNIQUE (supplier, supplier_sku)
 );
 """
@@ -59,6 +61,23 @@ CREATE INDEX IF NOT EXISTS ix_products_ship ON products(shipping_days);
 CREATE INDEX IF NOT EXISTS ix_products_rating ON products(rating);
 CREATE INDEX IF NOT EXISTS ix_products_total ON products(total_cost);
 CREATE INDEX IF NOT EXISTS ix_products_cat_sup ON products(category, supplier);
+CREATE INDEX IF NOT EXISTS ix_products_match ON products(match_key);
+CREATE INDEX IF NOT EXISTS ix_products_updated ON products(updated_at);
+CREATE INDEX IF NOT EXISTS ix_hits_product ON saved_search_hits(product_id);
+CREATE INDEX IF NOT EXISTS ix_alerts_product ON alerts(product_id);
+CREATE INDEX IF NOT EXISTS ix_alerts_saved ON alerts(saved_search_id);
+CREATE INDEX IF NOT EXISTS ix_alerts_imported ON alerts(imported_id);
+"""
+
+# v4: una alerta puede venir de un producto importado (monitor) o de una búsqueda guardada
+ALERTS_TABLE = """
+CREATE TABLE IF NOT EXISTS alerts (
+  id INTEGER PRIMARY KEY,
+  imported_id INTEGER REFERENCES imported_products(id) ON DELETE CASCADE,
+  saved_search_id INTEGER REFERENCES saved_searches(id) ON DELETE CASCADE,
+  product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+  type TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL, read INTEGER NOT NULL DEFAULT 0
+);
 """
 
 SCHEMA = PRODUCTS_TABLE + """
@@ -70,11 +89,8 @@ CREATE TABLE IF NOT EXISTS imported_products (
   status TEXT NOT NULL DEFAULT 'draft', created_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS alerts (
-  id INTEGER PRIMARY KEY,
-  imported_id INTEGER NOT NULL REFERENCES imported_products(id) ON DELETE CASCADE,
-  type TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL, read INTEGER NOT NULL DEFAULT 0
-);
+ALERTS_TABLE_DEF
+
 
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -85,7 +101,31 @@ CREATE TABLE IF NOT EXISTS search_log (
   results INTEGER NOT NULL, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_search_log_q ON search_log(q_norm);
+
+-- v4: historial diario por producto (pedidos acumulados, pedidos del día, costo, stock)
+CREATE TABLE IF NOT EXISTS product_snapshots (
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  date TEXT NOT NULL,                 -- YYYY-MM-DD
+  orders INTEGER NOT NULL,            -- pedidos acumulados a esa fecha
+  orders_day INTEGER NOT NULL,        -- pedidos de ese día
+  cost REAL NOT NULL, shipping_cost REAL NOT NULL, stock INTEGER NOT NULL,
+  PRIMARY KEY (product_id, date)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS ix_snapshots_date ON product_snapshots(date);
+
+-- v4: búsquedas guardadas (params = parámetros de /api/products en JSON)
+CREATE TABLE IF NOT EXISTS saved_searches (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, params TEXT NOT NULL,
+  notify INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, last_checked_at TEXT
+);
+CREATE TABLE IF NOT EXISTS saved_search_hits (     -- productos ya vistos por cada búsqueda guardada
+  saved_search_id INTEGER NOT NULL REFERENCES saved_searches(id) ON DELETE CASCADE,
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  first_seen_at TEXT NOT NULL,
+  PRIMARY KEY (saved_search_id, product_id)
+) WITHOUT ROWID;
 """
+SCHEMA = SCHEMA.replace("ALERTS_TABLE_DEF", ALERTS_TABLE)
 
 PRODUCT_COLS = ["supplier", "supplier_sku", "source", "title", "category", "tags", "image", "product_url",
                 "cost", "shipping_cost", "shipping_days", "warehouse", "stock", "orders", "orders_7d",
@@ -133,6 +173,23 @@ def _migrate_v1_to_v2(conn) -> None:
     conn.execute("UPDATE products SET image = '' WHERE image LIKE 'https://placehold.co/%'")
 
 
+def _migrate_v3_to_v4(conn) -> None:
+    """v4: products.match_key (mismo producto en varios proveedores) y alertas que pueden venir de
+    búsquedas guardadas (imported_id deja de ser obligatorio: se reconstruye la tabla conservando todo)."""
+    have = {r[1] for r in conn.execute("PRAGMA table_info(products)")}
+    if "match_key" not in have:
+        conn.execute("ALTER TABLE products ADD COLUMN match_key TEXT NOT NULL DEFAULT ''")
+    cols = {r[1]: r for r in conn.execute("PRAGMA table_info(alerts)")}
+    if cols and "saved_search_id" not in cols:
+        conn.execute(ALERTS_TABLE.replace("IF NOT EXISTS alerts", "alerts_v4"))
+        # Se omiten alertas huérfanas (sin producto importado): con FOREIGN KEYS activas impedirían migrar
+        conn.execute("INSERT INTO alerts_v4(id, imported_id, type, message, created_at, read) "
+                     "SELECT id, imported_id, type, message, created_at, read FROM alerts "
+                     "WHERE imported_id IN (SELECT id FROM imported_products)")
+        conn.execute("DROP TABLE alerts")
+        conn.execute("ALTER TABLE alerts_v4 RENAME TO alerts")
+
+
 def _migrate_v2_to_v3(conn) -> None:
     """v3: agrega las columnas de métricas precalculadas (los valores se calculan después en init_db)."""
     have = {r[1] for r in conn.execute("PRAGMA table_info(products)")}
@@ -177,12 +234,18 @@ _UPSERT = (f"INSERT INTO products({','.join(_UPSERT_COLS)}) VALUES ({','.join(':
            + ", ".join(f"{c} = excluded.{c}" for c in _UPSERT_COLS if c not in ("supplier", "supplier_sku")))
 
 
-def upsert_products(conn, products, source: str) -> tuple[int, int]:
+def upsert_products(conn, products, source: str, *, run_hooks: bool = True,
+                    collect_ids: list | None = None) -> tuple[int, int]:
     """Inserta o actualiza productos normalizados (con sus métricas y el índice de búsqueda).
-    Devuelve (nuevos, actualizados)."""
+    Devuelve (nuevos, actualizados).
+
+    run_hooks=False: el llamador ejecuta hooks.run_catalog_write al terminar su operación completa
+    (p. ej. carga CSV con reemplazo), así los módulos no ven un catálogo a medio escribir.
+    collect_ids: si se pasa una lista, se le agregan los ids de los productos insertados/actualizados."""
     ts = now()
     s = get_settings(conn)
     count = [0]
+    keys: list = []
 
     def rows():
         for p in products:
@@ -192,6 +255,7 @@ def upsert_products(conn, products, source: str) -> tuple[int, int]:
             else:
                 r = p.to_row()
             r.update(source=source, updated_at=ts)
+            keys.append((r["supplier"], r["supplier_sku"]))
             r.update(metrics.compute(r, s))
             count[0] += 1
             yield r
@@ -202,6 +266,18 @@ def upsert_products(conn, products, source: str) -> tuple[int, int]:
     if search.fts_enabled(conn):
         search.sync(conn)
     search.invalidate(conn)
+    # Ids exactos de lo escrito en esta llamada (la marca de tiempo tiene precisión de segundos y
+    # podría incluir filas de otra escritura del mismo segundo, incluso ya borradas)
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS _df_upserted(supplier TEXT, sku TEXT, PRIMARY KEY (supplier, sku))")
+    conn.execute("DELETE FROM _df_upserted")
+    conn.executemany("INSERT OR IGNORE INTO _df_upserted VALUES (?, ?)", keys)
+    ids = [r[0] for r in conn.execute(
+        "SELECT p.id FROM _df_upserted u JOIN products p ON p.supplier = u.supplier AND p.supplier_sku = u.sku")]
+    conn.execute("DELETE FROM _df_upserted")
+    if collect_ids is not None:
+        collect_ids.extend(ids)
+    if run_hooks:
+        hooks.run_catalog_write(conn, ids)  # módulos (historial, comparador, búsquedas guardadas…)
     return new, count[0] - new
 
 
@@ -236,6 +312,7 @@ def init_db(seed_size: int = 1500) -> None:
         conn.execute("BEGIN")
         try:
             _migrate_v2_to_v3(conn)
+            _migrate_v3_to_v4(conn)
             fts = search.create_schema(conn)
             currency.ensure_schema(conn)
             for k, v in DEFAULT_SETTINGS.items():

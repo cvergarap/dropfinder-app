@@ -1,4 +1,27 @@
 const $ = (s, el = document) => el.querySelector(s);
+
+/* Puntos de extensión para los módulos de funcionalidades (js/history.js, js/compare.js, js/saved.js).
+   Cada módulo se registra aquí; app.js no los conoce. */
+const DF = {
+  cardExtras: [],      // f(p) -> HTML extra dentro de la tarjeta de producto (ya escapado)
+  detailSections: [],  // f(p, container) -> agrega secciones al detalle (puede ser async)
+  viewLoaders: {},     // { nombreVista: f() } al abrir la pestaña data-view="nombreVista"
+  onResults: [],       // f(data, params) tras renderizar resultados de búsqueda
+  currencyChange: [],  // f() cuando cambia la moneda mostrada (para re-renderizar)
+};
+window.DF = DF;
+
+/* Ejecuta una extensión sin que su error (síncrono o promesa rechazada) rompa la app */
+function dfSafe(fn, ...args) {
+  try {
+    const r = fn(...args);
+    if (r && typeof r.then === "function") r.catch((e) => console.error("[DF]", e));
+    return r;
+  } catch (e) {
+    console.error("[DF]", e);
+    return undefined;
+  }
+}
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 /* money(), moneyValue(), moneyToUsd() y Currency vienen de js/currency.js */
 const fmt = (n) => Number(n).toLocaleString("es");
@@ -66,11 +89,13 @@ function show(view) {
   if (view === "alerts") loadAlerts();
   if (view === "settings") { loadSettings(); Currency.load(); }
   if (view === "suppliers") loadSuppliers();
+  if (DF.viewLoaders[view]) dfSafe(DF.viewLoaders[view]);
 }
 $$(".tab").forEach((b) => b.addEventListener("click", () => show(b.dataset.view)));
 
 /* ---------------- Búsqueda ---------------- */
 let page = 1;
+let lastParams = "";       // parámetros de la búsqueda que produjo lastData
 let lastData = null;       // última respuesta de /api/products (para re-renderizar al cambiar de moneda)
 let sortTouched = false;   // el usuario eligió un orden a mano
 let exactSearch = false;   // "Buscar en cambio X": pedir la búsqueda sin corrección
@@ -115,6 +140,7 @@ async function search() {
     const data = await api(`/api/products?${params}`);
     if (seq !== searchSeq) return;   // llegó una búsqueda más nueva
     lastData = data;
+    lastParams = params.toString();
     renderGrid(data);
   } catch (e) {
     if (seq !== searchSeq) return;
@@ -171,6 +197,7 @@ function card(p) {
         <div><b>${money(p.suggested_price, { kind: "price" })}</b><span>Venta</span></div>
         <div><b class="${p.profit >= 0 ? "good" : "bad"}">${money(p.profit)}</b><span><i class="kpi-label">Ganancia · </i>${p.margin}%</span></div>
       </div>
+      ${DF.cardExtras.map((f) => dfSafe(f, p) || "").join("")}
       <div class="actions">${p.imported_id
         ? `<button class="ghost" disabled>✓ Importado</button>`
         : `<button class="primary import" data-id="${p.id}">Importar</button>`}</div>
@@ -192,6 +219,10 @@ function renderGrid(data) {
       <span class="muted">Página ${data.page} de ${data.pages}</span>
       <button class="ghost" data-p="${data.page + 1}" ${data.page >= data.pages ? "disabled" : ""}>Siguiente →</button>`;
   } else pager.innerHTML = "";
+  // Parámetros de la búsqueda que produjo `data` (sin página), no los del formulario actual
+  const params = new URLSearchParams(lastParams || "");
+  params.delete("page");
+  DF.onResults.forEach((f) => dfSafe(f, data, params));
 }
 
 $("#pager").addEventListener("click", (e) => {
@@ -323,12 +354,15 @@ function renderDetail(p) {
         <dt>Stock</dt><dd>${p.stock > 0 ? fmt(p.stock) : '<span class="bad">Sin stock</span>'}</dd>
       </dl>
       <div class="meta">${p.tags.map((t) => `<span class="chip">#${esc(t)}</span>`).join("")}</div>
+      <div id="detailExtras" class="detail-extras"></div>
       ${p.imported_id ? `<button class="ghost" disabled>✓ Ya importado</button>`
         : `<label class="field">Precio de venta (${Currency.code()})<input id="dPrice" ${priceInputAttrs(moneyValue(p.suggested_price, { kind: "price" }))}>
              <small id="dPriceVat" class="vat"></small></label>
            <button class="primary" id="dImport">Importar a Mis productos</button>`}
     </div></div>`;
   $(".close", dlg).onclick = () => dlg.close();
+  const extras = $("#detailExtras", dlg);
+  DF.detailSections.forEach((f) => dfSafe(f, p, extras));
   const input = $("#dPrice", dlg);
   if (input) {
     // Si el usuario ya había escrito un precio y luego cambió la moneda, se conserva convertido
@@ -422,14 +456,14 @@ async function loadAlerts() {
   $("#alertsList").innerHTML = rows.length
     ? rows.map((a) => `<li class="${a.type} ${a.read ? "" : "unread"}">${esc(a.title)}: ${esc(a.message)}
         <small>${new Date(a.created_at).toLocaleString("es")}</small></li>`).join("")
-    : `<li class="empty">Sin alertas. Importa productos y ejecuta el monitor.</li>`;
+    : `<li class="empty">Sin alertas. Importa productos y ejecuta el monitor, o guarda una búsqueda para enterarte de productos nuevos.</li>`;
 }
 $("#markRead").addEventListener("click", async () => { await api("/api/alerts/read", { method: "POST" }); loadAlerts(); refreshCounts(); });
 
 async function refreshCounts() {
-  const [imports, alerts] = await Promise.all([api("/api/imports"), api("/api/alerts")]);
+  const [imports, alerts] = await Promise.all([api("/api/imports"), api("/api/alerts/count")]);
   $("#importsCount").textContent = imports.length;
-  $("#alertsCount").textContent = alerts.filter((a) => !a.read).length;
+  $("#alertsCount").textContent = alerts.unread;
 }
 
 /* ---------------- Proveedores ---------------- */
@@ -602,6 +636,7 @@ function onCurrencyChange() {
   else if (lastData) renderGrid(lastData);
   if (lastImports) renderImports(lastImports);
   if (lastDetail && $("#detail").open) renderDetail(lastDetail);
+  DF.currencyChange.forEach((f) => dfSafe(f));
 }
 Currency.onChange(onCurrencyChange);
 

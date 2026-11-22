@@ -16,8 +16,13 @@ from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+import compare
 import currency
 import db
+from errors import ApiError  # noqa: F401  (los módulos y pruebas usan server.ApiError)
+import history
+import hooks
+import saved_searches
 import search
 from connectors import CsvSupplierConnector, MockSupplierConnector
 from connectors.base import PriceStock
@@ -35,12 +40,6 @@ SORTS = {
 MAX_BODY = 20 * 1024 * 1024   # 20 MB (catálogos CSV grandes)
 # Fuentes con consulta en vivo de precio/stock. Los CSV se actualizan volviendo a subir el archivo.
 LIVE_CONNECTORS = {"mock": MockSupplierConnector()}
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message)
-        self.status = status
 
 
 def _num(qs, key, cast=float):
@@ -353,6 +352,7 @@ def run_monitor() -> dict:
             changed.append(r["product_id"])
             _check_imported(conn, r, new, s, created)
         db.recompute_metrics(conn, s, ids=changed)
+        hooks.run_catalog_write(conn, changed)
     return {"checked": checked, "skipped": skipped, "alerts": created}
 
 
@@ -381,7 +381,8 @@ def upload_csv(body: dict) -> dict:
     removed = 0
     with db.connect() as conn:
         s = db.get_settings(conn)
-        new, updated = db.upsert_products(conn, parsed.products, "csv")
+        touched: list = []
+        new, updated = db.upsert_products(conn, parsed.products, "csv", run_hooks=False, collect_ids=touched)
         if body.get("replace"):
             skus = [p.supplier_sku for p in parsed.products]
             conn.execute("CREATE TEMP TABLE IF NOT EXISTS _skus(sku TEXT PRIMARY KEY)")
@@ -389,11 +390,15 @@ def upload_csv(body: dict) -> dict:
             conn.executemany("INSERT OR IGNORE INTO _skus VALUES (?)", [(k,) for k in skus])
             gone = "supplier = ? AND source = 'csv' AND supplier_sku NOT IN (SELECT sku FROM _skus)"
             # Los que ya importaste no se borran: quedan sin stock (y el monitor lo avisa)
+            touched += [r[0] for r in conn.execute(
+                f"SELECT id FROM products WHERE {gone} AND id IN (SELECT product_id FROM imported_products)", (supplier,))]
             conn.execute(f"UPDATE products SET stock = 0, updated_at = ? WHERE {gone} "
                          "AND id IN (SELECT product_id FROM imported_products)", (db.now(), supplier))
             removed = conn.execute(f"DELETE FROM products WHERE {gone} "
                                    "AND id NOT IN (SELECT product_id FROM imported_products)", (supplier,)).rowcount
             search.invalidate(conn)
+        # Los módulos ven el catálogo ya completo (después del reemplazo), una sola vez
+        hooks.run_catalog_write(conn, touched)
         # Alertas para los productos importados de este proveedor cuyo costo/stock cambió
         for r in conn.execute(IMPORT_SQL + " WHERE p.supplier = ? AND p.source = 'csv'", (supplier,)).fetchall():
             _check_imported(conn, r, PriceStock(r["cost"], r["shipping_cost"], r["stock"]), s, created_alerts)
@@ -420,10 +425,18 @@ def delete_supplier_catalog(qs: dict) -> dict:
     return {"deleted": n}
 
 
+def alerts_count() -> dict:
+    with db.connect() as conn:
+        return {"unread": conn.execute("SELECT COUNT(*) FROM alerts WHERE read = 0").fetchone()[0]}
+
+
 def list_alerts() -> list:
     with db.connect() as conn:
         return [dict(r) for r in conn.execute(
-            "SELECT a.*, i.title FROM alerts a JOIN imported_products i ON i.id = a.imported_id "
+            "SELECT a.*, COALESCE(i.title, p.title, s.name, '') AS title, s.name AS saved_search_name "
+            "FROM alerts a LEFT JOIN imported_products i ON i.id = a.imported_id "
+            "LEFT JOIN products p ON p.id = a.product_id "
+            "LEFT JOIN saved_searches s ON s.id = a.saved_search_id "
             "ORDER BY a.id DESC LIMIT 200")]
 
 
@@ -482,10 +495,15 @@ ROUTES = [
     ("POST", r"/api/catalog/csv", lambda m, qs, b: upload_csv(b)),
     ("DELETE", r"/api/catalog", lambda m, qs, b: delete_supplier_catalog(qs)),
     ("POST", r"/api/alerts/read", lambda m, qs, b: mark_alerts_read()),
+    ("GET", r"/api/alerts/count", lambda m, qs, b: alerts_count()),
     ("GET", r"/api/currency", lambda m, qs, b: currency_state()),
     ("PUT", r"/api/currency", lambda m, qs, b: currency_update(b)),
     ("POST", r"/api/currency/refresh", lambda m, qs, b: currency_refresh()),
 ]
+
+# Rutas de los módulos de funcionalidades (cada uno define su propia lista ROUTES)
+for _module in (history, compare, saved_searches):
+    ROUTES.extend(_module.ROUTES)
 
 
 class Handler(SimpleHTTPRequestHandler):
