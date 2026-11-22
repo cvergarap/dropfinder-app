@@ -39,6 +39,7 @@ class FakeWooCommerce:
         self.injections: list[dict] = []
         self._ids = itertools.count(100)
         self.evil_hits = 0
+        self.bad_image_marker = "bad"          # una imagen cuya URL contiene esto hace fallar la petición (400)
         self.sku_error_code = "woocommerce_rest_product_sku_already_exists"
         self.httpd: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
@@ -107,8 +108,18 @@ class FakeWooCommerce:
             p = {"id": pid, "name": "Existente", "type": "simple", "status": "draft", "sku": "", "regular_price": "1.00",
                  "sale_price": "", "manage_stock": False, "stock_quantity": None, "description": "", "images": [], "tags": []}
             p.update(fields)
+            p["tags"] = self._tags_out(p["tags"])
             self.stores[host]["products"][pid] = p
             return dict(p)
+
+    @staticmethod
+    def _tags_out(tags) -> list[dict]:
+        """WooCommerce devuelve las etiquetas como [{id, name, slug}] aunque se envíen como [{name}]."""
+        out = []
+        for i, t in enumerate(tags or []):
+            name = t["name"] if isinstance(t, dict) else str(t)
+            out.append({"id": 10 + i, "name": name, "slug": re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")})
+        return out
 
     # ------------------------------------------------------------ HTTP
     @staticmethod
@@ -204,6 +215,8 @@ class FakeWooCommerce:
         op, route = self._classify(h.command, m, st)
         if op == "list" and "sku" in query:
             op = "find_sku"
+        if op == "update" and isinstance(rec["body"], dict) and set(rec["body"]) == {"images"}:
+            op = "images"
         rec["op"] = op
         with self.lock:
             self.requests.append(rec)
@@ -248,6 +261,8 @@ class FakeWooCommerce:
     def _dispatch(self, op: str, route: str, rec: dict, st: dict, raw: bytes):
         if op == "root":
             return 200, {"name": st["name"], "description": "x", "namespaces": st["namespaces"]}, {}
+        if op == "images":
+            op = "update"
         if op == "unknown":
             return self._err(404, "rest_no_route", "No route was found matching the URL and request method.")
         if "wc/v3" not in st["namespaces"]:
@@ -367,7 +382,11 @@ class FakeWooCommerce:
         pid = next(self._ids)
         p = {"id": pid, "type": "simple", "status": "publish", "sku": "", "sale_price": "", "manage_stock": False,
              "stock_quantity": None, "description": "", "images": [], "tags": []}
+        for im in body.get("images") or []:
+            if self.bad_image_marker in im["src"]:
+                return self._err(400, "woocommerce_product_image_upload_error", "No se pudo descargar la imagen")
         p.update(body)
+        p["tags"] = self._tags_out(p["tags"])
         products[pid] = p
         return 201, dict(p), {}
 
@@ -381,5 +400,10 @@ class FakeWooCommerce:
         sp = body.get("sale_price", p["sale_price"])
         if rp and sp and float(sp) >= float(rp):
             return self._err(400, "woocommerce_rest_invalid_product_sale_price", "La oferta debe ser menor que el precio")
+        for im in body.get("images") or []:
+            if self.bad_image_marker in im["src"]:
+                return self._err(400, "woocommerce_product_image_upload_error", "No se pudo descargar la imagen")
         p.update(body)
+        if "tags" in body:
+            p["tags"] = self._tags_out(body["tags"])
         return 200, dict(p), {}

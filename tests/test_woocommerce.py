@@ -39,6 +39,7 @@ CS = "cs_" + "b2" * 20
 C = woocommerce.WooCommerceConnector
 BASIC = base64.b64encode(f"{CK}:{CS}".encode()).decode()
 RETRYABLE_ERR = (StoreError,)
+OWN = ["dropfinder", "dfi-ab12cd34"]
 
 
 class Base(unittest.TestCase):
@@ -62,9 +63,13 @@ class Base(unittest.TestCase):
         d = dict(title="Lámpara <LED> & más", price=19.9, sku="DF-1", stock=7, description="Línea 1\nLínea <b>2</b>\n\nPárrafo 2",
                  image_urls=["https://cdn.x.com/a.jpg", "http://x.com/b.jpg", "javascript:alert(1)", "https://u:p@x.com/c.jpg",
                              "https://10.0.0.1/x.jpg"],
-                 compare_at_price=9.9, vendor="Prov", product_type="Hogar", tags=["a", "b,c", "dropfinder"], cost=7.5)
+                 compare_at_price=9.9, vendor="Prov", product_type="Hogar", tags=list(OWN), cost=7.5)
         d.update(kw)
         return StoreProduct(**d)
+
+    def seed(self, sku="DF-1", tags=None, **kw):
+        """Producto ya existente en la tienda; por defecto creado por esta instalación (etiquetas propias)."""
+        return self.fake.put_product(HOST, sku=sku, tags=OWN if tags is None else tags, **kw)
 
     def count(self):
         return len(self.fake.products(HOST))
@@ -215,19 +220,19 @@ class SharedClientDnsTest(unittest.TestCase):
             e = self._validate_with_dns([ip])
             self.assertNotIsInstance(e, (StoreAuthError, StoreNotFound), ip)
             self.assertFalse(e.retryable, ip)
-            self.assertIn("no permitida", str(e))
+            self.assertIn("No se pudo conectar con el dominio", str(e))
 
     def test_mixed_public_and_private_refused(self):
         e = self._validate_with_dns(["93.184.216.34", "10.0.0.5"])
-        self.assertIn("no permitida", str(e))
+        self.assertIn("No se pudo conectar con el dominio", str(e))
         e = self._validate_with_dns(["10.0.0.5", "93.184.216.34"])
-        self.assertIn("no permitida", str(e))
+        self.assertIn("No se pudo conectar con el dominio", str(e))
 
     def test_localtest_me_style_name_passes_syntax_but_not_dns(self):
         self.assertEqual(C.normalize_domain("anything.localtest.me"), "anything.localtest.me")
         self.assertEqual(C.normalize_domain("127.0.0.1.nip.io"), "127.0.0.1.nip.io")
         e = self._validate_with_dns(["127.0.0.1"])
-        self.assertIn("no permitida", str(e))
+        self.assertIn("No se pudo conectar con el dominio", str(e))
 
     def test_unresolvable_is_not_sent(self):
         def gai(*a, **k):
@@ -235,7 +240,7 @@ class SharedClientDnsTest(unittest.TestCase):
         with mock.patch.object(shttp.socket, "getaddrinfo", gai):
             with self.assertRaises(StoreError) as cm:
                 C("tienda.com", {"consumer_key": CK, "consumer_secret": CS}).publish(
-                    StoreProduct(title="x", price=1, sku="DF-1", stock=1))
+                    StoreProduct(title="x", price=1, sku="DF-1", stock=1, tags=["dropfinder", "dfi-ab12cd34"]))
         self.assertTrue(cm.exception.retryable and cm.exception.not_sent)
 
 
@@ -440,7 +445,7 @@ class ValidateTest(Base):
 class PublishTest(Base):
     def test_exact_request_bodies(self):
         ref = self.conn().publish(self.product(active=False))
-        self.assertEqual(self.fake.ops(), ["find_sku", "create"])
+        self.assertEqual(self.fake.ops(), ["find_sku", "create", "images"])
         find = self.fake.requests_for("find_sku")[0]
         self.assertEqual(find["query"], {"sku": "DF-1", "status": "any"})
         body = self.fake.requests_for("create")[0]["body"]
@@ -448,9 +453,8 @@ class PublishTest(Base):
             "name": "Lámpara <LED> & más", "type": "simple", "status": "draft", "sku": "DF-1", "regular_price": "19.90",
             "manage_stock": True, "stock_quantity": 7,
             "description": "<p>Línea 1<br>Línea &lt;b&gt;2&lt;/b&gt;</p><p>Párrafo 2</p>",
-            "images": [{"src": "https://cdn.x.com/a.jpg"}],
-            "tags": [{"name": "a"}, {"name": "b c"}, {"name": "dropfinder"}],
-            "sale_price": "9.90"})
+            "tags": [{"name": "dropfinder"}, {"name": "dfi-ab12cd34"}]})
+        self.assertEqual(self.fake.requests_for("images")[0]["body"], {"images": [{"src": "https://cdn.x.com/a.jpg"}]})
         self.assertEqual(ref.external_id, str(self.fake.products(HOST)[0]["id"]))
         self.assertEqual(ref.url, f"https://{HOST}/wp-admin/post.php?post={ref.external_id}&action=edit")
         self.assertEqual((ref.variant_id, ref.inventory_item_id), ("", ""))
@@ -460,7 +464,7 @@ class PublishTest(Base):
         self.assertEqual(self.fake.products(HOST)[0]["status"], "draft")
 
     def test_created_as_draft_even_when_active_then_shown_last(self):
-        ref = self.conn().publish(self.product(active=True))
+        ref = self.conn().publish(self.product(active=True, image_urls=[]))
         self.assertEqual(self.fake.ops(), ["find_sku", "create", "update"])
         self.assertEqual(self.fake.requests_for("create")[0]["body"]["status"], "draft")
         self.assertEqual(self.fake.requests_for("update")[0]["body"], {"status": "publish"})
@@ -468,24 +472,26 @@ class PublishTest(Base):
         self.assertTrue(ref.external_id)
 
     def test_optional_fields_omitted(self):
-        self.conn().publish(self.product(active=False, compare_at_price=None, image_urls=[], tags=[], description=""))
+        self.conn().publish(self.product(active=False, compare_at_price=None, image_urls=[], description=""))
         body = self.fake.requests_for("create")[0]["body"]
-        for k in ("sale_price", "images", "tags"):
+        for k in ("sale_price", "images"):
             self.assertNotIn(k, body)
         self.assertEqual(body["description"], "")
+        self.assertEqual(self.fake.requests_for("images"), [])
 
-    def test_sale_price_only_if_lower(self):
-        for cmp_, expect in ((9.9, "9.90"), (19.9, None), (25, None), (19.89, "19.89"), (0.004, None)):
+    def test_sale_price_never_sent(self):
+        """compare_at_price no se admite (semántica distinta a Shopify): nunca se envía sale_price, ni vacío."""
+        c = self.conn()
+        for cmp_ in (9.9, 19.9, 25, None, 0.5):
             self.fake.stores[HOST]["products"].clear()
-            self.fake.requests.clear()
-            if cmp_ == 0.004:
-                with self.assertRaises(StoreValidationError):          # redondea a 0.00: inválido, no se envía nada
-                    self.conn().publish(self.product(active=False, compare_at_price=cmp_))
-                self.assertEqual(self.fake.requests, [])
-                continue
-            self.conn().publish(self.product(active=False, compare_at_price=cmp_))
-            body = self.fake.requests_for("create")[0]["body"]
-            self.assertEqual(body.get("sale_price"), expect, cmp_)
+            c.publish(self.product(active=True, compare_at_price=cmp_))                  # crear
+            c.publish(self.product(active=True, compare_at_price=cmp_))                  # adoptar
+            ref = ListingRef(external_id=str(self.fake.products(HOST)[0]["id"]))
+            c.update_price_stock(ref, 20, 3, compare_at_price=cmp_)
+        for r in self.fake.requests:
+            self.assertNotIn("sale_price", repr(r["body"]))
+        with self.assertRaises(StoreValidationError):                                    # un valor basura sigue siendo error
+            c.publish(self.product(compare_at_price="abc"))
 
     def test_validation_before_any_call(self):
         bad = [dict(title=""), dict(title="   "), dict(title=None), dict(price=0), dict(price=-1), dict(price=0.004),
@@ -507,7 +513,7 @@ class PublishTest(Base):
     def test_images_https_only_max10_and_no_ip_or_userinfo(self):
         urls = [f"https://x.com/{i}.jpg" for i in range(15)] + ["http://a.com/x.jpg"]
         self.conn().publish(self.product(image_urls=urls, active=False))
-        imgs = self.fake.requests_for("create")[0]["body"]["images"]
+        imgs = self.fake.requests_for("images")[0]["body"]["images"]
         self.assertEqual(len(imgs), 10)
         self.assertTrue(all(i["src"].startswith("https://") for i in imgs))
         self.fake.stores[HOST]["products"].clear()
@@ -516,7 +522,7 @@ class PublishTest(Base):
                "https://x.com:99999/a", "javascript:alert(1)", "data:image/png;base64,AAAA", "https://x.com/" + "a" * 2100, 5, None]
         self.fake.requests.clear()
         self.conn().publish(self.product(image_urls=bad, active=False))
-        self.assertNotIn("images", self.fake.requests_for("create")[0]["body"])
+        self.assertEqual(self.fake.requests_for("images"), [])
 
     def test_description_escaped_as_paragraphs(self):
         self.conn().publish(self.product(description="<script>alert(1)</script>\r\nl2\r\n\r\n\r\n  <img src=x onerror=1>  ", active=False))
@@ -539,45 +545,103 @@ class PublishTest(Base):
 
     # ---------------------------------------------------------------- idempotencia
     def test_adopts_existing_sku_without_duplicating(self):
-        seed = self.fake.put_product(HOST, sku="DF-1", status="draft", regular_price="5.00", stock_quantity=1)
-        ref = self.conn().publish(self.product(active=False))
+        seed = self.seed(status="draft", regular_price="5.00", stock_quantity=1)
+        ref = self.conn().publish(self.product(active=False, image_urls=[]))
         self.assertEqual(ref.external_id, str(seed["id"]))
         self.assertEqual(self.count(), 1)
         self.assertEqual(self.fake.ops(), ["find_sku", "update"])
         self.assertEqual(self.fake.requests_for("update")[0]["body"],
-                         {"regular_price": "19.90", "manage_stock": True, "stock_quantity": 7, "sale_price": "9.90"})
+                         {"regular_price": "19.90", "manage_stock": True, "stock_quantity": 7,
+                          "description": "<p>Línea 1<br>Línea &lt;b&gt;2&lt;/b&gt;</p><p>Párrafo 2</p>"})
         p = self.fake.products(HOST)[0]
-        self.assertEqual((p["regular_price"], p["stock_quantity"], p["status"]), ("19.90", 7, "draft"))
+        self.assertEqual((p["regular_price"], p["stock_quantity"], p["status"], p["name"]), ("19.90", 7, "draft", "Existente"))
 
     def test_adopted_published_product_not_downgraded_and_active_shown(self):
-        seed = self.fake.put_product(HOST, sku="DF-1", status="publish")
-        self.conn().publish(self.product(active=False))
-        self.assertEqual(self.fake.products(HOST)[0]["status"], "publish")           # no se oculta lo que ya estaba visible
+        # Decisión: adoptar NUNCA cambia la visibilidad de un producto existente (ocultar uno que su dueño ya hizo visible
+        # sería peor); solo se publica un borrador si active=True.
+        seed = self.seed(status="publish")
+        self.conn().publish(self.product(active=False, image_urls=[]))
+        self.assertEqual(self.fake.products(HOST)[0]["status"], "publish")
+        self.assertEqual([r["body"] for r in self.fake.requests_for("update") if "status" in r["body"]], [])
         self.fake.requests.clear()
-        seed2 = self.fake.put_product(HOST, sku="DF-2", status="draft")
-        self.conn().publish(self.product(sku="DF-2", active=True))
+        seed2 = self.seed(sku="DF-2", status="draft")
+        self.conn().publish(self.product(sku="DF-2", active=True, image_urls=[]))
         self.assertEqual(self.fake.requests_for("update")[-1]["body"], {"status": "publish"})
         self.assertEqual(seed["id"] + 1, seed2["id"])
 
-    def test_sku_filter_result_checked_exactly(self):
-        self.fake.put_product(HOST, sku="df-1", status="draft")                      # el servidor compara sin mayúsculas
-        with self.assertRaises(StoreValidationError) as cm:                          # el SKU existe (sin mayúsculas) pero no es el nuestro
-            self.conn().publish(self.product(active=False))
-        self.assertIn("SKU", str(cm.exception))
+    def test_sku_match_is_case_insensitive_and_ignores_other_items(self):
+        seed = self.seed(sku="df-1", status="draft")                                 # MySQL no distingue mayúsculas
+        ref = self.conn().publish(self.product(active=False, image_urls=[]))
+        self.assertEqual(ref.external_id, str(seed["id"]))
         self.assertEqual(self.count(), 1)
+        # variaciones y otros SKU devueltos por ?sku= se ignoran
+        c = self.conn()
+        with mock.patch.object(C, "_call", return_value=[
+                {"id": 1, "sku": "DF-1", "type": "variation", "status": "publish", "tags": [{"name": "dropfinder"}]},
+                {"id": 2, "sku": "DF-1", "type": "simple", "status": "trash"},
+                {"id": 3, "sku": "DF-10", "type": "simple", "status": "publish"},
+                {"id": 4, "sku": None, "type": "simple", "status": "publish"}, "basura", None]):
+            self.assertIsNone(c._find_by_sku("DF-1"))
 
     def test_sku_exists_error_on_create_adopts(self):
         for code in ("woocommerce_rest_product_sku_already_exists", "product_invalid_sku"):
             self.fake.stores[HOST]["products"].clear()
             self.fake.requests.clear()
             self.fake.sku_error_code = code
-            seed = self.fake.put_product(HOST, sku="DF-1", status="draft")
+            seed = self.seed(status="draft")
             self.fake.inject("empty200", op="find_sku")                              # la búsqueda previa no lo vio (carrera)
-            ref = self.conn().publish(self.product(active=False))
+            ref = self.conn().publish(self.product(active=False, image_urls=[]))
             self.assertEqual(ref.external_id, str(seed["id"]), code)
             self.assertEqual(self.count(), 1)
             self.assertEqual(self.fake.ops(), ["find_sku", "create", "find_sku", "update"])
             self.assertEqual(self.fake.requests_for("create")[0]["body"]["status"], "draft")
+
+    def test_sku_exists_race_with_foreign_product_is_conflict(self):
+        foreign = self.seed(tags=["otra"], regular_price="50.00", stock_quantity=99, status="publish")
+        self.fake.inject("empty200", op="find_sku")
+        with self.assertRaises(StoreValidationError) as cm:
+            self.conn().publish(self.product(active=True))
+        self.assertIn("no creó esta instalación", str(cm.exception))
+        self.assertEqual(self.fake.requests_for("update"), [])
+        self.assertEqual(self.fake.products(HOST)[0]["regular_price"], "50.00")
+        self.assertEqual(foreign["id"], self.fake.products(HOST)[0]["id"])
+
+    def test_ownership_conflict_when_sku_without_our_tags(self):
+        for tags in ([], ["otra"], ["dropfinder"], ["dfi-ab12cd34"], ["dropfinder", "dfi-otra999"], ["Dropfinder-x", "dfi-ab12cd3"]):
+            self.fake.stores[HOST]["products"].clear()
+            self.fake.requests.clear()
+            self.seed(tags=tags, name="Camiseta del cliente", regular_price="50.00", stock_quantity=99, status="publish")
+            with self.assertRaises(StoreValidationError, msg=tags) as cm:
+                self.conn().publish(self.product(price=3, stock=1, active=True))
+            self.assertIn("Ya existe en tu tienda un producto con el SKU DF-1 que no creó esta instalación", str(cm.exception))
+            self.assertIn("cámbiale el SKU o bórralo", str(cm.exception))
+            self.assertEqual(self.fake.ops(), ["find_sku"], tags)                    # ni crea encima ni toca nada
+            p = self.fake.products(HOST)[0]
+            self.assertEqual((p["name"], p["regular_price"], p["stock_quantity"]), ("Camiseta del cliente", "50.00", 99))
+
+    def test_ownership_by_slug_or_name_and_case(self):
+        seed = self.fake.put_product(HOST, sku="DF-1", tags=[{"name": "DropFinder"}, {"name": "DFI AB12CD34"}])
+        ref = self.conn().publish(self.product(image_urls=[], tags=["dropfinder", "dfi-ab12cd34"]))
+        self.assertEqual(ref.external_id, str(seed["id"]))
+
+    def test_trashed_product_with_our_sku_is_not_adopted(self):
+        self.seed(status="trash")
+        ref = self.conn().publish(self.product(active=False, image_urls=[]))
+        self.assertEqual(self.fake.ops(), ["find_sku", "create"])
+        self.assertEqual(self.count(), 2)
+        self.assertTrue(ref.external_id)
+
+    def test_sku_charset_restricted_before_any_call(self):
+        for sku in ("DF-1,DF-2", "DF 1", "DF-1&x=1", "DF-1#", "DF/1", "DF-1;", "DF-ñ", "", "a" * 256):
+            with self.assertRaises(StoreValidationError, msg=sku):
+                self.conn().publish(self.product(sku=sku))
+        self.assertEqual(self.fake.requests, [])
+
+    def test_publish_requires_tags_to_prove_ownership(self):
+        for tags in ([], None, [""], "  "):
+            with self.assertRaises(StoreValidationError):
+                self.conn().publish(self.product(tags=tags))
+        self.assertEqual(self.fake.requests, [])
 
     def test_sku_exists_but_cannot_find_it(self):
         self.fake.put_product(HOST, sku="DF-1", status="draft")
@@ -664,7 +728,8 @@ class PublishTest(Base):
         self.assertEqual(e.orphan_external_id, pid)
         self.assertIn(pid, str(e))
         self.assertEqual(len(self.fake.requests_for("delete")), woocommerce.CLEANUP_TRIES)
-        self.assertEqual(self.sleeps, [3.0] * (woocommerce.CLEANUP_TRIES - 1))
+        self.assertEqual(self.sleeps, [woocommerce.CLEANUP_MAX_SLEEP] * (woocommerce.CLEANUP_TRIES - 1))
+        self.assertLessEqual(sum(self.sleeps), 3.0)
         self.assertTrue(e.retryable)
         # el siguiente intento reutiliza el borrador huérfano
         self.fake.injections.clear()
@@ -710,6 +775,112 @@ class PublishTest(Base):
             self.conn().publish(self.product(active=True))
         self.assertTrue(hasattr(cm.exception, "orphan_external_id"))
 
+
+    # ---------------------------------------------------------------- imágenes (mejor esfuerzo)
+    def test_images_sent_in_second_step_with_large_timeouts(self):
+        seen = []
+        real = shttp.request_json
+
+        def spy(method, url, payload=None, **kw):
+            seen.append((method, payload and sorted(payload), kw.get("timeout"), kw.get("total_timeout")))
+            return real(method, url, payload, **kw)
+        with mock.patch.object(woocommerce.shttp, "request_json", spy):
+            self.conn().publish(self.product(active=False))
+        self.assertEqual(seen[-1], ("PUT", ["images"], woocommerce.IMAGES_TIMEOUT, woocommerce.IMAGES_TIMEOUT))
+        self.assertGreaterEqual(woocommerce.IMAGES_TIMEOUT, 90.0)
+        self.assertNotIn("images", [k for m, pl, t, tt in seen[:-1] for k in (pl or [])])
+        self.assertEqual(seen[-2][0], "POST")
+
+    def test_bad_image_keeps_product_and_does_not_raise(self):
+        with self.assertLogs("dropfinder.woocommerce", level="WARNING") as lg:
+            ref = self.conn().publish(self.product(active=True, image_urls=["https://x.com/bad.jpg", "https://x.com/ok.jpg"]))
+        self.assertEqual(self.count(), 1)
+        self.assertEqual(self.fake.products(HOST)[0]["status"], "publish")
+        self.assertEqual(self.fake.products(HOST)[0]["images"], [])
+        self.assertEqual(self.fake.requests_for("delete"), [])                       # nada de limpieza: el producto sirve
+        self.assertIn(ref.external_id, "\n".join(lg.output))
+        for sec in (CK, CS, BASIC):
+            self.assertNotIn(sec, "\n".join(lg.output))
+        # el motor no reintenta; si lo hiciera, adopta y vuelve a intentar las imágenes sin duplicar
+        self.conn().publish(self.product(active=True, image_urls=["https://x.com/ok.jpg"]))
+        self.assertEqual(self.count(), 1)
+        self.assertEqual(self.fake.products(HOST)[0]["images"], [{"src": "https://x.com/ok.jpg"}])
+
+    def test_slow_image_step_times_out_but_product_kept(self):
+        self.fake.inject("sleep", op="images", seconds=1.0)
+        with mock.patch.object(woocommerce, "IMAGES_TIMEOUT", 0.3):
+            ref = self.conn().publish(self.product(active=False))
+        self.assertEqual(self.count(), 1)
+        self.assertEqual(ref.external_id, str(self.fake.products(HOST)[0]["id"]))
+
+    def test_image_step_errors_never_raise(self):
+        for kind in ("http401", "http429", "http500", "route404", "product404", "html200", "malformed", "redirect"):
+            self.fake.stores[HOST]["products"].clear()
+            self.fake.injections.clear()
+            self.fake.inject(kind, op="images")
+            self.conn().publish(self.product(active=False))
+            self.assertEqual(self.count(), 1, kind)
+
+    def test_adoption_resends_only_what_is_missing(self):
+        self.seed(status="draft", name="Nombre propio", description="<p>desc propia</p>", images=[{"src": "https://x.com/old.jpg"}])
+        self.conn().publish(self.product(active=False))
+        self.assertEqual(self.fake.requests_for("images"), [])
+        b = self.fake.requests_for("update")[0]["body"]
+        self.assertNotIn("name", b)
+        self.assertNotIn("description", b)
+        self.assertEqual(self.fake.products(HOST)[0]["images"], [{"src": "https://x.com/old.jpg"}])
+        self.fake.stores[HOST]["products"].clear()
+        self.fake.requests.clear()
+        self.seed(status="draft", name="", description="")
+        self.conn().publish(self.product(active=False))
+        b = self.fake.requests_for("update")[0]["body"]
+        self.assertEqual(b["name"], "Lámpara <LED> & más")
+        self.assertIn("<p>", b["description"])
+        self.assertEqual(len(self.fake.requests_for("images")), 1)
+
+    # ---------------------------------------------------------------- limpieza: plazo
+    def test_cleanup_sleeps_bounded_even_with_huge_retry_after(self):
+        self.fake.inject("http500", op="update")
+        self.fake.inject("http429", op="delete", count=10, retry_after=120)
+        with self.assertRaises(StoreError):
+            self.conn().publish(self.product(active=True))
+        self.assertTrue(self.sleeps)
+        self.assertLessEqual(max(self.sleeps), 1.5)
+        self.assertLessEqual(sum(self.sleeps), 3.0)
+
+    def test_cleanup_respects_total_deadline(self):
+        self.fake.inject("http500", op="update")
+        with mock.patch.object(woocommerce, "CLEANUP_DEADLINE", 0.0):
+            with self.assertRaises(StoreError) as cm:
+                self.conn().publish(self.product(active=True))
+        self.assertEqual(self.fake.requests_for("delete"), [])
+        self.assertTrue(hasattr(cm.exception, "orphan_external_id"))
+
+    def test_cleanup_request_limits_follow_remaining_deadline(self):
+        seen = []
+        real = shttp.request_json
+
+        def spy(method, url, payload=None, **kw):
+            if method == "DELETE":
+                seen.append(kw)
+            return real(method, url, payload, **kw)
+        self.fake.inject("http500", op="update")
+        with mock.patch.object(woocommerce.shttp, "request_json", spy):
+            with self.assertRaises(StoreError):
+                self.conn().publish(self.product(active=True))
+        self.assertTrue(seen)
+        self.assertLessEqual(seen[0]["total_timeout"], woocommerce.CLEANUP_DEADLINE)
+        self.assertLessEqual(seen[0]["timeout"], woocommerce.CLEANUP_DEADLINE)
+
+    def test_cleanup_never_deletes_an_adopted_product(self):
+        seed = self.seed(status="draft")
+        self.fake.inject("http500", op="update", count=1)
+        with self.assertRaises(StoreError):
+            self.conn().publish(self.product(active=True))
+        self.assertEqual(self.fake.requests_for("delete"), [])
+        self.assertEqual(self.count(), 1)
+        self.assertEqual(self.fake.products(HOST)[0]["id"], seed["id"])
+
     # ---------------------------------------------------------------- concurrencia
     def test_concurrent_publishes_of_same_sku_yield_one_product(self):
         errors, refs = [], []
@@ -744,20 +915,16 @@ class UpdateTest(Base):
         got = self.fake.products(HOST)[0]
         self.assertEqual((got["regular_price"], got["stock_quantity"], got["manage_stock"]), ("19.90", 7, True))
 
-    def test_sale_price_rules(self):
+    def test_sale_price_never_sent_and_manual_sale_untouched(self):
         p = self.fake.put_product(HOST, sku="DF-1", sale_price="3.00", regular_price="10.00")
         ref = self.ref(p)
-        self.conn().update_price_stock(ref, 20, 1)                                   # sin compare: no se toca la oferta manual
-        self.assertNotIn("sale_price", self.fake.requests_for("update")[0]["body"])
-        self.assertEqual(self.fake.products(HOST)[0]["sale_price"], "3.00")
-        self.conn().update_price_stock(ref, 20, 1, compare_at_price=15)
-        self.assertEqual(self.fake.requests_for("update")[1]["body"]["sale_price"], "15.00")
-        self.conn().update_price_stock(ref, 20, 1, compare_at_price=20)              # no menor: no se envía
-        self.assertNotIn("sale_price", self.fake.requests_for("update")[2]["body"])
-        self.conn().update_price_stock(ref, 20, 1, compare_at_price=25)
-        self.assertNotIn("sale_price", self.fake.requests_for("update")[3]["body"])
+        for cmp_ in (None, 15, 20, 25, 1):
+            self.conn().update_price_stock(ref, 20, 1, compare_at_price=cmp_)
         for r in self.fake.requests_for("update"):
-            self.assertNotEqual(r["body"].get("sale_price"), "")
+            self.assertNotIn("sale_price", r["body"])
+        self.assertEqual(self.fake.products(HOST)[0]["sale_price"], "3.00")
+        with self.assertRaises(StoreValidationError):
+            self.conn().update_price_stock(ref, 20, 1, compare_at_price="x")
 
     def test_draft_and_trashed_products_still_update(self):
         for st in ("draft", "trash", "private", "pending"):
@@ -813,7 +980,7 @@ class UpdateTest(Base):
 
 class DeleteTest(Base):
     def test_delete_force_true(self):
-        p = self.fake.put_product(HOST, sku="DF-1")
+        p = self.seed()
         self.conn().delete(self.ref(p))
         r = self.fake.requests_for("delete")[0]
         self.assertEqual((r["method"], r["query"]), ("DELETE", {"force": "true"}))
@@ -821,27 +988,50 @@ class DeleteTest(Base):
         self.assertEqual(self.count(), 0)                                            # sin force solo iría a la papelera
 
     def test_delete_idempotent_product_gone(self):
-        p = self.fake.put_product(HOST, sku="DF-1")
+        p = self.seed()
         ref = self.ref(p)
         self.conn().delete(ref)
         self.conn().delete(ref)                                                      # 404 de producto = éxito
         self.conn().delete(ListingRef(external_id="424242"))
-        self.assertEqual(len(self.fake.requests_for("delete")), 3)
+        self.assertEqual(len(self.fake.requests_for("delete")), 1)                   # los otros dos: el GET dio 404 de producto
+        self.assertEqual(len(self.fake.requests_for("get")), 3)
+
+    def test_delete_refuses_products_not_created_by_dropfinder(self):
+        for tags in ([], ["otra"], ["dropfinder"], ["dfi-ab12cd34"], ["dropfinder", "dfi-"], ["xdropfinder", "dfi-ab12"]):
+            self.fake.stores[HOST]["products"].clear()
+            self.fake.requests.clear()
+            p = self.seed(tags=tags, name="Del cliente")
+            with self.assertRaises(StoreValidationError, msg=tags) as cm:
+                self.conn().delete(self.ref(p))
+            self.assertIn("no lleva las etiquetas de DropFinder", str(cm.exception))
+            self.assertEqual(self.fake.requests_for("delete"), [], tags)
+            self.assertEqual(self.count(), 1)
+
+    def test_delete_accepts_any_dfi_tag_and_slug_match(self):
+        for tags in (["dropfinder", "dfi-zzzz9999"], ["x", "DropFinder", "DFI-AB12CD34", "y"]):
+            p = self.seed(tags=tags)
+            self.conn().delete(self.ref(p))
+        self.assertEqual(self.count(), 0)
+
+    def test_delete_get_garbage_does_not_delete(self):
+        with mock.patch.object(C, "_call", return_value=["no", "dict"]):
+            with self.assertRaises(StoreValidationError):
+                self.conn().delete(ListingRef(external_id="5"))
 
     def test_delete_route_404_is_not_success(self):
-        self.fake.inject("route404", op="delete")
+        self.fake.inject("route404", op="get")
         with self.assertRaises(StoreValidationError) as cm:
             self.conn().delete(ListingRef(external_id="5"))
         self.assertNotIsInstance(cm.exception, StoreNotFound)
 
     def test_delete_html_404_is_not_success(self):
-        self.fake.inject("http404", op="delete", html=True, code="")
+        self.fake.inject("http404", op="get", html=True, code="")
         with self.assertRaises(StoreError) as cm:
             self.conn().delete(ListingRef(external_id="5"))
         self.assertNotIsInstance(cm.exception, StoreNotFound)
 
     def test_delete_unknown_404_code_is_not_success(self):
-        self.fake.inject("http404", op="delete", code="algo_raro")
+        self.fake.inject("http404", op="get", code="algo_raro")
         with self.assertRaises(StoreValidationError):
             self.conn().delete(ListingRef(external_id="5"))
 
@@ -849,7 +1039,7 @@ class DeleteTest(Base):
         for kind, cls in (("http401", StoreAuthError), ("http403", StoreAuthError), ("http429", StoreRateLimited),
                           ("http500", StoreError)):
             self.fake.injections.clear()
-            self.fake.inject(kind, op="delete")
+            self.fake.inject(kind, op="get")
             with self.assertRaises(cls, msg=kind):
                 self.conn().delete(ListingRef(external_id="5"))
 
@@ -903,6 +1093,20 @@ class ErrorMappingTest(Base):
         e = self.check("http401", StoreAuthError)
         for w in ("Authorization", "exactamente", "permisos"):
             self.assertIn(w, str(e))
+
+    def test_auth_hint_lists_new_causes(self):
+        e = self.check("http401", StoreAuthError)
+        for w in ("Apache", "Cloudflare en modo SSL flexible", "X-Forwarded-Proto", "PUT/DELETE"):
+            self.assertIn(w, str(e))
+
+    def test_foreign_error_bodies_are_not_echoed_raw(self):
+        e = self.check("http500", StoreError, html=True)
+        self.assertNotIn("Error 500", str(e))                       # el HTML de un sitio ajeno no se refleja
+        e = self.check("http400", StoreValidationError, message="m" * 1000, code="x")
+        self.assertLess(len(str(e)), 120 + 120)
+        self.assertNotIn("m" * 121, str(e))
+        e = self.check("http400", StoreValidationError, message="<b>hola</b> <script>x()</script>", code="x")
+        self.assertNotIn("<", str(e))
 
     def test_429_retry_after_variants(self):
         self.assertEqual(self.check("http429", StoreRateLimited, retry_after=7).retry_after, 7.0)
@@ -1181,8 +1385,6 @@ MUTANTS = [
     ("cleanup_unbounded_none", "for attempt in range(CLEANUP_TRIES):", "for attempt in range(1):"),
     ("cleanup_no_orphan_id", "original.orphan_external_id = pid", "pass"),
     ("cleanup_adopted", "if not adopted:\n                self._cleanup_orphan(pid, e)", "if True:\n                self._cleanup_orphan(pid, e)"),
-    ("sale_always", "return c if Decimal(c) < Decimal(price) else None", "return c"),
-    ("sale_empty_string", "        if compare is None:\n            return None", "        if compare is None:\n            return ''"),
     ("update_no_manage_stock", 'body = {"regular_price": p, "manage_stock": True, "stock_quantity": n}', 'body = {"regular_price": p, "stock_quantity": n}'),
     ("price_as_float", 'body = {"name": title, "type": "simple", "status": "draft", "sku": sku, "regular_price": price,',
      'body = {"name": title, "type": "simple", "status": "draft", "sku": sku, "regular_price": float(price),'),
@@ -1190,7 +1392,6 @@ MUTANTS = [
     ("set_active_inverted", '"publish" if active else "draft"', '"draft" if active else "publish"'),
     ("ref_not_validated", "if not _ID_RE.fullmatch(pid):", "if False:"),
     ("adopt_deletes_nothing_but_skips_update", "            if adopted:                              # lo adoptado", "            if False:                              # lo adoptado"),
-    ("find_exact_sku_filter", 'd.get("sku") == sku and d.get("type")', 'd.get("sku") is not None and d.get("type")'),
     ("repr_leaks", 'return f"<WooCommerceConnector {self.domain}>"', 'return f"<WooCommerceConnector {self.domain} {dict(self.credentials)}>"'),
     ("creds_repr_leaks", 'return "<credenciales ocultas>"', "return dict.__repr__(self)"),
     ("basic_wrong_order", 'f"{k}:{s}".encode("utf-8")', 'f"{s}:{k}".encode("utf-8")'),
@@ -1204,6 +1405,42 @@ MUTANTS = [
     ("validation_after_call", "        existing = self._find_by_sku(sku)\n        adopted", "        existing = self._find_by_sku(sku)\n        adopted"),
     ("stock_negative", "if n < 0 or n > MAX_STOCK:", "if n > MAX_STOCK:"),
     ("title_empty", 'if not title:\n            raise StoreValidationError("El producto necesita un título")', "pass"),
+    ("adopt_without_tags", "            existing = self._own_or_conflict(existing, tags, sku)\n        adopted = existing is not None",
+     "            pass\n        adopted = existing is not None"),
+    ("adopt_race_without_tags", "                existing = self._own_or_conflict(existing, tags, sku)\n                adopted = True",
+     "                adopted = True"),
+    ("tags_match_any", "if not tags_match(self._tag_names(existing), [t[\"name\"] for t in tags]):",
+     "if not set(x.lower() for x in self._tag_names(existing)) & set(t['name'].lower() for t in tags):"),
+    ("tags_match_names_only", 'out += [t[k] for k in ("name", "slug") if isinstance(t.get(k), str)]', 'out += [t[k] for k in ("slug",) if isinstance(t.get(k), str)]'),
+    ("delete_without_ownership", "if OWN_TAG not in names or not any(", "if False and not any("),
+    ("delete_only_generic_tag", "if OWN_TAG not in names or not any(n.startswith(INSTALL_TAG_PREFIX) and len(n) > len(INSTALL_TAG_PREFIX) for n in names):",
+     "if OWN_TAG not in names:"),
+    ("delete_only_dfi_tag", "if OWN_TAG not in names or not any(", "if False or not any("),
+    ("delete_dfi_empty_suffix", "and len(n) > len(INSTALL_TAG_PREFIX) for n in names)", "for n in names)"),
+    ("delete_get_skipped", '            prod = self._call("GET", f"/products/{pid}", ref_op=True)', "            prod = {'tags': [{'name': 'dropfinder'}, {'name': 'dfi-x'}]}"),
+    ("sale_empty_adopt", 'upd = {"regular_price": price, "manage_stock": True, "stock_quantity": stock}', 'upd = {"regular_price": price, "manage_stock": True, "stock_quantity": stock, "sale_price": ""}'),
+    ("sale_in_update", 'payload={"regular_price": p, "manage_stock": True, "stock_quantity": n},', 'payload={"regular_price": p, "manage_stock": True, "stock_quantity": n, "sale_price": ""},'),
+    ("sale_in_create", '"stock_quantity": stock, "description": description, "tags": tags}', '"stock_quantity": stock, "description": description, "tags": tags, "sale_price": "1.00"}'),
+    ("images_in_create", '"stock_quantity": stock, "description": description, "tags": tags}\n        images = _safe_images(product.image_urls)',
+     '"stock_quantity": stock, "description": description, "tags": tags}\n        images = _safe_images(product.image_urls)\n        body["images"] = images'),
+    ("images_failure_raises", '            log.warning("woocommerce: no se pudieron poner las imágenes del producto %s en %s: %s", pid, self._host(),\n                        self._text(e))', "            raise"),
+    ("images_timeout_small", "IMAGES_TIMEOUT = 90.0", "IMAGES_TIMEOUT = 20.0"),
+    ("images_resent_always", "if images and not (adopted and existing.get(\"images\")):", "if images:"),
+    ("adopt_overwrites_name", 'if not existing.get("name"):', "if True:"),
+    ("cleanup_sleep_unbounded", "CLEANUP_MAX_SLEEP = 1.5", "CLEANUP_MAX_SLEEP = 10.0"),
+    ("cleanup_budget_unbounded", "CLEANUP_SLEEP_BUDGET - slept,", "100.0,"),
+    ("cleanup_deadline_ignored", "            if left <= 0:\n                break", "            if False:\n                break"),
+    ("cleanup_limits_ignored", 'limits={"timeout": min(self.TIMEOUT, left), "total_timeout": left})', "limits=None)"),
+    ("sku_case_sensitive", 'd["sku"].lower() == sku.lower()', 'd["sku"] == sku'),
+    ("sku_trash_included", ' and d.get("status") != "trash"', ""),
+    ("sku_variation_included", 'and d.get("type") != "variation"', ""),
+    ("sku_charset_comma", 'r"^[A-Za-z0-9_.\\-]{1,255}$"', 'r"^[A-Za-z0-9_.,\\-]{1,255}$"'),
+    ("adopt_changes_visibility", 'if product.active and status != "publish":', 'if product.active != (status == "publish"):'),
+    ("hint_cloudflare", "Cloudflare en modo SSL flexible sin X-Forwarded-Proto (WooCommerce solo acepta Basic con \"\n             \"SSL); ", ""),
+    ("echo_foreign_html", 'detail = self._text(data.get("message", "")) if isinstance(data.get("message"), str) else ""', 'detail = self._text(resp.body.decode("utf-8", "replace"))'),
+    ("echo_limit", "MAX_ERROR_TEXT = 120", "MAX_ERROR_TEXT = 400"),
+    ("publish_without_tags_ok", "        if not tags:                                     # sin etiquetas", "        if False:                                     # sin etiquetas"),
+    ("conflict_message", "que no creó esta instalación de DropFinder", "x"),
     ("shown_when_inactive", "if product.active and status != \"publish\":", "if status != \"publish\":"),
 ]
 MUTANTS = [m for m in MUTANTS if m[0] != "validation_after_call"]       # (original == reemplazo: no es un mutante)
