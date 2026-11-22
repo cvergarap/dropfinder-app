@@ -1,6 +1,9 @@
 # API de tiendas (contrato compartido del Sprint 4-5)
 
 Todas las rutas exigen sesión; los datos son del usuario (ajeno = 404). Errores: `{"error": "mensaje en español"}`.
+Los errores 409 llevan un `code` estable para distinguir casos: `max_connections`, `duplicate_store`, `has_listings`,
+`pending_deletes`, `credentials_unreadable`; los de tienda: `store_auth`, `store_validation`, `store_missing_scopes`,
+`store_rate_limited`, `store_unreachable`. Todo texto que venga de la tienda se muestra siempre **escapado**.
 Nunca se devuelve 401 por un fallo de la tienda (el navegador lo tomaría por sesión perdida): credenciales
 rechazadas = 400, tienda caída = 502, límite de velocidad = 429.
 
@@ -31,7 +34,7 @@ rechazadas = 400, tienda caída = 502, límite de velocidad = 429.
 | `POST /api/stores/sync` | procesa ya los trabajos vencidos del usuario → `{processed, failed}` |
 | `GET /api/stores/queue` | `{pending, running, failed}` del usuario |
 
-`listing` = `{id, imported_id (puede ser null), connection_id, store_name, platform, title, status (pending|published|hidden|error|removed), external_url, last_price, last_stock, last_synced_at, last_error, pending_action (publish|sync|hide|show|delete|null), is_demo, created_at}`. Los precios son de la moneda de la tienda.
+`listing` (`is_demo` sale de la columna del anuncio, no del producto: sobrevive a que se quite de Mis productos) = `{id, imported_id (puede ser null), connection_id, store_name, platform, title, status (pending|published|hidden|error|removed), external_url, last_price, last_stock, last_synced_at, last_error, pending_action (publish|sync|hide|show|delete|null), is_demo, created_at}`. Los precios son de la moneda de la tienda.
 
 ## Reglas que el motor debe respetar
 - Los productos de demostración (`source = 'mock'`) son ficticios: solo se publican con `allow_demo` explícito y **nunca**
