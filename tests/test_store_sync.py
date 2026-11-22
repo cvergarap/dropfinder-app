@@ -881,6 +881,22 @@ class ReviewVisibilityAndPriceTest(ChangeDuringRunningJobTest):
         store_sync.run_due_jobs(limit=2)
         self.assertEqual(len([c for c in FakeStore.calls if c[0] == "set_active" and c[-1] is False]), 2)
 
+    def test_retry_of_failed_rule_show_runs_even_if_marker_changed(self):
+        store, iid, lid = self.published(as_draft=False, stock=10)
+        pid = self.pid_of(iid)
+        self.catalog_change(pid, stock=0)
+        store_sync.run_due_jobs()                                           # hide por regla (marca = 1)
+        self.catalog_change(pid, stock=5)                                   # show por regla pendiente
+        FakeStore.fail_next.append(sc.StoreValidationError("no se pudo mostrar"))
+        store_sync.run_due_jobs(limit=1)                                    # el show falla: sigue oculto
+        self.assertEqual(self.listing(lid)["status"], "hidden")
+        self.assertEqual(len(self.alerts("store_visibility_failed")), 1)
+        with db.connect() as conn:
+            conn.execute("UPDATE store_listings SET hidden_by_rule = 0 WHERE id = ?", (lid,))
+        store_sync.listing_action(lid, "retry")
+        store_sync.run_due_jobs()
+        self.assertEqual((self.listing(lid)["status"], self.remote(lid)["active"]), ("published", True))
+
     def test_restore_never_invents_hidden_when_previous_state_unknown(self):
         store, iid, lid = self.published(as_draft=False, stock=10)
         FakeStore.fail_next.append(sc.StoreValidationError("stock inválido"))
