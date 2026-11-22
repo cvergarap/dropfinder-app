@@ -12,7 +12,7 @@
   /* ============================================================ funciones puras */
 
   const STATUS = {
-    pending: ["Pendiente", "⏳"], published: ["Publicado", "✓"], hidden: ["Oculto", "◌"],
+    pending: ["Pendiente", "⏳"], published: ["Publicado", "✓"], hidden: ["Oculto · no visible para tus clientes", "◌"],
     error: ["Con error", "⚠"], removed: ["Quitado", "✕"],
   };
   const PENDING_ACTION = {
@@ -117,21 +117,43 @@
   /* Acciones de fila según el estado del anuncio */
   function listingActions(l) {
     if (!l || l.pending_action) return [];
+    if (l.imported_id === null) return ["remove"];       // huérfano: sin producto en Mis productos el servidor responde 409 no_product
     switch (l.status) {
       case "published": return ["sync", "hide", "remove"];
       case "hidden": return ["sync", "show", "remove"];
       case "error": return ["retry", "remove"];
-      case "removed": return ["remove"];
+      case "removed": return ["retry", "remove"];        // borrado a mano en la tienda: Reintentar = volver a publicar
       default: return ["sync", "remove"];
     }
   }
 
-  function statusLabel(l) {
-    const [label, icon] = STATUS[l && l.status] || [String((l && l.status) || "—"), "•"];
-    return { label, icon, pending: l && PENDING_ACTION[l.pending_action] ? PENDING_ACTION[l.pending_action] : "" };
+  const HIDDEN_HELP = "Los productos publicados como borrador empiezan en este estado («Borrador en tienda»): no se ven en tu tienda hasta que pulses «Mostrar».";
+  /* short: texto corto para insignias en «Mis productos» (allí «Draft» ya significa otra cosa) */
+  function statusLabel(l, short = false) {
+    const st = l && l.status;
+    let [label, icon] = STATUS[st] || [String(st || "—"), "•"];
+    let help = "";
+    if (st === "hidden") {
+      if (l.hidden_by_rule) { label = "Oculto automáticamente (sin stock)"; help = "DropFinder lo ocultó porque el proveedor se quedó sin stock. Volverá a mostrarse si regresa el stock (según tus ajustes)."; }
+      else { help = HIDDEN_HELP; if (short) label = "Borrador en tienda"; }
+    }
+    return { label, icon, help, pending: l && PENDING_ACTION[l.pending_action] ? PENDING_ACTION[l.pending_action] : "" };
+  }
+
+  /* Id seguro para atributos id/for/selectores a partir de la clave del campo */
+  function credId(prefix, key) { return `${prefix}-${String(key).replace(/[^a-z0-9_-]/gi, "_")}`; }
+
+  /* Riesgos al publicar un producto importado: margen negativo o stock 0 (si faltan los datos, no se avisa) */
+  function publishRisks(r) {
+    const out = [];
+    if (r && (Number(r.margin) < 0 || Number(r.profit) < 0)) out.push("margen negativo (perderías dinero con cada venta)");
+    if (r && r.stock !== null && r.stock !== undefined && r.stock !== "" && Number(r.stock) === 0) out.push("sin stock en el proveedor");
+    return out;
   }
 
   function skipReasonText(r) { return SKIP_REASONS[r] || "No se pudo publicar"; }
+  /* Texto de un omitido: primero el mensaje del servidor, si no el mapa local */
+  function skipText(s) { return (s && typeof s.message === "string" && s.message.trim()) || skipReasonText(s && s.reason); }
 
   function fmtDateTime(iso) {
     if (!iso) return "";
@@ -142,7 +164,7 @@
 
   const pure = {
     parseDomainInput, formatStorePrice, safeHttpsUrl, splitHelp, planCredentialFields, queueBadge, listingActions,
-    statusLabel, skipReasonText, fmtDateTime, MAX_BULK, SKIP_REASONS, MONITOR_CHOICES,
+    statusLabel, skipReasonText, skipText, credId, publishRisks, fmtDateTime, MAX_BULK, SKIP_REASONS, MONITOR_CHOICES,
   };
   if (typeof module !== "undefined" && module.exports) { module.exports = pure; return; }
 
@@ -221,7 +243,7 @@
   }
 
   /* Confirmación: devuelve {ok, checked} */
-  function confirmDialog({ title, bodyHtml, confirmLabel, danger = false, checkbox = null }) {
+  function confirmDialog({ title, bodyHtml, confirmLabel, danger = false, checkbox = null, onOpen = null }) {
     return new Promise((resolve) => {
       const dlg = openModal(`<form method="dialog" class="st-form" novalidate>
         <h2 id="%ID%">${esc(title)}</h2>
@@ -232,6 +254,7 @@
           <button type="submit" class="primary ${danger ? "st-danger" : ""}">${esc(confirmLabel)}</button>
         </div></form>`, { cls: "st-narrow", focus: "[data-cancel]" });
       let result = { ok: false, checked: false };
+      if (onOpen) onOpen(dlg);
       $("[data-cancel]", dlg).addEventListener("click", () => dlg.close());
       $("form", dlg).addEventListener("submit", (e) => {
         e.preventDefault();
@@ -452,11 +475,16 @@
     const s = storeById(id);
     if (!s) return;
     const n = Number(s.listings) || 0;
+    let live = n;                                    // «publicados» = publicados + ocultos (no los quitados ni con error)
+    try {
+      const [a, b] = await Promise.all(["published", "hidden"].map((st) => api(`/api/stores/${id}/listings?status=${st}&page_size=1`)));
+      live = (a.total || 0) + (b.total || 0);
+    } catch { /* se usa el total */ }
     const r = await confirmDialog({
       title: `¿Desconectar ${s.name}?`,
       confirmLabel: "Desconectar", danger: true,
-      bodyHtml: n
-        ? `<p>Tienes <b>${fmt(n)} producto${n === 1 ? "" : "s"} publicado${n === 1 ? "" : "s"}</b> en esta tienda.</p>
+      bodyHtml: live
+        ? `<p>Tienes <b>${fmt(live)} producto${live === 1 ? "" : "s"} publicado${live === 1 ? "" : "s"}</b> en esta tienda.</p>
            <p><b>Seguirán en tu tienda</b> tal como están (con el último precio y stock), pero DropFinder dejará de sincronizarlos.
               Si quieres retirarlos, hazlo antes desde «Productos publicados».</p>`
         : `<p>DropFinder dejará de conectarse con esta tienda. Podrás volver a conectarla cuando quieras.</p>`,
@@ -513,7 +541,7 @@
 
   /* ============================================================ asistente de conexión */
   function fieldRow(f, prefix, hint) {
-    const id = `${prefix}-${f.key}`;
+    const id = credId(prefix, f.key);
     const optional = f.required === false;
     return `<div class="st-field">
       <label for="${id}">${esc(f.label)}${optional ? ` <span class="st-opt">(opcional)</span>` : ""}</label>
@@ -553,7 +581,7 @@
   function readCredentials(form, platform, prefix) {
     const plan = planCredentialFields(platform.credential_fields);
     const val = (f) => {
-      const el = form.querySelector(`#${CSS.escape(`${prefix}-${f.key}`)}`);
+      const el = form.querySelector(`#${CSS.escape(credId(prefix, f.key))}`);
       return el ? el.value.trim() : "";
     };
     const creds = {};
@@ -690,6 +718,7 @@
         await storesChanged();
       } catch (ex) {
         setBusy(dlg, false, go, "", "Conectar tienda");
+        wipeCredentials(form);                      // tampoco se conserva el secreto tras un intento fallido
         showError(err, ex);
         (ex.status === 409 || ex.status === 400 ? $("#stcDomain", dlg) : go).focus();
       } finally { sending = false; }
@@ -815,6 +844,7 @@
         await storesChanged();
       } catch (ex) {
         setBusy(dlg, false, btn, "", "Validar y guardar credenciales");
+        wipeCredentials(credForm);
         showError(err, ex);
       } finally { rotating = false; }
     });
@@ -883,8 +913,9 @@
 
   function statusBadgeHtml(l) {
     const s = statusLabel(l);
-    return `<span class="st-badge st-l-${esc(l.status)}"><span aria-hidden="true">${s.icon}</span> ${esc(s.label)}</span>` +
-      (s.pending ? ` <span class="st-pending muted">${esc(s.pending)}</span>` : "");
+    return `<span class="st-badge st-l-${esc(l.status)}" ${s.help ? `title="${esc(s.help)}"` : ""}><span aria-hidden="true">${s.icon}</span> ${esc(s.label)}</span>` +
+      (s.pending ? ` <span class="st-pending muted">${esc(s.pending)}</span>` : "") +
+      (s.help ? `<small class="st-help-line muted">${esc(s.help)}</small>` : "");
   }
 
   const ACTION_BTN = {
@@ -945,6 +976,11 @@
     const l = S.sub && S.sub.data && S.sub.data.items.find((x) => x.id === lid);
     if (!l) return;
     if (act === "remove") return removeListing(l);
+    if (act === "show") {
+      const r = await confirmDialog({ title: "¿Mostrar este producto?", confirmLabel: "Mostrar", bodyHtml:
+        `<p><b>${esc(l.title)}</b></p><p>Esto hará visible el producto a tus clientes ahora. ¿Continuar?</p>` });
+      if (!r.ok) return;
+    }
     if (btn) btn.disabled = true;
     try {
       const r = await api(`/api/store-listings/${lid}/${act}`, { method: "POST" });
@@ -1028,8 +1064,8 @@
   function badgesHtml(importedId) {
     const ls = byImport.get(Number(importedId)) || [];
     return ls.map((l) => {
-      const s = statusLabel(l);
-      return `<span class="st-badge st-l-${esc(l.status)}" title="${esc(l.last_error || `${l.store_name}: ${s.label}`)}"><span aria-hidden="true">${s.icon}</span> ${esc(l.store_name || "Tienda")} · ${esc(s.pending || s.label)}</span>`;
+      const s = statusLabel(l, true);
+      return `<span class="st-badge st-l-${esc(l.status)}" title="${esc(l.last_error || s.help || `${l.store_name}: ${s.label}`)}"><span aria-hidden="true">${s.icon}</span> ${esc(l.store_name || "Tienda")} · ${esc(s.pending || s.label)}</span>`;
     }).join("");
   }
 
@@ -1089,6 +1125,20 @@
     if (!S.stores) ensureStores().then(syncPublishButtons).catch(() => null);
     refreshBadges();
     kick();
+  });
+  DF.beforeImportRemove.push(async (id) => {
+    const live = (byImport.get(id) || []).filter((l) => l.status !== "removed");
+    if (!live.length) return true;
+    const r = await confirmDialog({
+      title: "Este producto está publicado en tu tienda", confirmLabel: "Quitar de Mis productos", danger: true,
+      bodyHtml: `<p>Está publicado en ${esc([...new Set(live.map((l) => l.store_name))].join(", "))}. Si lo quitas de Mis productos,
+        <b>seguirá en tu tienda</b> pero DropFinder dejará de sincronizarlo: si luego se agota, <b>no se ocultará solo</b>.</p>
+        <p>Puedes retirarlo antes desde <button type="button" class="link" data-go-listings>Tiendas → Productos publicados</button>.</p>`,
+      onOpen: (dlg) => $("[data-go-listings]", dlg).addEventListener("click", () => {
+        dlg.close(); show("stores"); setTimeout(() => openListings(live[0].connection_id), 0);
+      }),
+    });
+    return r.ok;
   });
   DF.importRemoved.push((id) => {
     const n = (byImport.get(id) || []).filter((l) => l.status !== "removed").length;
@@ -1183,6 +1233,7 @@
     if (!rows.length) return;
     const demo = rows.filter((r) => r.source === "mock");
     const allDemo = demo.length === rows.length;
+    const riskRows = rows.map((r) => [r, publishRisks(r)]).filter(([, rs]) => rs.length);
     const single = rows.length === 1;
     const dlg = openModal(`<form class="st-form st-publish-form" novalidate>
       <h2 id="%ID%">${single ? "Publicar en tienda" : `Publicar ${rows.length} productos en tienda`}</h2>
@@ -1193,6 +1244,9 @@
       <label class="st-check st-setting"><input type="checkbox" id="stpDraft">
         <span><b>Publicar como borrador</b><small class="muted">Lo revisas en tu tienda antes de que sea visible para tus clientes.</small></span></label>
       <p class="note st-price-note" id="stpPrice"></p>
+      ${riskRows.length ? `<div class="st-warn" role="note"><b>⚠ ${single ? "Ojo con este producto" : `${riskRows.length} de los productos tienen problemas`}</b>
+        <ul>${riskRows.map(([r, rs]) => `<li>${single ? "" : `<b>${esc(r.title)}</b>: `}${esc(rs.join(" y "))}</li>`).join("")}</ul>
+        <label class="st-check"><input type="checkbox" id="stpRisk"> <span>Publicar de todos modos</span></label></div>` : ""}
       ${demo.length ? `<div class="st-warn" role="note"><b>⚠ ${allDemo ? (single ? "Producto de demostración: es ficticio." : "Son productos de demostración: son ficticios.") : `${demo.length} de los productos son de demostración (ficticios).`}</b>
         <p>No existen en ningún proveedor y no se sincronizarán nunca. Úsalos solo para probar tu tienda.</p>
         <label class="st-check"><input type="checkbox" id="stpDemo"> <span>${allDemo ? "Entiendo que es ficticio y quiero publicarlo igual" : "Publicar también los de demostración (si no marcas, se omiten)"}</span></label></div>` : ""}
@@ -1217,8 +1271,10 @@
     };
     storeSel.addEventListener("change", refresh);
     refresh();
-    const syncGo = () => { go.disabled = !!(allDemo && demoBox && !demoBox.checked); };
+    const riskBox = $("#stpRisk", dlg);
+    const syncGo = () => { go.disabled = !!((allDemo && demoBox && !demoBox.checked) || (riskBox && !riskBox.checked)); };
     if (demoBox) demoBox.addEventListener("change", syncGo);
+    if (riskBox) riskBox.addEventListener("change", syncGo);
     syncGo();
     $("[data-cancel]", dlg).addEventListener("click", () => dlg.close());
     let sending = false;
@@ -1226,13 +1282,20 @@
       e.preventDefault();
       if (sending || go.disabled) return;
       hideError(err);
+      if (!$("#stpDraft", dlg).checked) {            // publicar sin borrador = visible para clientes reales
+        sending = true;
+        const c = await confirmDialog({ title: "¿Publicar visible?", confirmLabel: "Publicar visible", bodyHtml:
+          `<p>Esto hará visible ${single ? "el producto" : "los productos"} a tus clientes ahora. ¿Continuar?</p><p class="muted">Si prefieres revisarlo antes, marca «Publicar como borrador».</p>` });
+        sending = false;
+        if (!c.ok) return;
+      }
       sending = true;
       const body = { imported_ids: rows.map((r) => r.id), as_draft: $("#stpDraft", dlg).checked, allow_demo: !!(demoBox && demoBox.checked) };
       setBusy(dlg, true, go, "Enviando…", "Publicar");
       try {
         const r = await api(`/api/stores/${storeSel.value}/publish`, { method: "POST", body });
         setBusy(dlg, false, go, "", "Publicar");
-        showPublishResult(dlg, rows, r, currentStore());
+        showPublishResult(dlg, rows, r, currentStore(), body.as_draft);
         selected.clear();
         $$("#importsBody .st-sel").forEach((c) => { c.checked = false; });
         updateBulkBar();
@@ -1245,14 +1308,14 @@
     });
   }
 
-  function showPublishResult(dlg, rows, r, store) {
+  function showPublishResult(dlg, rows, r, store, asDraft) {
     const queued = r.queued || [], skipped = r.skipped || [];
     const title = (id) => (rows.find((x) => x.id === id) || {}).title || `Producto #${id}`;
     const res = $("#stpResult", dlg);
     res.innerHTML = `${queued.length ? `<p class="good"><b>✓ ${queued.length} producto${queued.length === 1 ? "" : "s"} en cola</b> para publicarse${store ? ` en ${esc(store.name)}` : ""}.
-        Verás el estado en «Mis productos» y en Tiendas → Productos publicados.</p>` : ""}
+        ${asDraft ? `Se crea como <b>borrador en la tienda</b> (no visible para tus clientes). Para hacerlo visible usa «Mostrar» en Tiendas → Productos publicados.` : "Verás el estado en «Mis productos» y en Tiendas → Productos publicados."}</p>` : ""}
       ${skipped.length ? `<p class="${queued.length ? "" : "bad"}"><b>${skipped.length} no se publicaron:</b></p>
-        <ul>${skipped.map((s) => `<li><b>${esc(title(s.imported_id))}</b>: ${esc(skipReasonText(s.reason))}</li>`).join("")}</ul>` : ""}`;
+        <ul>${skipped.map((s) => `<li><b>${esc(title(s.imported_id))}</b>: ${esc(skipText(s))}</li>`).join("")}</ul>` : ""}`;
     res.classList.remove("hidden");
     $$(".st-field, .st-setting, .st-price-note, .st-warn", dlg).forEach((el) => el.classList.add("hidden"));
     $(".st-actions", dlg).innerHTML = `<button type="button" class="ghost" data-go-stores>Ver en Tiendas</button>
@@ -1260,6 +1323,7 @@
     $("[data-close]", dlg).addEventListener("click", () => dlg.close());
     $("[data-go-stores]", dlg).addEventListener("click", () => { dlg.close(); show("stores"); });
     $("[data-close]", dlg).focus();
+    if (asDraft && queued.length) toast("Creado como borrador en la tienda: para hacerlo visible usa «Mostrar» en Tiendas → Productos publicados");
   }
 
   /* ============================================================ arranque */

@@ -68,7 +68,11 @@ t("queueBadge y listingActions", () => {
   assert.equal(h.queueBadge(null), 0);
   assert.deepEqual(h.listingActions({ status: "published" }), ["sync", "hide", "remove"]);
   assert.deepEqual(h.listingActions({ status: "hidden" }), ["sync", "show", "remove"]);
-  assert.deepEqual(h.listingActions({ status: "error" }), ["retry", "remove"]);
+  assert.deepEqual(h.listingActions({ status: "error", imported_id: 3 }), ["retry", "remove"]);
+  assert.deepEqual(h.listingActions({ status: "removed", imported_id: 3 }), ["retry", "remove"]);       // borrado a mano: republicar
+  for (const status of ["published", "hidden", "error", "removed", "pending"]) {
+    assert.deepEqual(h.listingActions({ status, imported_id: null }), ["remove"], status);               // huérfano: solo Quitar
+  }
   assert.deepEqual(h.listingActions({ status: "published", pending_action: "sync" }), []);
 });
 
@@ -83,6 +87,45 @@ t("statusLabel, skipReasonText y fechas", () => {
   assert.equal(h.fmtDateTime("no es fecha"), "no es fecha");
   assert.ok(h.fmtDateTime("2026-11-22T10:00:00Z").length > 5);
   assert.equal(h.MAX_BULK, 50);
+});
+
+t("borrador vs oculto: textos", () => {
+  assert.equal(h.statusLabel({ status: "hidden" }).label, "Oculto · no visible para tus clientes");
+  assert.match(h.statusLabel({ status: "hidden" }).help, /borrador/i);
+  assert.equal(h.statusLabel({ status: "hidden" }, true).label, "Borrador en tienda");
+  assert.equal(h.statusLabel({ status: "hidden", hidden_by_rule: true }).label, "Oculto automáticamente (sin stock)");
+  assert.equal(h.statusLabel({ status: "hidden", hidden_by_rule: true }, true).label, "Oculto automáticamente (sin stock)");
+});
+
+t("skipText: mensaje del servidor primero, mapa local de respaldo", () => {
+  assert.equal(h.skipText({ reason: "already_published", message: "Ya existe; usa Reintentar" }), "Ya existe; usa Reintentar");
+  assert.equal(h.skipText({ reason: "already_published" }), "Ya publicado");
+  assert.equal(h.skipText({ reason: "x", message: "  " }), "No se pudo publicar");
+});
+
+t("grupos de credenciales con los ids reales del conector de Shopify", () => {
+  const fields = [
+    { key: "access_token", label: "Token de acceso de la API de administración", secret: true, required: false, group: "token" },
+    { key: "client_id", label: "ID de cliente (Client ID)", secret: false, required: false, group: "app" },
+    { key: "client_secret", label: "Secreto de cliente (Client secret)", secret: true, required: false, group: "app" },
+  ];
+  const p = h.planCredentialFields(fields);
+  assert.deepEqual(p.modes.map((m) => [m.id, m.title, m.fields.map((f) => f.key)]),
+    [["token", "Token de acceso", ["access_token"]], ["app", "ID y secreto de la app", ["client_id", "client_secret"]]]);
+  assert.equal(p.flat.length, 0);
+  // ids de grupo desconocidos (o raros): título con las etiquetas, sin romper
+  const u = h.planCredentialFields([{ key: "a", label: "Uno", required: false, group: "<b>x</b>" }, { key: "b", label: "Dos", required: false, group: 7 }]);
+  assert.equal(u.modes.length, 2); assert.equal(u.modes[0].title, "Uno"); assert.equal(u.modes[1].id, "7");
+});
+
+t("credId sanea claves; publishRisks", () => {
+  assert.equal(h.credId("stc", 'a" onfocus="x'), "stc-a__onfocus__x");
+  assert.equal(h.credId("stc", "client_id"), "stc-client_id");
+  assert.deepEqual(h.publishRisks({ margin: 30, profit: 5, stock: 10 }), []);
+  assert.equal(h.publishRisks({ margin: -5, profit: -1, stock: 10 }).length, 1);
+  assert.equal(h.publishRisks({ margin: 10, stock: 0 }).length, 1);
+  assert.equal(h.publishRisks({ margin: -1, stock: 0 }).length, 2);
+  assert.deepEqual(h.publishRisks({}), []);
 });
 
 console.log(`${n} pruebas OK`);

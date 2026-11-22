@@ -153,3 +153,5 @@ button.st-danger { background: var(--bad); color: #fff; }
 
 /* Los textos .sr-only (position:absolute) dentro de la tabla no deben desbordar la página: el contenedor con scroll los contiene */
 #view-stores .table-wrap { position: relative; }
+.st-help-line { display: block; font-size: 11px; white-space: normal; max-width: 260px; margin-top: 2px; }
+.st-warn ul { margin: 0; padding-left: 18px; }

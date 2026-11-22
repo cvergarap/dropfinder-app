@@ -13,6 +13,7 @@ const DF = {
   importRowExtras: [], // contenido extra bajo el título (insignias de tiendas)
   importActions: [],   // botones extra en la celda de acciones
   onImports: [],       // f(filas) tras dibujar la tabla
+  beforeImportRemove: [], // async f(id) -> false cancela quitar el producto
   importRemoved: [],   // f(id) -> texto opcional que se agrega al aviso al quitar un producto
   /* Sesión (la maneja js/auth.js). api() espera a `ready` (sesión iniciada) antes de llamar a la API,
      envía `csrf` en las peticiones que modifican datos y llama a onUnauthorized() ante un 401. */
@@ -463,6 +464,7 @@ $("#importsBody").addEventListener("click", async (e) => {
     await api(`/api/imports/${tr.dataset.id}`, { method: "PATCH", body: { status } });
     loadImports();
   } else if (e.target.matches(".del")) {
+    for (const f of DF.beforeImportRemove) { if ((await dfSafe(f, Number(tr.dataset.id))) === false) return; }
     const hint = DF.importRemoved.map((f) => dfSafe(f, Number(tr.dataset.id)) || "").filter(Boolean).join(" ");
     await api(`/api/imports/${tr.dataset.id}`, { method: "DELETE" });
     toast(`Producto quitado${hint ? `. ${hint}` : ""}`); loadImports(); refreshCounts();
