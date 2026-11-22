@@ -1169,5 +1169,144 @@ class BoundaryTest(Base):
         self.assertEqual(d, "&quot;q&quot; &amp; &#x27;a&#x27;")
 
 
+class OwnershipTest(Base):
+    """El SKU DF-<id> es local a cada base de datos: sin las etiquetas de esta instalación NO es nuestro producto."""
+    CONFLICT = "no creó esta instalación de DropFinder"
+
+    def snapshot(self):
+        return json.dumps(self.products(), sort_keys=True, default=str)
+
+    def assertConflict(self, tags, **add):
+        pid = self.fake.add_product(STORE, "DF-1", tags, **add)
+        before = self.snapshot()
+        with self.assertRaises(StoreValidationError) as cm:
+            self.publish(active=True)
+        self.assertIn(self.CONFLICT, str(cm.exception))
+        self.assertIn("DF-1", str(cm.exception))
+        self.assertNotIsInstance(cm.exception, StoreNotFound)
+        self.assertEqual(self.snapshot(), before)                       # ni pisado ni duplicado
+        self.assertEqual(len(self.products()), 1)
+        for op in ("product_create", "variant_update", "product_update", "product_delete"):
+            self.assertEqual(self.fake.requests_for(op), [], op)
+        return pid
+
+    def test_foreign_products_with_same_sku_are_never_adopted(self):
+        for tags in ("", "oferta,verano", "dropfinder", "dfi-abc123", "dropfinder,dfi-OTRA", "dropfinder-dfi-abc123"):
+            self.products().clear()
+            self.fake.requests.clear()
+            self.assertConflict(tags, published=True)
+
+    def test_foreign_unpublished_and_published_untouched(self):
+        self.assertConflict("", published=False, price="9.00", stock=3)
+
+    def test_other_installation_tags_rejected(self):
+        self.assertConflict("dropfinder,dfi-zzz999")
+
+    def test_own_product_is_adopted_case_insensitive_and_any_order(self):
+        for tags in ("dropfinder,dfi-abc123", "DFI-ABC123, DropFinder", "x,dfi-abc123,y,dropfinder"):
+            self.products().clear()
+            self.fake.requests.clear()
+            pid = self.fake.add_product(STORE, "DF-1", tags, published=False)
+            ref = self.publish(active=False, price=77)
+            self.assertEqual((ref.external_id, len(self.products())), (str(pid), 1), tags)
+            self.assertEqual(self.fake.requests_for("product_create"), [])
+            self.assertEqual(self.products()[pid]["variants"][0]["price"], "77.00")
+
+    def test_list_answer_with_foreign_first_adopts_own(self):
+        self.st["sku_mode"] = "list"
+        foreign = self.fake.add_product(STORE, "DF-1", "", name="Del cliente")
+        own = self.fake.add_product(STORE, "DF-1", "dropfinder,dfi-abc123")
+        # el fake devuelve primero los otros productos: el del cliente va antes
+        ref = self.publish(active=False)
+        self.assertEqual(ref.external_id, str(own))
+        self.assertEqual(self.products()[foreign]["variants"][0]["price"], "5.00")
+        self.assertEqual(self.fake.requests_for("variant_update")[0]["path"].split("/")[3:5], ["products", str(own)])
+
+    def test_list_with_only_foreign_is_conflict(self):
+        self.st["sku_mode"] = "list"
+        self.fake.add_product(STORE, "DF-1", "a")
+        self.fake.add_product(STORE, "DF-1", "b")
+        with self.assertRaises(StoreValidationError):
+            self.publish()
+        self.assertEqual(self.fake.requests_for("product_create"), [])
+
+    def test_engine_without_tags_never_adopts(self):
+        self.fake.add_product(STORE, "DF-1", "dropfinder,dfi-abc123")
+        with self.assertRaises(StoreValidationError):
+            self.publish(tags=[])
+
+    def test_tags_sent_exactly_as_given(self):
+        self.publish(tags=["dropfinder", "dfi-9f8e7d"])
+        self.assertEqual(self.fake.requests_for("product_create")[0]["body"]["tags"], "dropfinder,dfi-9f8e7d")
+        p = next(iter(self.products().values()))
+        self.assertEqual(p["tags"], "dropfinder,dfi-9f8e7d")
+        # y lo que se crea se reconoce como propio al reintentar
+        ref = self.publish(tags=["dropfinder", "dfi-9f8e7d"], price=3)
+        self.assertEqual((len(self.products()), ref.external_id), (1, str(p["id"])))
+        with self.assertRaises(StoreValidationError):
+            self.publish(tags=["dropfinder", "dfi-otra-instalacion"])
+
+    def test_lost_response_retry_adopts_own_creation(self):
+        self.fake.inject("execute_then_drop", op="product_create")
+        with self.assertRaises(StoreError):
+            self.publish(active=True)
+        self.publish(active=True)
+        self.assertEqual(len(self.products()), 1)
+
+    def test_delete_refuses_untagged_and_partially_tagged(self):
+        for tags in ("", "oferta", "dropfinder", "dfi-abc123", "dropfinder,dfi-", "mi-dropfinder,dfi-x"):
+            self.products().clear()
+            self.fake.requests.clear()
+            pid = self.fake.add_product(STORE, "DF-1", tags)
+            with self.assertRaises(StoreValidationError) as cm:
+                self.conn().delete(ListingRef(str(pid), "1"))
+            self.assertNotIsInstance(cm.exception, StoreNotFound)
+            self.assertIn(pid, self.products())
+            self.assertEqual(self.fake.requests_for("product_delete"), [], tags)
+
+    def test_delete_accepts_dropfinder_products_of_any_installation(self):
+        for tags in ("dropfinder,dfi-abc123", "DropFinder,DFI-otra", "x,dfi-1,dropfinder"):
+            pid = self.fake.add_product(STORE, "DF-9", tags)
+            self.conn().delete(ListingRef(str(pid), "1"))
+            self.assertNotIn(pid, self.products())
+
+    def test_delete_of_published_product_roundtrip_and_missing(self):
+        ref = self.publish()
+        self.conn().delete(ref)
+        self.assertEqual(self.products(), {})
+        self.fake.requests.clear()
+        self.conn().delete(ref)                                         # ya no existe: éxito, sin DELETE
+        self.assertEqual(self.fake.requests_for("product_delete"), [])
+        self.assertEqual(self.fake.ops(), ["product_get", "store"])
+
+    def test_delete_missing_store_is_validation_error(self):
+        with self.assertRaises(StoreValidationError) as cm:
+            self.conn(domain="999999").delete(ListingRef("5001", "1"))
+        self.assertNotIsInstance(cm.exception, StoreNotFound)
+
+    def test_delete_with_hostile_tags_in_response(self):
+        pid = self.fake.add_product(STORE, "DF-1", "")
+        for bad in (None, 5, {"dropfinder": 1}, [None, 3]):
+            self.products()[pid]["tags"] = bad
+            with self.assertRaises(StoreValidationError):
+                self.conn().delete(ListingRef(str(pid), "1"))
+        self.products()[pid]["tags"] = ["dropfinder", "dfi-x"]            # lista (si la API cambiara) también vale
+        self.conn().delete(ListingRef(str(pid), "1"))
+
+    def test_cleanup_only_deletes_what_this_call_created(self):
+        own = self.fake.add_product(STORE, "DF-1", "dropfinder,dfi-abc123", published=False)
+        self.fake.inject("http500", op="variant_update")
+        with self.assertRaises(StoreError):
+            self.publish()
+        self.assertIn(own, self.products())
+        self.assertEqual(self.fake.requests_for("product_delete"), [])
+
+    def test_cleanup_of_created_product_still_deletes_it(self):
+        self.fake.inject("http500", op="product_update")
+        with self.assertRaises(StoreError):
+            self.publish(active=True)
+        self.assertEqual(self.products(), {})
+
+
 if __name__ == "__main__":
     unittest.main()
