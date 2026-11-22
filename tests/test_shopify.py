@@ -643,7 +643,10 @@ class InputValidationTest(Base):
                 self.conn().publish(self.product(**kw))
             except StoreError:
                 pass
-        self.assertTrue(True)
+        for call in (lambda c: c.publish(None), lambda c: c.delete(None), lambda c: c.set_active(None, True),
+                     lambda c: c.update_price_stock(None, 1, 1)):
+            with self.assertRaises(StoreValidationError):
+                call(self.conn())
 
     def test_compare_not_above_price_is_dropped(self):
         for compare in (19.9, 10.0, 19.899):
@@ -848,11 +851,12 @@ class CredentialsHygieneTest(Base):
             self.st["apps"][f"client_{i}_abc"] = CSECRET
         with mock.patch.object(shopify, "MAX_TOKEN_ENTRIES", 3):
             for i in range(5):
-                C(SHOP, {"client_id": f"client_{i}_abc", "client_secret": CSECRET}).validate()
+                C(SHOP, {"client_id": f"client_{i}_abc", "client_secret": CSECRET},
+                  {"location_id": "gid://shopify/Location/1"}).validate()      # sin barrer por la caché de ubicación
         self.assertLessEqual(len(shopify._TOKEN_CACHE), 3)
         real = shopify._now()
         with mock.patch.object(shopify, "_now", lambda: real + 10 ** 6):
-            self.conn("client").validate()
+            C(SHOP, {"client_id": CID, "client_secret": CSECRET}, {"location_id": "gid://shopify/Location/1"}).validate()
         self.assertEqual(len(shopify._TOKEN_CACHE), 1)             # lo caducado se barrió
         self.assertLessEqual(len(shopify._FETCH_LOCKS), 5)
 
