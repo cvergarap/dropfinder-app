@@ -13,6 +13,7 @@ import re
 import sqlite3
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -191,7 +192,7 @@ def search_products(qs: dict, *, log: bool = True) -> dict:
                 elif _query(conn, fix_tokens, use_fts, where, args, sort, page, size, count_only=True)[0] > total:
                     suggestion = fix
         if tokens and page == 1 and log:   # para el autocompletado se guarda la consulta ya corregida
-            _best_effort(conn, search.log_search, effective, total, db.now())
+            _best_effort(conn, search.log_search, effective, total, db.now(), current_user_id())
     return {
         "total": total, "page": page, "page_size": size, "pages": math.ceil(total / size) if total else 0,
         "items": items, "query": effective, "sort": sort,
@@ -204,7 +205,7 @@ def suggest(qs: dict) -> dict:
     q = qs.get("q", [""])[0][:100]
     limit = min(20, max(1, _num(qs, "limit", int) or 8))
     with db.connect() as conn:
-        return {"items": search.suggest(conn, q, limit)}
+        return {"items": search.suggest(conn, q, limit, user_id=current_user_id())}
 
 
 def get_product(pid: int) -> dict:
@@ -357,18 +358,36 @@ def _check_imported(conn, r, new: PriceStock, s: dict, created: list) -> None:
                  (new.cost, new.stock, r["id"]))
 
 
-def run_monitor(user_id: int | None = None) -> dict:
+MONITOR_COOLDOWN_MIN = 15     # minutos entre dos actualizaciones del mismo producto por el monitor
+
+
+def run_monitor(user_id: int | None = None, force: bool = False) -> dict:
     """Re-consulta precio/stock en el proveedor para cada producto importado por el usuario y genera
     alertas. Si otro usuario importó el mismo producto, también recibe sus alertas (cada alerta es del
-    dueño de su producto importado); la respuesta solo informa las del usuario."""
+    dueño de su producto importado); la respuesta solo informa las del usuario.
+
+    Enfriamiento: el catálogo es compartido, así que un producto que el monitor actualizó hace menos de
+    MONITOR_COOLDOWN_MIN minutos no se vuelve a consultar ni a escribir (lo ejecute quien lo ejecute). Sus
+    alertas para el usuario se evalúan igual contra el último estado conocido. Solo el propietario puede
+    saltarse el enfriamiento con force=True. Corre con el bloqueo de escritura tomado (dos monitores a la vez
+    se serializan y no consultan dos veces el mismo producto)."""
     uid = current_user_id() if user_id is None else user_id
-    created, checked, skipped, changed = [], 0, 0, []
+    force = bool(force) and auth_context.is_owner()
+    created, checked, skipped, changed, cooled = [], 0, 0, [], 0
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=MONITOR_COOLDOWN_MIN)).isoformat(timespec="seconds")
     with db.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         s = db.get_settings(conn)
         for r in conn.execute(IMPORT_SQL + " WHERE i.user_id = ?", (uid,)).fetchall():
             connector = LIVE_CONNECTORS.get(r["source"])
             if connector is None:
                 skipped += 1
+                continue
+            last = conn.execute("SELECT checked_at FROM monitor_checks WHERE product_id = ?",
+                                (r["product_id"],)).fetchone()
+            if last and last[0] > cutoff and not force:
+                cooled += 1                    # sin consultar ni escribir el catálogo; alertas con lo último
+                _check_imported(conn, r, PriceStock(r["cost"], r["shipping_cost"], r["stock"]), s, created)
                 continue
             cur = PriceStock(r["cost"], r["shipping_cost"], r["stock"])
             new = connector.get_price_stock(r["supplier"], current=cur)
@@ -378,13 +397,15 @@ def run_monitor(user_id: int | None = None) -> dict:
             checked += 1
             conn.execute("UPDATE products SET cost = ?, shipping_cost = ?, stock = ?, updated_at = ? WHERE id = ?",
                          (new.cost, new.shipping_cost, new.stock, db.now(), r["product_id"]))
+            conn.execute("INSERT OR REPLACE INTO monitor_checks(product_id, checked_at) VALUES (?, ?)",
+                         (r["product_id"], db.now()))
             changed.append(r["product_id"])
             for other in conn.execute(IMPORT_SQL + " WHERE i.product_id = ?", (r["product_id"],)).fetchall():
                 _check_imported(conn, other, new, s, created)
         db.recompute_metrics(conn, s, ids=changed)
         hooks.run_catalog_write(conn, changed)
     mine = [{k: v for k, v in a.items() if k != "user_id"} for a in created if a["user_id"] == uid]
-    return {"checked": checked, "skipped": skipped, "alerts": mine}
+    return {"checked": checked, "skipped": skipped, "cooldown": cooled, "alerts": mine}
 
 
 # ---------------------------------------------------------------- proveedores / catálogo
@@ -535,7 +556,7 @@ ROUTES = [
     ("POST", r"/api/imports", lambda m, qs, b: create_import(b)),
     ("PATCH", r"/api/imports/(\d+)", lambda m, qs, b: update_import(int(m[1]), b)),
     ("DELETE", r"/api/imports/(\d+)", lambda m, qs, b: delete_import(int(m[1]))),
-    ("POST", r"/api/monitor/run", lambda m, qs, b: run_monitor()),
+    ("POST", r"/api/monitor/run", lambda m, qs, b: run_monitor(force=isinstance(b, dict) and b.get("force") is True)),
     ("GET", r"/api/alerts", lambda m, qs, b: list_alerts()),
     ("GET", r"/api/suppliers", lambda m, qs, b: list_suppliers()),
     ("POST", r"/api/catalog/csv", lambda m, qs, b: upload_csv(b)),
@@ -551,15 +572,76 @@ ROUTES = [
 for _module in (auth, history, compare, saved_searches, dashboard, collections_mod):
     ROUTES.extend(_module.ROUTES)
 
-# Rutas solo para el propietario: (método, patrón) → acción del mensaje "Solo el propietario puede …".
-# Catálogo, reglas de precio y usuarios son de la instalación. El monitor revisa los importados propios:
-# lo puede ejecutar cualquier usuario. Los módulos pueden agregar entradas o llamar auth.require_owner().
+# ---------------------------------------------------------------- acceso por ruta
+# TODA ruta debe estar en una de estas tres tablas (lo comprueba tests/test_auth.py, que recorre ROUTES):
+# - PUBLIC_ROUTES: sin sesión (deben coincidir con auth.PUBLIC_PATHS).
+# - OWNER_ONLY: solo el propietario → (método, patrón): acción del mensaje "Solo el propietario puede …".
+#   Catálogo, reglas de precio, tasa de cambio y usuarios son de la instalación.
+# - USER_ROUTES: cualquier usuario con sesión (los datos propios se separan con auth_context).
+# Una ruta sin clasificar se trata como solo-propietario si modifica datos (fallo seguro) y como de
+# usuario si es de lectura; la prueba igual falla para obligar a clasificarla.
+PUBLIC_ROUTES = {("GET", r"/api/auth/status"), ("POST", r"/api/auth/register"), ("POST", r"/api/auth/login")}
 OWNER_ONLY = {
     ("PUT", r"/api/settings"): "cambiar las reglas de precio",
     ("POST", r"/api/catalog/csv"): "cargar catálogos de proveedores",
     ("DELETE", r"/api/catalog"): "eliminar catálogos",
+    ("POST", r"/api/currency/refresh"): "actualizar la TRM de la instalación",
     **auth.OWNER_ONLY,
 }
+USER_ROUTES = {
+    # núcleo
+    ("GET", r"/api/products"), ("GET", r"/api/suggest"), ("GET", r"/api/products/(\d+)"), ("GET", r"/api/facets"),
+    ("GET", r"/api/settings"), ("GET", r"/api/imports"), ("POST", r"/api/imports"),
+    ("PATCH", r"/api/imports/(\d+)"), ("DELETE", r"/api/imports/(\d+)"),
+    ("POST", r"/api/monitor/run"),           # revisa los importados propios (con enfriamiento por producto)
+    ("GET", r"/api/alerts"), ("GET", r"/api/suppliers"), ("POST", r"/api/alerts/read"), ("GET", r"/api/alerts/count"),
+    ("GET", r"/api/currency"),
+    ("PUT", r"/api/currency"),               # preferencias propias; la tasa la valida currency_update (403)
+    # cuenta propia
+    ("POST", r"/api/auth/logout"), ("GET", r"/api/auth/me"), ("PATCH", r"/api/auth/me"),
+    # historial y comparador (lectura del catálogo compartido)
+    ("GET", r"/api/products/(\d+)/history"), ("GET", r"/api/rankings"), ("GET", r"/api/seasonal"),
+    ("GET", r"/api/suppliers/stats"), ("GET", r"/api/products/(\d+)/alternatives"),
+    ("GET", r"/api/alternatives/counts"), ("GET", r"/api/compare"),
+    # búsquedas guardadas (propias)
+    ("GET", r"/api/saved-searches"), ("GET", r"/api/saved-searches/preview"), ("POST", r"/api/saved-searches"),
+    ("POST", r"/api/saved-searches/check"), ("PATCH", r"/api/saved-searches/(\d+)"),
+    ("DELETE", r"/api/saved-searches/(\d+)"), ("GET", r"/api/saved-searches/(\d+)/results"),
+    ("POST", r"/api/saved-searches/(\d+)/seen"),
+    # colecciones y exportación (propias)
+    ("GET", r"/api/collections"), ("POST", r"/api/collections"), ("PATCH", r"/api/collections/(\d+)"),
+    ("DELETE", r"/api/collections/(\d+)"), ("GET", r"/api/collections/(\d+)/items"),
+    ("POST", r"/api/collections/(\d+)/items"), ("DELETE", r"/api/collections/(\d+)/items/(\d+)"),
+    ("PATCH", r"/api/collections/(\d+)/items/(\d+)"), ("POST", r"/api/favorites/(\d+)"),
+    ("GET", r"/api/favorites/ids"), ("GET", r"/api/product-collections/(\d+)"),
+    ("GET", r"/api/export/(search|collection|imports)\.csv"),
+}
+
+
+def route_access(method: str, pattern: str) -> str:
+    """'public', 'owner' o 'user' para una ruta de ROUTES (sin clasificar: 'owner' si modifica datos)."""
+    key = (method, pattern)
+    if key in PUBLIC_ROUTES:
+        return "public"
+    if key in OWNER_ONLY:
+        return "owner"
+    if key in USER_ROUTES:
+        return "user"
+    return "user" if method in ("GET", "HEAD") else "owner"
+
+
+# Tamaño máximo del cuerpo: 20 MB solo para cargar un catálogo CSV (propietario con sesión); cuentas y
+# usuarios, 16 KB (rutas públicas incluidas); el resto, 1 MB.
+MAX_BODY_AUTH = 16 * 1024
+MAX_BODY_DEFAULT = 1024 * 1024
+
+
+def body_limit(method: str, path: str) -> int:
+    if path.startswith(("/api/auth/", "/api/users")):
+        return MAX_BODY_AUTH
+    if method == "POST" and path == "/api/catalog/csv":
+        return MAX_BODY
+    return MAX_BODY_DEFAULT
 
 # ---------------------------------------------------------------- seguridad HTTP
 
@@ -583,6 +665,8 @@ ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"} | {
 # IP del proxy HTTPS de confianza (Caddy/nginx). Solo de esa IP se aceptan X-Forwarded-Proto/For.
 TRUSTED_PROXY = os.environ.get("DROPFINDER_TRUSTED_PROXY", "").strip()
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+LOOPBACK_IPS = {"127.0.0.1", "::1"}
+_xff_warned = [False]
 # Modo desarrollo: las peticiones SIN sesión actúan como este usuario (id). Solo lo activa main() si
 # DROPFINDER_ENV=development, DROPFINDER_DEV_USER=<id> y el servidor escucha en loopback. Es el único
 # atajo de autenticación de la app (los módulos no deben tener el suyo). None = desactivado.
@@ -590,13 +674,22 @@ DEV_USER: int | None = None
 
 
 def dev_user_from_env(host: str) -> int | None:
+    """Usuario del modo desarrollo o None. Si se pide (DROPFINDER_ENV=development + DROPFINDER_DEV_USER) en
+    una configuración que puede estar expuesta (proxy de confianza, hosts permitidos o --host que no son
+    locales), el servidor NO arranca: es un error de configuración, no algo que se pueda dejar pasar."""
     raw = os.environ.get("DROPFINDER_DEV_USER", "").strip()
     if not raw:
         return None
-    if os.environ.get("DROPFINDER_ENV") != "development" or _hostname(host) not in LOOPBACK or not raw.isdigit():
-        print("AVISO: DROPFINDER_DEV_USER se ignora: requiere DROPFINDER_ENV=development, un id numérico "
-              "y escuchar solo en 127.0.0.1/localhost.", flush=True)
+    if os.environ.get("DROPFINDER_ENV") != "development" or not raw.isdigit():
+        print("AVISO: DROPFINDER_DEV_USER se ignora: requiere DROPFINDER_ENV=development y un id numérico.",
+              flush=True)
         return None
+    exposed = [x for x in ([f"--host {host}"] if _hostname(host) not in LOOPBACK else [])
+               + ([f"DROPFINDER_TRUSTED_PROXY={TRUSTED_PROXY}"] if TRUSTED_PROXY else [])
+               + [f"host permitido {h}" for h in sorted(ALLOWED_HOSTS - LOOPBACK)]]
+    if exposed:
+        raise SystemExit("ERROR: el modo desarrollo (DROPFINDER_DEV_USER) no se puede usar con "
+                         + ", ".join(exposed) + ". Quita DROPFINDER_DEV_USER o esa configuración.")
     print("\n" + "!" * 78 + f"\n!! MODO DESARROLLO: las peticiones sin sesión actúan como el usuario {raw} "
           "(sin contraseña ni CSRF).\n!! No lo uses con datos reales ni expongas este servidor.\n" + "!" * 78 + "\n",
           flush=True)
@@ -620,6 +713,13 @@ def _parse_cookies(header: str) -> dict:
     return out
 
 
+def _dev_session_allowed(handler) -> bool:
+    """El modo desarrollo solo vale para peticiones directas desde este equipo: IP loopback, Host
+    loopback y sin cabeceras de proxy (X-Forwarded-* / Forwarded)."""
+    return (handler.client_address[0] in LOOPBACK_IPS and _hostname(handler.headers.get("Host", "")) in LOOPBACK
+            and not handler._has_forwarded())
+
+
 def _dev_session() -> dict:
     """Sesión ficticia del modo desarrollo (ver DEV_USER): el rol sale de la cuenta si existe."""
     with db.connect() as conn:
@@ -630,8 +730,15 @@ def _dev_session() -> dict:
 
 
 class Handler(SimpleHTTPRequestHandler):
+    server_version = "DropFinder"       # sin versión de Python en la cabecera Server
+    sys_version = ""
+    timeout = 30                        # segundos por conexión: una conexión a medias no retiene un hilo
+
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=FRONTEND, **kw)
+
+    def version_string(self):
+        return self.server_version
 
     def log_message(self, fmt, *args):
         pass
@@ -639,6 +746,8 @@ class Handler(SimpleHTTPRequestHandler):
     def end_headers(self):
         for k, v in SECURITY_HEADERS.items():
             self.send_header(k, v)
+        if getattr(self, "headers", None) is not None and self._secure():
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
         if self.path.startswith("/api/"):
             self.send_header("Cache-Control", "no-store")
         super().end_headers()
@@ -651,7 +760,20 @@ class Handler(SimpleHTTPRequestHandler):
         """HTTPS solo si lo dice el proxy de confianza (la app no habla HTTPS por sí misma)."""
         return self._from_proxy() and (self.headers.get("X-Forwarded-Proto") or "").strip().lower() == "https"
 
+    def _has_forwarded(self) -> bool:
+        return any(k.lower().startswith("x-forwarded-") or k.lower() == "forwarded" for k in self.headers.keys())
+
+    def _local_direct(self) -> bool:
+        """Conexión directa desde este equipo: IP y Host loopback, sin proxy de por medio."""
+        return (self.client_address[0] in LOOPBACK_IPS and _hostname(self.headers.get("Host", "")) in LOOPBACK
+                and not self._has_forwarded())
+
     def _client_ip(self) -> str:
+        if not self._from_proxy() and self.headers.get("X-Forwarded-For") and not _xff_warned[0]:
+            _xff_warned[0] = True
+            print(f"AVISO: llegó X-Forwarded-For desde {self.client_address[0]}, que no es el proxy de confianza: "
+                  "se ignora. Si la app está detrás de un proxy, configura DROPFINDER_TRUSTED_PROXY (si no, todos "
+                  "los clientes comparten una IP para el límite de intentos).", flush=True)
         if self._from_proxy():
             fwd = [x.strip() for x in (self.headers.get("X-Forwarded-For") or "").split(",") if x.strip()]
             if fwd:
@@ -702,6 +824,7 @@ class Handler(SimpleHTTPRequestHandler):
         url = urlparse(self.path)
         info = auth.RequestInfo(ip=self._client_ip(), user_agent=self.headers.get("User-Agent") or "",
                                 secure=self._secure())
+        info.local_direct = self._local_direct()
         info.token = _parse_cookies(self.headers.get("Cookie", "")).get(auth.cookie_name(info.secure))
         auth.set_request(info)
         auth_context.clear()
@@ -727,7 +850,7 @@ class Handler(SimpleHTTPRequestHandler):
         auth.maybe_purge()
         if not public:
             info.session = auth.load_session(info.token)
-            if not info.session and DEV_USER is not None:
+            if not info.session and DEV_USER is not None and _dev_session_allowed(self):
                 info.session = _dev_session()
             if not info.session:
                 return 401, {"error": "Inicia sesión para continuar"}, {}
@@ -743,14 +866,21 @@ class Handler(SimpleHTTPRequestHandler):
             match = re.fullmatch(pattern, url.path)
             if m != method or not match:
                 continue
-            action = OWNER_ONLY.get((m, pattern))
-            if action and not auth_context.is_owner():
+            if route_access(m, pattern) == "owner" and not auth_context.is_owner():
+                action = OWNER_ONLY.get((m, pattern), "usar esta función")
                 return 403, {"error": f"Solo el propietario puede {action}."}, {}
             try:
                 body = {}
-                length = int(self.headers.get("Content-Length") or 0)
-                if length > MAX_BODY:
-                    raise ApiError(413, "Archivo demasiado grande (máx. 20 MB)")
+                raw_len = (self.headers.get("Content-Length") or "0").strip()
+                if not raw_len.isdigit():
+                    self.close_connection = True
+                    return 400, {"error": "Content-Length inválido"}, {}
+                length = int(raw_len)
+                limit = body_limit(method, url.path)
+                if length > limit:
+                    self.close_connection = True       # no se lee el cuerpo: se cierra la conexión
+                    size = f"{limit // 1048576} MB" if limit >= 1048576 else f"{limit // 1024} KB"
+                    raise ApiError(413, f"Petición demasiado grande (máx. {size})")
                 if length:
                     body = json.loads(self.rfile.read(length) or b"{}")
                 result = fn(match, parse_qs(url.query), body)
@@ -761,6 +891,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return e.status, {"error": str(e)}, getattr(e, "headers", None) or {}
             except (json.JSONDecodeError, UnicodeDecodeError):
                 return 400, {"error": "JSON inválido"}, {}
+            except OverflowError:              # ids enormes (/api/users/99999999999999999999…)
+                return 400, {"error": "Identificador inválido"}, {}
             except Exception as e:  # noqa: BLE001
                 self.log_error("Error interno: %r", e)
                 return 500, {"error": "Error interno del servidor"}, {}
@@ -813,10 +945,14 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     args = ap.parse_args()
     global DEV_USER
-    if args.host not in ("0.0.0.0", "::", ""):
+    if ":" in args.host:
+        raise SystemExit("ERROR: DropFinder solo escucha en IPv4 (p. ej. --host 127.0.0.1). "
+                         "Para IPv6 usa un proxy (Caddy/nginx) delante.")
+    if args.host not in ("0.0.0.0", ""):
         ALLOWED_HOSTS.add(_hostname(args.host))
     DEV_USER = dev_user_from_env(args.host)
     db.init_db()
+    auth.init_setup_token()
     threading.Thread(target=_auto_refresh_trm, daemon=True).start()
     print(f"DropFinder en http://{args.host}:{args.port}")
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()

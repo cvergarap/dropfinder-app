@@ -1,11 +1,15 @@
 """Cuentas de usuario (Sprint 3): contraseñas, sesiones, CSRF, Origin/Host, límite de intentos, roles,
 protección del último propietario, aislamiento de datos entre usuarios (IDOR) y cabeceras de seguridad."""
+import contextlib
+import io
 import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -142,7 +146,8 @@ class AuthHttpTest(unittest.TestCase):
     # ------------------------------------------------------------ registro, login, sesión
     def test_register_only_first_time(self):
         c = self.client()
-        self.assertEqual(c.call("GET", "/api/auth/status"), (200, {"has_users": False, "authenticated": False}))
+        self.assertEqual(c.call("GET", "/api/auth/status"),
+                         (200, {"has_users": False, "authenticated": False, "setup_token_required": False}))
         st, d = c.call("POST", "/api/auth/register", {"email": "a@b.co", "name": "A", "password": "corta"})
         self.assertEqual(st, 400)
         st, d = c.call("POST", "/api/auth/register", {"email": "Dueña@Ejemplo.com", "name": "Dueña", "password": PW})
@@ -153,7 +158,8 @@ class AuthHttpTest(unittest.TestCase):
         for attr in ("HttpOnly", "SameSite=Lax", "Path=/", "Max-Age=1209600"):
             self.assertIn(attr, cookie)
         self.assertNotIn("Secure", cookie)                   # sin proxy HTTPS de confianza
-        self.assertEqual(c.call("GET", "/api/auth/status")[1], {"has_users": True, "authenticated": True})
+        self.assertEqual(c.call("GET", "/api/auth/status")[1],
+                         {"has_users": True, "authenticated": True, "setup_token_required": False})
         st, me = c.call("GET", "/api/auth/me")
         self.assertEqual((st, me["user"]["name"], me["csrf_token"]), (200, "Dueña", c.csrf))
         st, d = self.client().call("POST", "/api/auth/register", {"email": "otro@b.co", "name": "O", "password": PW})
@@ -310,17 +316,23 @@ class AuthHttpTest(unittest.TestCase):
 
     def test_trusted_proxy(self):
         https = {"X-Forwarded-Proto": "https", "X-Forwarded-For": "1.1.1.1, 203.0.113.9"}
-        c = self.client()      # sin proxy de confianza configurado, X-Forwarded-* se ignoran
-        st, _ = c.call("POST", "/api/auth/register", {"email": "duena@ejemplo.com", "name": "D", "password": PW},
-                       headers=https)
+        c = self.client()      # sin proxy de confianza configurado, X-Forwarded-* se ignoran (salvo para el registro)
+        token = auth.init_setup_token(out=lambda *_: None)
+        try:
+            st, _ = c.call("POST", "/api/auth/register", {"email": "duena@ejemplo.com", "name": "D", "password": PW,
+                                                          "setup_token": token}, headers=https)
+        finally:
+            auth._setup_hash = None
         self.assertEqual(st, 201)
         self.assertNotIn("Secure", c.cookies[0])
+        self.assertNotIn("Strict-Transport-Security", c.headers)
         old, server.TRUSTED_PROXY = server.TRUSTED_PROXY, "127.0.0.1"
         try:
             p = self.client()
             self.assertEqual(p.call("POST", "/api/auth/login", {"email": "duena@ejemplo.com", "password": PW},
                                     headers=https)[0], 200)
             cookie = p.cookies[0]
+            self.assertEqual(p.headers["Strict-Transport-Security"], "max-age=31536000")   # HSTS solo por HTTPS
             self.assertTrue(cookie.startswith(auth.SECURE_COOKIE_NAME + "="), cookie)
             self.assertIn("Secure", cookie)
             token = cookie.split(";", 1)[0].split("=", 1)[1]
@@ -336,10 +348,10 @@ class AuthHttpTest(unittest.TestCase):
             server.TRUSTED_PROXY = old
 
     # ------------------------------------------------------------ límite de intentos
-    def test_throttle_by_email(self):
+    def test_throttle_by_email_and_ip(self):
         self.owner()
         c = self.client()
-        for _ in range(auth.MAX_FAILS_EMAIL):
+        for _ in range(auth.MAX_FAILS_PAIR):
             self.assertEqual(c.login("duena@ejemplo.com", "mala-clave-123")[0], 401)
         st, d = c.login("duena@ejemplo.com")                 # bloqueado aunque la clave sea correcta
         self.assertEqual(st, 429, d)
@@ -359,6 +371,118 @@ class AuthHttpTest(unittest.TestCase):
         self.assertEqual(st, 429)
         self.assertIn("Retry-After", c.headers)
 
+    def via(self, ip):
+        return {"X-Forwarded-For": ip}
+
+    def test_throttle_does_not_lock_out_owner_from_other_ip(self):
+        """Hallazgo 2: 5 fallos de un atacante ya no bloquean al propietario en otra IP; el tope agregado por
+        correo (50) no aplica a una IP desde la que el propietario ya entró."""
+        self.owner()
+        old, server.TRUSTED_PROXY = server.TRUSTED_PROXY, "127.0.0.1"
+        try:
+            c = self.client()
+            self.assertEqual(c.call("POST", "/api/auth/login", {"email": "duena@ejemplo.com", "password": PW},
+                                    headers=self.via("198.51.100.7"))[0], 200)       # IP habitual (conocida)
+            for i in range(auth.MAX_FAILS_PAIR):
+                c.call("POST", "/api/auth/login", {"email": "duena@ejemplo.com", "password": "mala-clave-123"},
+                       headers=self.via("203.0.113.1"))
+            st, _ = c.call("POST", "/api/auth/login", {"email": "duena@ejemplo.com", "password": PW},
+                           headers=self.via("203.0.113.1"))
+            self.assertEqual(st, 429)                                                  # el atacante sí espera
+            self.assertEqual(c.call("POST", "/api/auth/login", {"email": "duena@ejemplo.com", "password": PW},
+                                    headers=self.via("198.51.100.20"))[0], 200)      # otra IP nueva: entra
+            # Ataque distribuido: 50 fallos desde 10 IP → una IP nueva espera; la IP conocida no
+            for n in range(auth.MAX_FAILS_EMAIL // auth.MAX_FAILS_PAIR):
+                for _ in range(auth.MAX_FAILS_PAIR):
+                    c.call("POST", "/api/auth/login", {"email": "duena@ejemplo.com", "password": "mala-clave-123"},
+                           headers=self.via(f"192.0.2.{n + 1}"))
+            st, _ = c.call("POST", "/api/auth/login", {"email": "duena@ejemplo.com", "password": PW},
+                           headers=self.via("198.51.100.99"))
+            self.assertEqual(st, 429)
+            self.assertIn("Retry-After", c.headers)
+            self.assertEqual(c.call("POST", "/api/auth/login", {"email": "duena@ejemplo.com", "password": PW},
+                                    headers=self.via("198.51.100.7"))[0], 200)
+        finally:
+            server.TRUSTED_PROXY = old
+
+    def test_throttle_is_atomic_under_concurrency(self):
+        """Hallazgo 1: 60 intentos simultáneos con clave errónea para un correo → como mucho 5 verificaciones."""
+        self.owner()
+        calls, lock = [], threading.Lock()
+        orig = auth.verify_password
+
+        def counting(pw, h):
+            with lock:
+                calls.append(1)
+            return orig(pw, h)
+        auth.verify_password = counting
+        statuses = []
+        try:
+            def one():
+                for _ in range(20):          # la cola de conexiones del servidor de prueba es corta: reintentar
+                    try:
+                        st, _ = self.client().login("duena@ejemplo.com", "mala-clave-123")
+                        break
+                    except OSError:
+                        time.sleep(0.05)
+                with lock:
+                    statuses.append(st)
+            ts = [threading.Thread(target=one) for _ in range(60)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+        finally:
+            auth.verify_password = orig
+        self.assertLessEqual(len(calls), auth.MAX_FAILS_PAIR, statuses)
+        self.assertEqual(statuses.count(401), len(calls))
+        self.assertEqual(statuses.count(429), 60 - len(calls))
+
+    # ------------------------------------------------------------ registro del primer propietario
+    def test_register_requires_setup_token_unless_local(self):
+        """Hallazgo 4: vía proxy u otro equipo, registrar exige el código de instalación."""
+        c = self.client()
+        body = {"email": "duena@ejemplo.com", "name": "D", "password": PW}
+        old_allowed = set(server.ALLOWED_HOSTS)
+        server.ALLOWED_HOSTS.add("app.example.com")
+        env = os.environ.get("DROPFINDER_SETUP_TOKEN")
+        try:
+            for headers in ({"X-Forwarded-For": "203.0.113.5"}, {"X-Forwarded-Proto": "https"},
+                            {"Host": "app.example.com"}, {"Forwarded": "for=203.0.113.5"}):
+                st, d = c.call("GET", "/api/auth/status", headers=headers)
+                self.assertTrue(d["setup_token_required"], headers)
+                self.assertEqual(c.call("POST", "/api/auth/register", body, headers=headers)[0], 403, headers)
+            auth._setup_hash = None
+            self.assertEqual(c.call("POST", "/api/auth/register", {**body, "setup_token": "x"},
+                                    headers={"Host": "app.example.com"})[0], 403)   # sin código configurado
+            os.environ["DROPFINDER_SETUP_TOKEN"] = "codigo-de-instalacion-123"
+            self.assertIsNone(auth.init_setup_token(out=lambda *_: None))
+            self.assertEqual(c.call("POST", "/api/auth/register", {**body, "setup_token": "otro"},
+                                    headers={"Host": "app.example.com"})[0], 403)
+            st, d = c.call("POST", "/api/auth/register", {**body, "setup_token": "codigo-de-instalacion-123"},
+                           headers={"Host": "app.example.com"})
+            self.assertEqual(st, 201, d)
+        finally:
+            auth._setup_hash = None
+            server.ALLOWED_HOSTS.clear()
+            server.ALLOWED_HOSTS.update(old_allowed)
+            if env is None:
+                os.environ.pop("DROPFINDER_SETUP_TOKEN", None)
+            else:
+                os.environ["DROPFINDER_SETUP_TOKEN"] = env
+
+    def test_setup_token_printed_only_without_users(self):
+        out = []
+        token = auth.init_setup_token(out=out.append)
+        try:
+            self.assertTrue(token and token in out[0])
+            self.assertNotIn(token.encode(), repr(auth._setup_hash).encode())          # solo el hash en memoria
+            self.owner()
+            self.assertIsNone(auth.init_setup_token(out=out.append))
+            self.assertEqual(len(out), 1)
+        finally:
+            auth._setup_hash = None
+
     # ------------------------------------------------------------ roles y administración
     def test_owner_only_routes(self):
         owner = self.owner()
@@ -374,6 +498,9 @@ class AuthHttpTest(unittest.TestCase):
             self.assertEqual(st, 403, path)
             self.assertTrue(d["error"].startswith("Solo el propietario puede"), d)
         self.assertEqual(m.call("POST", "/api/monitor/run")[0], 200)     # el monitor revisa sus importados
+        st, d = m.call("POST", "/api/currency/refresh")                  # hallazgo 5: TRM de la instalación
+        self.assertEqual(st, 403)
+        self.assertIn("TRM", d["error"])
         self.assertEqual(m.call("GET", "/api/settings")[0], 200)
         # Moneda: preferencias sí; la tasa (instalación) no, salvo reenviar el mismo valor
         _, cur = m.call("GET", "/api/currency")
@@ -565,17 +692,30 @@ class AuthHttpTest(unittest.TestCase):
         import contextlib
         import io
         env = {k: os.environ.get(k) for k in ("DROPFINDER_DEV_USER", "DROPFINDER_ENV")}
+        old_proxy, old_allowed = server.TRUSTED_PROXY, set(server.ALLOWED_HOSTS)
         try:
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 os.environ["DROPFINDER_DEV_USER"] = "1"
                 os.environ.pop("DROPFINDER_ENV", None)
                 self.assertIsNone(server.dev_user_from_env("127.0.0.1"))       # falta DROPFINDER_ENV
                 os.environ["DROPFINDER_ENV"] = "development"
-                self.assertIsNone(server.dev_user_from_env("0.0.0.0"))         # no loopback
-                self.assertIsNone(server.dev_user_from_env("192.168.1.5"))
+                for host in ("0.0.0.0", "192.168.1.5"):                        # hallazgo 3: error al arrancar
+                    with self.assertRaises(SystemExit):
+                        server.dev_user_from_env(host)
+                server.TRUSTED_PROXY = "127.0.0.1"
+                with self.assertRaises(SystemExit):
+                    server.dev_user_from_env("127.0.0.1")
+                server.TRUSTED_PROXY = ""
+                server.ALLOWED_HOSTS.add("app.example.com")
+                with self.assertRaises(SystemExit):
+                    server.dev_user_from_env("127.0.0.1")
+                server.ALLOWED_HOSTS.discard("app.example.com")
                 self.assertEqual(server.dev_user_from_env("127.0.0.1"), 1)
             self.assertIn("MODO DESARROLLO", out.getvalue())
         finally:
+            server.TRUSTED_PROXY = old_proxy
+            server.ALLOWED_HOSTS.clear()
+            server.ALLOWED_HOSTS.update(old_allowed)
             for k, v in env.items():
                 if v is None:
                     os.environ.pop(k, None)
@@ -594,9 +734,136 @@ class AuthHttpTest(unittest.TestCase):
             self.assertEqual(anon.call("POST", "/api/imports", {"product_id": self.pids[1]},
                                        headers={"Origin": "http://malo.example"})[0], 403)
             self.assertEqual(len(m.call("GET", "/api/imports")[1]), 1)
+            # Escenario del revisor: modo activo y petición que llega por el proxy → no aplica
+            server.TRUSTED_PROXY = "127.0.0.1"
+            server.ALLOWED_HOSTS.add("app.example.com")
+            for h in ({"Host": "app.example.com", "X-Forwarded-Proto": "https"}, {"X-Forwarded-For": "203.0.113.9"},
+                      {"Host": "app.example.com"}):
+                self.assertEqual(anon.call("GET", "/api/users", headers=h)[0], 401, h)
+                self.assertEqual(anon.call("POST", "/api/users", {"email": "x@x.co", "name": "X", "password": PW,
+                                                                  "role": "owner"}, headers=h)[0], 401, h)
         finally:
             server.DEV_USER = old
+            server.TRUSTED_PROXY = old_proxy
+            server.ALLOWED_HOSTS.clear()
+            server.ALLOWED_HOSTS.update(old_allowed)
         self.assertEqual(anon.call("GET", "/api/imports")[0], 401)
+
+    def test_every_route_is_classified(self):
+        """Hallazgo 5: cada ruta (también las de los módulos) está clasificada como pública, de cualquier
+        usuario o solo del propietario; una ruta nueva sin clasificar hace fallar esta prueba."""
+        tables = (server.PUBLIC_ROUTES, set(server.OWNER_ONLY), server.USER_ROUTES)
+        for m, pattern, _ in server.ROUTES:
+            n = sum((m, pattern) in t for t in tables)
+            self.assertEqual(n, 1, f"{m} {pattern}: clasifícala en PUBLIC_ROUTES, OWNER_ONLY o USER_ROUTES")
+        self.assertEqual({p for _, p in server.PUBLIC_ROUTES}, auth.PUBLIC_PATHS)
+        routes = {(m, p) for m, p, _ in server.ROUTES}
+        for t in tables:
+            self.assertLessEqual(set(t), routes, "entrada para una ruta que no existe")
+        # Sin clasificar: mutadora → solo propietario; lectura → usuario
+        self.assertEqual(server.route_access("POST", r"/api/nueva"), "owner")
+        self.assertEqual(server.route_access("GET", r"/api/nueva"), "user")
+        owner = self.owner()
+        m, _ = self.member(owner)
+        server.ROUTES.append(("POST", r"/api/prueba-sin-clasificar", lambda *a: {"ok": True}))
+        try:
+            st, d = m.call("POST", "/api/prueba-sin-clasificar")
+            self.assertEqual(st, 403, d)
+            self.assertEqual(owner.call("POST", "/api/prueba-sin-clasificar")[0], 200)
+        finally:
+            server.ROUTES.pop()
+
+    def test_monitor_cooldown(self):
+        """Hallazgo 6: un miembro no puede mover el catálogo compartido ejecutando el monitor una y otra vez."""
+        owner = self.owner()
+        m, mid = self.member(owner)
+        pid = self.pids[3]
+        m.call("POST", "/api/imports", {"product_id": pid, "sell_price": 0.5})
+
+        def product():
+            with db.connect() as conn:
+                return tuple(conn.execute("SELECT cost, stock, updated_at FROM products WHERE id = ?", (pid,)).fetchone())
+        st, r1 = m.call("POST", "/api/monitor/run")
+        self.assertEqual((st, r1["checked"], r1["cooldown"]), (200, 1, 0))
+        after_first = product()
+        for _ in range(3):
+            st, r = m.call("POST", "/api/monitor/run", {"force": True})      # force no vale para miembros
+            self.assertEqual((r["checked"], r["cooldown"]), (0, 1))
+            self.assertIn("negative_margin", [a["type"] for a in r["alerts"]])  # alertas con el último estado
+        self.assertEqual(product(), after_first)                               # catálogo sin tocar
+        owner.call("POST", "/api/imports", {"product_id": pid})
+        self.assertEqual(owner.call("POST", "/api/monitor/run")[1]["cooldown"], 1)   # también para el propietario
+        st, r = owner.call("POST", "/api/monitor/run", {"force": True})
+        self.assertEqual((r["checked"], r["cooldown"]), (1, 0))
+        with db.connect() as conn:                                              # pasado el enfriamiento, vuelve
+            conn.execute("UPDATE monitor_checks SET checked_at = ?",
+                         ((datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat(timespec="seconds"),))
+        self.assertEqual(m.call("POST", "/api/monitor/run")[1]["checked"], 1)
+
+    def raw(self, request: bytes) -> str:
+        """Petición HTTP cruda (para cabeceras que urllib no deja enviar). Devuelve la primera línea."""
+        with socket.create_connection(self.srv.server_address, timeout=5) as sk:
+            sk.sendall(request)
+            data = b""
+            while b"\r\n" not in data:
+                chunk = sk.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        return data.split(b"\r\n", 1)[0].decode()
+
+    def test_body_limits_and_invalid_input(self):
+        owner = self.owner()
+        host = f"127.0.0.1:{self.srv.server_address[1]}"
+        big = json.dumps({"email": "a@b.co", "password": "x" * (auth.MAX_PASSWORD * 20)})
+        self.assertEqual(self.client().call("POST", "/api/auth/login", json.loads(big))[0], 413)   # > 16 KB
+        for path, length in (("/api/auth/login", "2000000"), ("/api/users", "20000"), ("/api/imports", "2000000")):
+            line = self.raw(f"POST {path} HTTP/1.1\r\nHost: {host}\r\nCookie: {auth.COOKIE_NAME}={owner.token}\r\n"
+                            f"X-CSRF-Token: {owner.csrf}\r\nContent-Length: {length}\r\n\r\n{{}}".encode())
+            self.assertIn(" 413 ", line, path)
+        for length in ("-5", "abc", "1e3"):
+            line = self.raw(f"POST /api/auth/login HTTP/1.1\r\nHost: {host}\r\nContent-Length: {length}\r\n\r\n".encode())
+            self.assertIn(" 400 ", line, length)
+        for method, path in (("PATCH", "/api/users/99999999999999999999999"), ("DELETE", "/api/users/99999999999999999999999"),
+                             ("PATCH", "/api/imports/99999999999999999999999"), ("GET", "/api/products/99999999999999999999999")):
+            st, d = owner.call(method, path, {"role": "member"} if method == "PATCH" else None)
+            self.assertIn(st, (400, 404), (path, d))
+        self.assertEqual(server.Handler.timeout, 30)
+
+    def test_server_header_and_ipv6_host(self):
+        c = self.client()
+        c.call("GET", "/api/auth/status")
+        self.assertEqual(c.headers["Server"], "DropFinder")
+        import sys as _sys
+        old = _sys.argv
+        for host in ("::", "::1"):
+            _sys.argv = ["server.py", "--host", host]
+            try:
+                with self.assertRaises(SystemExit) as cm:
+                    server.main()
+                self.assertIn("IPv4", str(cm.exception.code))
+            finally:
+                _sys.argv = old
+
+    def test_xff_from_untrusted_peer_warns_once(self):
+        server._xff_warned[0] = False
+        c = self.client()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            c.call("GET", "/api/auth/status", headers={"X-Forwarded-For": "203.0.113.1"})
+            c.call("GET", "/api/auth/status", headers={"X-Forwarded-For": "203.0.113.2"})
+        self.assertEqual(out.getvalue().count("X-Forwarded-For"), 1)
+
+    def test_search_log_per_user(self):
+        a = self.owner()
+        b, _ = self.member(a)
+        st, d = a.call("GET", "/api/products?q=lampara")
+        self.assertEqual(st, 200)
+        _, sa = a.call("GET", "/api/suggest?q=lam")
+        _, sb = b.call("GET", "/api/suggest?q=lam")
+        self.assertIn("busqueda", [x["type"] for x in sa["items"]])
+        self.assertNotIn("busqueda", [x["type"] for x in sb["items"]])      # no ve las búsquedas de A
+        with db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM search_log WHERE user_id IS NULL").fetchone()[0], 0)
 
     def test_background_without_context_fails_visibly(self):
         auth_context.clear()

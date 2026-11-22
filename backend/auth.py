@@ -13,9 +13,14 @@ Decisiones de seguridad (ver docs/adr/0001-stack.md y README):
   todas las sesiones del usuario.
 - CSRF: cada sesión tiene su csrf_token; toda petición que modifica datos debe enviarlo en la cabecera
   X-CSRF-Token (lo comprueba server.py). Además se rechazan peticiones con Origin/Referer de otro sitio.
-- Límite de intentos: 5 fallos por correo o 20 por IP en 15 minutos → 429 con Retry-After. El mensaje
-  de error es siempre el mismo y un correo desconocido también calcula un scrypt (no se puede saber
-  qué correos tienen cuenta midiendo el tiempo de respuesta).
+- Límite de intentos (ventana de 15 minutos, 429 con Retry-After): 5 fallos por (correo, IP); 20 por IP
+  (cualquier correo); 50 por correo desde todas las IP, salvo para una IP desde la que ese correo ya
+  entró bien (así un atacante no deja fuera al propietario en su equipo de siempre). El intento se
+  registra ANTES de verificar la contraseña y en la misma transacción que cuenta (BEGIN IMMEDIATE): una
+  ráfaga concurrente no consigue más verificaciones que el límite. El mensaje de error es siempre el
+  mismo y un correo desconocido también calcula un scrypt (sin enumeración por tiempo).
+- Registro del primer propietario: solo desde este mismo equipo (IP y Host loopback, sin proxy) o con
+  el código de instalación (DROPFINDER_SETUP_TOKEN o el que se imprime en la consola al arrancar).
 
 Uso desde otros módulos: auth_context.current_user_id() / current_role() (los fija server.py en cada
 petición). Para borrar datos propios al eliminar un usuario: auth.on_user_delete(fn(conn, user_id)).
@@ -25,6 +30,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import os
 import re
 import secrets
 import sqlite3
@@ -53,8 +59,10 @@ TOUCH_INTERVAL_S = 300       # last_seen_at/expires_at se actualizan como mucho 
 PURGE_INTERVAL_S = 3600      # limpieza periódica de sesiones vencidas e intentos viejos
 
 LOGIN_WINDOW = timedelta(minutes=15)
-MAX_FAILS_EMAIL = 5
-MAX_FAILS_IP = 20
+MAX_FAILS_PAIR = 5           # por (correo, IP)
+MAX_FAILS_IP = 20            # por IP, cualquier correo
+MAX_FAILS_EMAIL = 50         # por correo desde todas las IP (no aplica a una IP conocida de ese correo)
+KNOWN_IP_TTL = timedelta(days=30)   # cuánto se recuerda que un correo entró bien desde una IP
 
 ROLES = ("owner", "member")
 BAD_LOGIN = "Correo o contraseña incorrectos"
@@ -153,6 +161,7 @@ class RequestInfo:
     def __init__(self, ip: str = "", user_agent: str = "", token: str | None = None, secure: bool = False):
         self.ip, self.user_agent, self.token, self.secure = ip, user_agent[:300], token, secure
         self.session: dict | None = None      # sesión válida (si hay)
+        self.local_direct = False             # conexión directa desde este equipo (sin proxy): la fija server.py
         self.set_cookies: list[str] = []      # cabeceras Set-Cookie a enviar en la respuesta
 
 
@@ -234,7 +243,13 @@ def maybe_purge() -> None:
 def purge(conn) -> None:
     now = _now()
     conn.execute("DELETE FROM sessions WHERE expires_at < ?", (_iso(now),))
-    conn.execute("DELETE FROM login_attempts WHERE created_at < ?", (_iso(now - LOGIN_WINDOW),))
+    _prune_attempts(conn, now)
+
+
+def _prune_attempts(conn, now) -> None:
+    """Fallos: solo cuentan dentro de la ventana. Aciertos: se recuerdan KNOWN_IP_TTL (IP conocida)."""
+    conn.execute("DELETE FROM login_attempts WHERE ok = 0 AND created_at < ?", (_iso(now - LOGIN_WINDOW),))
+    conn.execute("DELETE FROM login_attempts WHERE ok = 1 AND created_at < ?", (_iso(now - KNOWN_IP_TTL),))
 
 
 def load_session(token: str | None, touch: bool = True) -> dict | None:
@@ -285,26 +300,43 @@ def _user_json(r) -> dict:
 # ---------------------------------------------------------------- límite de intentos
 
 def _retry_after(conn, email: str, ip: str) -> int:
-    """Segundos de espera si el correo o la IP superaron el límite de fallos (0 si no)."""
+    """Segundos de espera si se superó algún límite de fallos (0 si no). Los intentos en curso cuentan
+    como fallos (se registran antes de verificar)."""
     now = _now()
     since = _iso(now - LOGIN_WINDOW)
+    rules = [("email = ? AND ip = ?", (email, ip), MAX_FAILS_PAIR), ("ip = ?", (ip,), MAX_FAILS_IP)]
+    known = conn.execute("SELECT 1 FROM login_attempts WHERE email = ? AND ip = ? AND ok = 1 AND created_at > ? "
+                         "LIMIT 1", (email, ip, _iso(now - KNOWN_IP_TTL))).fetchone()
+    if not known:
+        rules.append(("email = ?", (email,), MAX_FAILS_EMAIL))
     waits = []
-    for col, val, limit in (("email", email, MAX_FAILS_EMAIL), ("ip", ip, MAX_FAILS_IP)):
-        rows = conn.execute(f"SELECT created_at FROM login_attempts WHERE {col} = ? AND ok = 0 AND created_at > ? "
-                            "ORDER BY created_at DESC LIMIT ?", (val, since, limit)).fetchall()
+    for cond, args, limit in rules:
+        rows = conn.execute(f"SELECT created_at FROM login_attempts WHERE {cond} AND ok = 0 AND created_at > ? "
+                            "ORDER BY created_at DESC LIMIT ?", (*args, since, limit)).fetchall()
         if len(rows) >= limit:
             oldest = _parse(rows[-1][0])           # cuando este fallo salga de la ventana, se libera un intento
             waits.append(max(1, int((oldest + LOGIN_WINDOW - now).total_seconds()) + 1))
     return max(waits, default=0)
 
 
-def _record_attempt(conn, email: str, ip: str, ok: bool) -> None:
-    now = _now()
-    conn.execute("INSERT INTO login_attempts(email, ip, ok, created_at) VALUES (?, ?, ?, ?)",
-                 (email, ip, int(ok), _iso(now)))
-    if ok:     # un acceso correcto libera al correo (los fallos por IP siguen contando)
-        conn.execute("DELETE FROM login_attempts WHERE email = ? AND ok = 0", (email,))
-    conn.execute("DELETE FROM login_attempts WHERE created_at < ?", (_iso(now - LOGIN_WINDOW),))
+def _begin_attempt(email: str, ip: str) -> int:
+    """Comprueba los límites y registra el intento como fallo, todo con el bloqueo de escritura tomado
+    (atómico frente a peticiones simultáneas). Lanza 429 si hay que esperar. Devuelve el id del intento."""
+    with db.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        wait = _retry_after(conn, email, ip)
+        if wait:
+            raise _too_many(wait)
+        return conn.execute("INSERT INTO login_attempts(email, ip, ok, created_at) VALUES (?, ?, 0, ?)",
+                            (email, ip, _iso(_now()))).lastrowid
+
+
+def _attempt_ok(conn, attempt_id: int, email: str, ip: str) -> None:
+    """Contraseña correcta: el intento pasa a acierto (la IP queda como conocida para ese correo) y se
+    borran los fallos de ese mismo (correo, IP). Los de otras IP siguen contando."""
+    conn.execute("UPDATE login_attempts SET ok = 1 WHERE id = ?", (attempt_id,))
+    conn.execute("DELETE FROM login_attempts WHERE email = ? AND ip = ? AND ok = 0", (email, ip))
+    _prune_attempts(conn, _now())
 
 
 def _too_many(seconds: int) -> ApiError:
@@ -385,12 +417,48 @@ def has_users(conn) -> bool:
     return conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
 
 
+# ---------------------------------------------------------------- código de instalación (primer registro)
+
+_setup_hash: bytes | None = None     # SHA-256 del código vigente (el código en claro no se guarda)
+
+
+def _sha(token: str) -> bytes:
+    return hashlib.sha256(token.encode("utf-8")).digest()
+
+
+def init_setup_token(out=print) -> str | None:
+    """Al arrancar el servidor: código para crear el primer propietario desde otro equipo o a través del
+    proxy. DROPFINDER_SETUP_TOKEN si está definido (no se imprime); si no, y aún no hay usuarios, se genera
+    uno y se imprime en la consola. Devuelve el código generado (o None)."""
+    global _setup_hash
+    env = os.environ.get("DROPFINDER_SETUP_TOKEN", "").strip()
+    if env:
+        _setup_hash = _sha(env)
+        return None
+    with db.connect() as conn:
+        if has_users(conn):
+            _setup_hash = None
+            return None
+    token = secrets.token_urlsafe(18)
+    _setup_hash = _sha(token)
+    out("\n" + "=" * 78 + "\nDropFinder aún no tiene cuentas. Abre la app en este equipo (http://127.0.0.1) para crear\n"
+        f"la cuenta del propietario, o usa este código de instalación desde otro equipo:  {token}\n"
+        + "=" * 78 + "\n")
+    return token
+
+
+def _setup_token_ok(token) -> bool:
+    return (_setup_hash is not None and isinstance(token, str) and 0 < len(token) <= 200
+            and hmac.compare_digest(_sha(token.strip()), _setup_hash))
+
+
 def status() -> dict:
     with db.connect() as conn:
         users = has_users(conn)
     info = request()
     sess = info.session or load_session(info.token, touch=False)
-    return {"has_users": users, "authenticated": bool(sess)}
+    return {"has_users": users, "authenticated": bool(sess),
+            "setup_token_required": (not users) and not info.local_direct}
 
 
 def create_first_owner(conn, email: str, name: str, pw_hash: str) -> int:
@@ -409,9 +477,14 @@ def create_first_owner(conn, email: str, name: str, pw_hash: str) -> int:
 
 
 def register(body: dict) -> Reply:
-    """Primer arranque: crea la cuenta del propietario (id 1, dueño de los datos existentes)."""
+    """Primer arranque: crea la cuenta del propietario (recibe los datos existentes). Si se borraran todas
+    las cuentas, el registro volvería a abrirse con las mismas condiciones."""
     if not isinstance(body, dict):
         raise ApiError(400, "JSON inválido")
+    # Desde otro equipo o a través del proxy, el primero en llegar no puede quedarse con la instalación
+    if not request().local_direct and not _setup_token_ok(body.get("setup_token")):
+        raise ApiError(403, "Para crear la cuenta del propietario desde otro equipo necesitas el código de "
+                            "instalación que se muestra en la consola del servidor al arrancar.")
     email = clean_email(body.get("email"))
     name = clean_name(body.get("name"))
     password = check_password_policy(body.get("password"), email)
@@ -433,17 +506,14 @@ def login(body: dict) -> dict:
         raise ApiError(400, "Escribe tu correo y tu contraseña")
     email, password = email[:MAX_EMAIL], password[:MAX_PASSWORD + 1]
     info = request()
+    attempt = _begin_attempt(email, info.ip)          # registrado como fallo antes de verificar
     with db.connect() as conn:
-        wait = _retry_after(conn, email, info.ip)
-        if wait:
-            raise _too_many(wait)
         u = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
-        ok = verify_password(password, u["password_hash"] if u else _dummy())
-        if not (u and ok):
-            _record_attempt(conn, email, info.ip, False)
-            conn.commit()
-            raise ApiError(401, BAD_LOGIN)
-        _record_attempt(conn, email, info.ip, True)
+    ok = verify_password(password, u["password_hash"] if u else _dummy())
+    if not (u and ok):
+        raise ApiError(401, BAD_LOGIN)
+    with db.connect() as conn:
+        _attempt_ok(conn, attempt, email, info.ip)
         if u["disabled"]:
             conn.commit()
             raise ApiError(403, "Tu cuenta está desactivada. Habla con el propietario de la instalación.")
@@ -490,14 +560,11 @@ def update_me(body: dict) -> dict:
         new_pw = body.get("new_password")
         if new_pw is not None:
             current = body.get("current_password")
-            wait = _retry_after(conn, u["email"], info.ip)
-            if wait:
-                raise _too_many(wait)
-            if not isinstance(current, str) or not verify_password(current[:MAX_PASSWORD + 1], u["password_hash"]):
-                _record_attempt(conn, u["email"], info.ip, False)
-                conn.commit()
-                raise ApiError(400, "La contraseña actual no es correcta")
             check_password_policy(new_pw, u["email"])
+            attempt = _begin_attempt(u["email"], info.ip)      # mismo límite que el inicio de sesión
+            if not isinstance(current, str) or not verify_password(current[:MAX_PASSWORD + 1], u["password_hash"]):
+                raise ApiError(400, "La contraseña actual no es correcta")
+            _attempt_ok(conn, attempt, u["email"], info.ip)
             conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(new_pw), uid))
             conn.execute("DELETE FROM sessions WHERE user_id = ?", (uid,))
             csrf = _start_session(conn, uid)

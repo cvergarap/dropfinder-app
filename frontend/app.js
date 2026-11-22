@@ -463,7 +463,8 @@ $("#runMonitor").addEventListener("click", async (e) => {
   try {
     const r = await api("/api/monitor/run", { method: "POST" });
     toast(`Monitor: ${r.checked} revisados, ${r.alerts.length} alertas nuevas` +
-      (r.skipped ? ` · ${r.skipped} de CSV (se actualizan al volver a subir el archivo)` : ""));
+      (r.skipped ? ` · ${r.skipped} de CSV (se actualizan al volver a subir el archivo)` : "") +
+      (r.cooldown ? ` · ${r.cooldown} revisados hace menos de 15 min (se usa el último dato)` : ""));
     loadImports(); refreshCounts();
   } finally { e.target.disabled = false; }
 });

@@ -23,7 +23,7 @@
   }
 
   /* ---------------- Pantalla de acceso ---------------- */
-  function showScreen(mode, notice = "") {
+  function showScreen(mode, notice = "", needToken = false) {
     document.body.classList.add("df-locked");
     if (!screen) {
       screen = document.createElement("main");
@@ -47,6 +47,10 @@
           autocomplete="${first ? "new-password" : "current-password"}"${first ? ' minlength="10" aria-describedby="pwHelp"' : ""}></label>
         ${first ? `<p id="pwHelp" class="muted small">Mínimo 10 caracteres y distinta de tu correo.</p>
           <label class="field">Repite la contraseña<input name="password2" type="password" autocomplete="new-password" required></label>` : ""}
+        ${first && needToken ? `<label class="field">Código de instalación<input name="setup_token" autocomplete="off"
+            required spellcheck="false" autocapitalize="none" aria-describedby="tokenHelp"></label>
+          <p id="tokenHelp" class="muted small">Estás entrando desde otro equipo. El código aparece en la consola
+            del servidor al arrancar (o es el valor de DROPFINDER_SETUP_TOKEN).</p>` : ""}
         <p class="auth-error" role="alert"></p>
         <button class="primary" type="submit">${first ? "Crear cuenta y entrar" : "Entrar"}</button>
       </form>
@@ -66,11 +70,13 @@
       if (!v.name.trim()) { err.textContent = "Escribe tu nombre."; return; }
       if ((v.password || "").length < 10) { err.textContent = "La contraseña debe tener al menos 10 caracteres."; return; }
       if (v.password !== v.password2) { err.textContent = "Las contraseñas no coinciden."; return; }
+      if (form.setup_token && !v.setup_token.trim()) { err.textContent = "Escribe el código de instalación."; return; }
     } else if (!v.email || !v.password) { err.textContent = "Escribe tu correo y tu contraseña."; return; }
     btn.disabled = true;
     try {
       const d = first
-        ? await call("/api/auth/register", "POST", { name: v.name, email: v.email, password: v.password })
+        ? await call("/api/auth/register", "POST", { name: v.name, email: v.email, password: v.password,
+          ...(v.setup_token ? { setup_token: v.setup_token.trim() } : {}) })
         : await call("/api/auth/login", "POST", { email: v.email, password: v.password });
       signedIn(d);
     } catch (e) {
@@ -333,7 +339,7 @@
   async function boot() {
     try {
       const st = await call("/api/auth/status");
-      if (!st.has_users) { showScreen("register"); return; }
+      if (!st.has_users) { showScreen("register", "", !!st.setup_token_required); return; }
       if (!st.authenticated) { showScreen("login"); return; }
       signedIn(await call("/api/auth/me"));
     } catch (e) {

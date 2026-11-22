@@ -15,7 +15,7 @@ from search import unaccent  # noqa: F401  (se mantiene db.unaccent por compatib
 
 DB_PATH = os.environ.get("DROPFINDER_DB", os.path.join(os.path.dirname(__file__), "dropfinder.db"))
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 PRODUCTS_TABLE = """
 CREATE TABLE IF NOT EXISTS products (
@@ -71,6 +71,7 @@ CREATE INDEX IF NOT EXISTS ix_imported_user ON imported_products(user_id);
 CREATE INDEX IF NOT EXISTS ix_alerts_user ON alerts(user_id, read);
 CREATE INDEX IF NOT EXISTS ix_saved_user ON saved_searches(user_id);
 CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS ix_search_log_user ON search_log(user_id, q_norm);
 """
 
 # v5: cada usuario tiene sus propios productos importados (un producto puede importarlo más de un usuario)
@@ -110,7 +111,8 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 -- Búsquedas realizadas (para sugerir las populares en el autocompletado)
 CREATE TABLE IF NOT EXISTS search_log (
   id INTEGER PRIMARY KEY, q TEXT NOT NULL, q_norm TEXT NOT NULL,
-  results INTEGER NOT NULL, created_at TEXT NOT NULL
+  results INTEGER NOT NULL, created_at TEXT NOT NULL,
+  user_id INTEGER                    -- v6: quién buscó (autocompletado por usuario); NULL = anterior a v6
 );
 CREATE INDEX IF NOT EXISTS ix_search_log_q ON search_log(q_norm);
 
@@ -159,6 +161,10 @@ CREATE TABLE IF NOT EXISTS login_attempts (
 CREATE INDEX IF NOT EXISTS ix_login_attempts ON login_attempts(email, created_at);
 CREATE INDEX IF NOT EXISTS ix_login_attempts_ip ON login_attempts(ip, created_at);
 CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at);
+-- v6: última vez que el monitor actualizó cada producto (enfriamiento entre ejecuciones)
+CREATE TABLE IF NOT EXISTS monitor_checks (
+  product_id INTEGER PRIMARY KEY REFERENCES products(id) ON DELETE CASCADE, checked_at TEXT NOT NULL
+);
 """
 SCHEMA = SCHEMA.replace("ALERTS_TABLE_DEF", ALERTS_TABLE).replace("IMPORTED_TABLE_DEF", IMPORTED_TABLE)
 
@@ -232,6 +238,14 @@ def _migrate_v4_to_v5(conn) -> None:
         tcols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         if tcols and "user_id" not in tcols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1")
+
+
+def _migrate_v5_to_v6(conn) -> None:
+    """v6: search_log.user_id (el autocompletado muestra a cada usuario solo sus búsquedas). Las búsquedas
+    anteriores quedan con user_id NULL: no se atribuyen a nadie (no se sabe quién las hizo)."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(search_log)")}
+    if cols and "user_id" not in cols:
+        conn.execute("ALTER TABLE search_log ADD COLUMN user_id INTEGER")
 
 
 def _migrate_v3_to_v4(conn) -> None:
@@ -386,6 +400,14 @@ def init_db(seed_size: int = 1500) -> None:
                 conn.rollback()
                 raise
             conn.execute("PRAGMA foreign_keys = ON")
+        if has_products and version < 6:
+            conn.execute("BEGIN")                       # todo o nada
+            try:
+                _migrate_v5_to_v6(conn)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         conn.executescript(SCHEMA)
         conn.execute("BEGIN")
         try:
