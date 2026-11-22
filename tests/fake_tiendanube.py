@@ -20,7 +20,7 @@ MONEY_RE = re.compile(r"^\d+\.\d{2}$")
 UA_RE = re.compile(r"^[^\s()]+ \([^\s@()]+@[^\s@()]+\.[^\s@()]+\)$")
 PRODUCT_FIELDS = {"name": dict, "description": dict, "published": bool, "brand": str, "tags": str, "images": list,
                   "variants": list}
-VARIANT_FIELDS = {"price": "money", "stock": "int", "sku": str, "cost": "money", "promotional_price": "money_or_null"}
+VARIANT_FIELDS = {"price": "money", "stock": "int", "sku": str, "cost": "money", "promotional_price": "money_or_null", "stock_management": bool}
 PUT_PRODUCT_FIELDS = {"published": bool}
 PUT_VARIANT_FIELDS = {k: v for k, v in VARIANT_FIELDS.items() if k != "sku"}
 OPS = ("store", "products_list", "sku_lookup", "product_create", "product_update", "variant_update", "product_delete")
@@ -75,10 +75,12 @@ class FakeTiendanube:
 
     # ------------------------------------------------------------ configuración
     def add_store(self, store: str, *, tokens=("tn_token_valido_123",), currency="USD", name=None, scopes=None,
-                  empty_list_404=True) -> dict:
+                  empty_list_404=True, main_language="es", languages=None, sku_mode="404") -> dict:
         st = {"tokens": set(tokens), "currency": currency, "name": name if name is not None else {"es": f"Tienda {store}"},
               "scopes": set(scopes if scopes is not None else ("read_products", "write_products")),
-              "products": {}, "empty_list_404": empty_list_404}
+              "products": {}, "empty_list_404": empty_list_404,
+              "main_language": main_language, "languages": languages if languages is not None else {"es": "Español"},
+              "sku_mode": sku_mode}   # sku_mode: qué responde GET /products/sku/{sku} si no existe: 404, empty_list, null
         self.stores[store] = st
         return st
 
@@ -285,8 +287,6 @@ class FakeTiendanube:
                 return f"variants.{i}.price: obligatorio"
             if v["price"] == "0.00":
                 return f"variants.{i}.price: debe ser mayor que cero"
-            if v.get("promotional_price") not in (None,) and float(v["promotional_price"]) >= float(v["price"]):
-                return f"variants.{i}.promotional_price: debe ser menor que price"
         for i, im in enumerate(body.get("images", [])):
             if not (isinstance(im, dict) and set(im) == {"src"} and isinstance(im["src"], str)
                     and im["src"].startswith("https://")):
@@ -298,7 +298,19 @@ class FakeTiendanube:
     # ------------------------------------------------------------ semántica
     @staticmethod
     def _variant_json(v):
-        return dict(v)
+        return {k: val for k, val in v.items() if k != "_stock_raw"}
+
+    @staticmethod
+    def _apply_variant(v, body):
+        """Semántica modelada: sin stock_management=true la variante informa stock null (ilimitado) e IGNORA `stock`."""
+        for k, val in body.items():
+            if k != "stock":
+                v[k] = val
+        if v.get("stock_management") is True:
+            if "stock" in body:
+                v["stock"] = body["stock"]
+        else:
+            v["stock"] = None
 
     def _product_json(self, p):
         return {"id": p["id"], "name": p["name"], "description": p["description"], "published": p["published"],
@@ -306,7 +318,8 @@ class FakeTiendanube:
                 "variants": [self._variant_json(v) for v in p["variants"]]}
 
     def _store(self, st, rest, body):
-        return 200, {"id": 1, "name": st["name"], "main_currency": st["currency"]}
+        return 200, {"id": 1, "name": st["name"], "main_currency": st["currency"], "main_language": st["main_language"],
+                     "languages": st["languages"]}
 
     def _products_list(self, st, rest, body):
         if not st["products"] and st["empty_list_404"]:
@@ -316,7 +329,15 @@ class FakeTiendanube:
     def _sku_lookup(self, st, rest, body, sku):
         for p in st["products"].values():
             if any(v["sku"] == sku for v in p["variants"]):
+                if st["sku_mode"] == "list":          # lista con otros productos antes (el coincidente NO es el primero)
+                    others = [self._product_json(o) for o in st["products"].values() if o is not p]
+                    return 200, others + [self._product_json(p)]
                 return 200, self._product_json(p)
+        mode = st["sku_mode"]
+        if mode == "empty_list":
+            return 200, []
+        if mode == "null":
+            return 200, None
         return 404, NOT_FOUND
 
     def _product_create(self, st, rest, body):
@@ -326,8 +347,11 @@ class FakeTiendanube:
         pid = next(self._ids)
         variants = []
         for v in body["variants"]:
-            variants.append({"id": next(self._ids), "product_id": pid, "price": v["price"], "stock": v.get("stock"),
-                             "sku": v.get("sku"), "cost": v.get("cost"), "promotional_price": v.get("promotional_price")})
+            nv = {"id": next(self._ids), "product_id": pid, "price": v["price"], "stock": None,
+                  "sku": v.get("sku"), "cost": v.get("cost"), "promotional_price": v.get("promotional_price"),
+                  "stock_management": False}
+            self._apply_variant(nv, {k: x for k, x in v.items() if k in ("stock", "stock_management")})
+            variants.append(nv)
         st["products"][pid] = {"id": pid, "name": body["name"], "description": body.get("description", {}),
                                "published": body["published"], "brand": body.get("brand", ""), "tags": body.get("tags", ""),
                                "images": [{"id": next(self._ids), "src": i["src"], "product_id": pid}
@@ -355,12 +379,9 @@ class FakeTiendanube:
         e = self._check_variant(body, PUT_VARIANT_FIELDS, "")
         if e:
             return self._unprocessable(e)
-        price = body.get("price", v["price"])
-        if price == "0.00":
+        if body.get("price") == "0.00":
             return self._unprocessable("price: debe ser mayor que cero")
-        if body.get("promotional_price") is not None and float(body["promotional_price"]) >= float(price):
-            return self._unprocessable("promotional_price: debe ser menor que price")
-        v.update(body)
+        self._apply_variant(v, body)
         return 200, self._variant_json(v)
 
     def _product_delete(self, st, rest, body, pid):

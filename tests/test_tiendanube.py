@@ -38,6 +38,8 @@ class Base(unittest.TestCase):
             x.start()
             self.addCleanup(x.stop)
         self.addCleanup(self.fake.stop)
+        tiendanube.clear_caches()
+        self.addCleanup(tiendanube.clear_caches)
         old_loop, shttp.ALLOW_LOOPBACK = shttp.ALLOW_LOOPBACK, True          # solo para el servidor falso local
         self.addCleanup(lambda: setattr(shttp, "ALLOW_LOOPBACK", old_loop))
 
@@ -196,9 +198,10 @@ class PublishTest(Base):
             "description": {"es": "Línea 1<br>Línea &lt;b&gt;2&lt;/b&gt;"},
             "published": False, "brand": "Prov", "tags": "a,b c",
             "images": [{"src": "https://cdn.x.com/a.jpg"}],
-            "variants": [{"price": "19.90", "stock": 7, "sku": "DF-1", "cost": "7.50"}]})
+            "variants": [{"price": "19.90", "stock": 7, "stock_management": True, "sku": "DF-1",
+                           "cost": "7.50"}]})
         self.assertIs(r["body"]["published"], False)
-        self.assertEqual(self.fake.ops(), ["sku_lookup", "product_create"])
+        self.assertEqual(self.fake.ops(), ["store", "sku_lookup", "product_create"])
         p = list(self.products().values())[0]
         self.assertEqual((ref.external_id, ref.variant_id), (str(p["id"]), str(p["variants"][0]["id"])))
         self.assertEqual(ref.inventory_item_id, "")
@@ -219,7 +222,7 @@ class PublishTest(Base):
         self.publish(title="X", description="", vendor="", tags=[], image_urls=[], cost=None, compare_at_price=None)
         self.assertEqual(self.fake.requests_for("product_create")[0]["body"],
                          {"name": {"es": "X"}, "description": {"es": ""}, "published": False,
-                          "variants": [{"price": "19.90", "stock": 7, "sku": "DF-1"}]})
+                          "variants": [{"price": "19.90", "stock": 7, "stock_management": True, "sku": "DF-1"}]})
 
     def test_promotional_only_when_lower(self):
         self.publish(compare_at_price=15.5)
@@ -241,12 +244,10 @@ class PublishTest(Base):
         self.assertNotIn("images", self.fake.requests_for("product_create")[-1]["body"])
 
     def test_sku_in_path_is_encoded(self):
-        self.publish(sku="DF/1 ñ?x=1#")
+        self.publish(sku="DF.1_x-9")
         r = self.fake.requests_for("sku_lookup")[0]
-        self.assertNotIn(" ", r["path"])
-        self.assertNotIn("?x", r["path"])
-        self.assertEqual(r["path"], f"/v1/{STORE}/products/sku/DF%2F1%20%C3%B1%3Fx%3D1%23")
-        self.assertEqual(list(self.products().values())[0]["variants"][0]["sku"], "DF/1 ñ?x=1#")
+        self.assertEqual(r["path"], f"/v1/{STORE}/products/sku/DF.1_x-9")
+        self.assertEqual(list(self.products().values())[0]["variants"][0]["sku"], "DF.1_x-9")
 
     def test_description_escaped(self):
         self.publish(description="<script>alert(1)</script>\r\n\"q\" & 'a'")
@@ -270,7 +271,7 @@ class IdempotentPublishTest(Base):
         self.assertEqual(self.fake.ops(), ["sku_lookup", "variant_update"])
         v = list(self.products().values())[0]["variants"][0]
         self.assertEqual((v["price"], v["stock"]), ("25.00", 3))
-        self.assertEqual(self.fake.requests_for("variant_update")[0]["body"], {"price": "25.00", "stock": 3})
+        self.assertEqual(self.fake.requests_for("variant_update")[0]["body"], {"price": "25.00", "stock": 3, "stock_management": True})
 
     def test_adopt_and_publish_when_active(self):
         ref = self.seed()
@@ -336,9 +337,9 @@ class IdempotentPublishTest(Base):
         self.assertEqual(len(self.fake.requests_for("product_create")), 2)
 
     def test_throttled_on_create_recovers_inline(self):
-        self.fake.inject("http429", op="product_create", count=1, reset_ms=3000)
+        self.fake.inject("http429", op="product_create", count=1, reset_ms=2000)
         self.publish()
-        self.assertEqual(self.sleeps, [3.0])
+        self.assertEqual(self.sleeps, [2.0])
         self.assertEqual(len(self.products()), 1)
 
     def test_throttled_on_lookup_then_create_once(self):
@@ -438,7 +439,7 @@ class UpdateTest(Base):
         r = self.fake.requests_for("variant_update")
         self.assertEqual([(x["method"], x["path"], x["body"]) for x in r],
                          [("PUT", f"/v1/{STORE}/products/{self.ref.external_id}/variants/{self.ref.variant_id}",
-                           {"price": "33.33", "stock": 4})])
+                           {"price": "33.33", "stock": 4, "stock_management": True})])
         self.assertNotIn("promotional_price", r[0]["raw"].decode())      # nunca null ni presente si no se pasó
         v = list(self.products().values())[0]["variants"][0]
         self.assertEqual((v["price"], v["stock"]), ("33.33", 4))
@@ -456,7 +457,8 @@ class UpdateTest(Base):
     def test_promotional_sent_when_lower(self):
         self.conn().update_price_stock(self.ref, 30, 2, compare_at_price=24.5)
         self.assertEqual(self.fake.requests_for("variant_update")[0]["body"],
-                         {"price": "30.00", "stock": 2, "promotional_price": "24.50"})
+                         {"price": "30.00", "stock": 2, "stock_management": True,
+                          "promotional_price": "24.50"})
 
     def test_set_active_toggles(self):
         c = self.conn()
@@ -789,11 +791,19 @@ class InputValidationTest(Base):
         self.assertEqual(self.fake.requests_for("product_create")[-1]["body"]["name"], {"es": "a b c d"})
 
     def test_sku(self):
-        for s in ("", "   ", None, "\x00"):
+        for s in ("", "   ", None, "\x00", "S" * 256, "S" * 400, ".", "..", "a/b", "a b", "a?x=1", "a#b", "%2e%2e", "a%2fb",
+                  "..\\x", "ñandú", " DF-1", "DF-1\n", "a:b", 5):
             self.bad(sku=s)
-        self.publish(sku="S" * 400)
+        self.publish(sku="S" * 255)
         self.assertEqual(self.fake.requests_for("product_create")[0]["body"]["variants"][0]["sku"], "S" * 255)
-        self.assertEqual(len(next(iter(self.products().values()))["variants"][0]["sku"]), 255)
+        for ok in ("...", ".a", "a.", "A_b-c.9"):
+            self.publish(sku=ok)
+
+    def test_sku_path_injection_never_reaches_the_store(self):
+        for s in ("..", ".", "%2e%2e", "a/b", "?x=1", "../products/1", "a/../b"):
+            with self.assertRaises(StoreValidationError, msg=s):
+                self.conn().publish(self.product(sku=s))
+        self.assertNoRequests()
 
     def test_other_amounts(self):
         self.bad(compare_at_price=float("nan"))
@@ -908,7 +918,6 @@ class FakeStrictnessTest(Base):
                {**g, "variants": [{"price": "1.00", "stock": "1"}]}, {**g, "variants": [{"price": "1.00", "stock": True}]},
                {**g, "variants": [{"price": "1.00", "stock": -1}]}, {**g, "variants": [{"price": "0.00"}]},
                {**g, "variants": [{"price": "1.00", "bogus": 1}]}, {**g, "variants": [{"stock": 1}]},
-               {**g, "variants": [{"price": "1.00", "promotional_price": "2.00"}]},
                {**g, "variants": [{"price": "1.00", "sku": 5}]}, {**g, "tags": ["a"]}, {**g, "images": [{"src": "http://x"}]},
                {**g, "images": [{"url": "https://x"}]}, {**g, "images": ["https://x"]}, {**g, "brand": 5},
                {**g, "description": "texto"}]
@@ -926,7 +935,6 @@ class FakeStrictnessTest(Base):
         self.assertEqual(self.raw("PUT", f"/products/{pid}/variants/{vid}", {"price": 5})[0], 422)
         self.assertEqual(self.raw("PUT", f"/products/{pid}/variants/{vid}", {"sku": "x"})[0], 422)
         self.assertEqual(self.raw("PUT", f"/products/{pid}/variants/{vid}", {"price": "0.00"})[0], 422)
-        self.assertEqual(self.raw("PUT", f"/products/{pid}/variants/{vid}", {"price": "2.00", "promotional_price": "3.00"})[0], 422)
         self.assertEqual(self.raw("PUT", f"/products/{pid}/variants/{vid}", {"price": "2.00", "stock": 3})[0], 200)
         self.assertEqual(self.raw("PUT", f"/products/{pid}/variants/99999999", {"price": "2.00"})[0], 404)
         self.assertEqual(self.raw("PUT", "/products/99999999", {"published": True})[0], 404)

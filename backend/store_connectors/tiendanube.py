@@ -12,10 +12,14 @@ DE DESARROLLO y revisa estos supuestos:
   4. GET /products?per_page=1 sirve de comprobación de lectura. Se recuerda que una tienda SIN productos puede
      responder 404 («Last page is 0») en vez de una lista vacía: por eso un 404 ahí se toma como «sin productos».
   5. POST /products acepta: name (objeto por idioma), description (objeto por idioma, HTML), published (booleano),
-     brand (cadena), tags (cadena separada por comas), images [{src}], variants [{price, stock, sku, cost?,
-     promotional_price?}] y devuelve el producto con `id` y `variants[0].id` numéricos. NO se envía `stock_management`
-     (se recuerda que el stock solo cuenta si la variante lo gestiona; si en la tienda real el stock no se refleja,
-     habrá que añadir `stock_management: true`). `product_type` no tiene campo equivalente y no se envía.
+     brand (cadena), tags (cadena separada por comas), images [{src}], variants [{price, stock, stock_management, sku,
+     cost?, promotional_price?}] y devuelve el producto con `id` y `variants[0].id` numéricos. `stock_management: true`
+     se envía SIEMPRE junto con `stock` (al crear, al actualizar y al adoptar): se recuerda que sin él la variante
+     tiene stock ilimitado (`stock: null`) e ignora el valor, lo que sobrevendería un producto agotado. SIN VERIFICAR:
+     con inventario multi-ubicación el `stock` de la variante podría reflejar solo la ubicación por defecto.
+     `product_type` no tiene campo equivalente y no se envía. El idioma de name/description es `main_language` de
+     GET /store (SIN VERIFICAR que exista; si no, `es`, si no el primero de `languages`), recordado 10 min.
+     SKU permitido: [A-Za-z0-9._-] hasta 255, y no «.» ni «..» (evita segmentos de ruta).
   6. PUT /products/{id}/variants/{variant_id} acepta price, stock y promotional_price (cadenas decimales / entero) y
      PUT /products/{id} acepta {published}. DELETE /products/{id} borra y responde 200 (o 204).
   7. GET /products/sku/{sku} devuelve 404 si no existe y el producto (objeto, o una lista con él) si existe, con
@@ -43,12 +47,14 @@ retry_after) y, si no se logra, el error original lleva `orphan_external_id`. Un
 from __future__ import annotations
 
 import functools
+import hashlib
 import html
 import ipaddress
 import json
 import logging
 import math
 import re
+import threading
 import time
 import urllib.parse
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -70,10 +76,12 @@ MAX_STOCK = 1_000_000_000
 MAX_PRICE = Decimal("1000000000")
 MAX_RETRY_AFTER = 120.0
 DEFAULT_RETRY_AFTER = 5.0
-MAX_INLINE_WAIT = 10.0                          # espera máxima dentro de la llamada ante un 429 (luego se informa al motor)
+MAX_INLINE_WAIT = 2.0                           # espera máxima dentro de la llamada ante un 429 (el motor tiene UN hilo: no bloquear)
 CLEANUP_TRIES = 3
-CLEANUP_MAX_SLEEP = 10.0
-LANG = "es"
+CLEANUP_MAX_SLEEP = 3.0
+LANG_TTL = 600.0                                # el idioma principal de la tienda se recuerda 10 min
+MAX_LANG_ENTRIES = 200
+DEFAULT_LANG = "es"
 
 _STORE_ID_RE = re.compile(r"[1-9][0-9]{2,11}")
 _ID_IN_URL_RE = re.compile(r"/(?:stores|admin/v2|admin|v1)/([0-9]+)(?![0-9])", re.I)
@@ -82,11 +90,45 @@ _LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 _EMAIL_RE = re.compile(rf"^[A-Za-z0-9._%+\-]{{1,64}}@{_LABEL}(?:\.{_LABEL})+$")
 _CURRENCY_RE = re.compile(r"^[A-Za-z]{3}$")
 _ID_RE = re.compile(r"^[0-9]{1,20}$")
+_SKU_RE = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
+_LANG_RE = re.compile(r"^[a-z]{2,3}$")
 
 
 # ---------------------------------------------------------------- utilidades de módulo
 def _sleep(seconds: float) -> None:
     time.sleep(seconds)
+
+
+def _now() -> float:
+    return time.time()
+
+
+_LANG_LOCK = threading.Lock()
+_LANG_CACHE: dict[tuple, tuple[str, float]] = {}
+
+
+def clear_caches() -> None:
+    """Vacía el idioma recordado (para pruebas)."""
+    with _LANG_LOCK:
+        _LANG_CACHE.clear()
+
+
+def _pick_language(data: dict) -> str:
+    """Idioma de los textos: main_language de la tienda; si no, es; si no, el primero disponible."""
+    def code(v):
+        if isinstance(v, str):
+            c = re.split(r"[-_]", v.strip().lower())[0]
+            return c if _LANG_RE.fullmatch(c) else ""
+        return ""
+    langs = data.get("languages")
+    avail = [code(k) for k in (langs.keys() if isinstance(langs, dict) else langs if isinstance(langs, list) else [])]
+    avail = [a for a in avail if a]
+    main = code(data.get("main_language"))
+    if main:
+        return main
+    if not avail or DEFAULT_LANG in avail:
+        return DEFAULT_LANG
+    return avail[0]
 
 
 def _money(value, what: str = "precio", *, allow_zero: bool = False) -> str:
@@ -410,9 +452,36 @@ class TiendanubeConnector(StoreConnector):
         if not isinstance(cur, str) or not _CURRENCY_RE.fullmatch(cur):
             raise StoreError("Tiendanube no informó una moneda válida para la tienda", retryable=False)
         # Lectura de productos (una tienda sin productos puede responder 404: se toma como lista vacía)
+        self._remember_language(_pick_language(data))
         self._call("GET", "/products?per_page=1&fields=id", missing="ok")
         return StoreInfo(name=_pick_name(data.get("name"), store), domain=store, currency=cur.upper(),
                          scopes=[], missing_scopes=[])
+
+    def _lang_key(self) -> tuple:
+        tok = self.credentials.get("access_token", "") if isinstance(self.credentials.get("access_token", ""), str) else ""
+        return (self._store(), hashlib.sha256(tok.strip().encode()).hexdigest()[:16])
+
+    def _remember_language(self, lang: str) -> None:
+        with _LANG_LOCK:
+            now = _now()
+            for k in [k for k, (_, exp) in _LANG_CACHE.items() if exp <= now]:
+                del _LANG_CACHE[k]
+            _LANG_CACHE[self._lang_key()] = (lang, now + LANG_TTL)
+            while len(_LANG_CACHE) > MAX_LANG_ENTRIES:
+                del _LANG_CACHE[min(_LANG_CACHE, key=lambda k: _LANG_CACHE[k][1])]
+
+    def _language(self) -> str:
+        """Idioma principal de la tienda (GET /store, recordado 10 min por tienda y token)."""
+        with _LANG_LOCK:
+            hit = _LANG_CACHE.get(self._lang_key())
+        if hit and hit[1] > _now():
+            return hit[0]
+        data = self._call("GET", "/store", missing="store")
+        if not isinstance(data, dict):
+            raise StoreError("Respuesta inesperada de Tiendanube", retryable=True)
+        lang = _pick_language(data)
+        self._remember_language(lang)
+        return lang
 
     def _admin_url(self, pid: str) -> str:
         return self.ADMIN_URL_TEMPLATE.format(store=self._store(), product=pid) if _ID_RE.fullmatch(pid or "") else ""
@@ -440,9 +509,10 @@ class TiendanubeConnector(StoreConnector):
         title = _clean_text(product.title, 255)
         if not title:
             raise StoreValidationError("El producto necesita un título")
-        sku = _clean_text(product.sku, 255)
-        if not sku:
-            raise StoreValidationError("El producto necesita un SKU (se usa para no duplicarlo)")
+        sku = product.sku if isinstance(product.sku, str) else ""
+        if not _SKU_RE.fullmatch(sku) or sku in (".", ".."):
+            raise StoreValidationError("El SKU debe tener 1 a 255 caracteres entre letras, números, punto, guion y guion bajo "
+                                       "(y no ser solo . o ..)")
         price = _money(product.price)
         promo = None
         if product.compare_at_price is not None:
@@ -453,6 +523,7 @@ class TiendanubeConnector(StoreConnector):
         images = _safe_images(product.image_urls)
         self._creds(self.credentials)
         self._store()
+        lang = self._language()
 
         # 2. Adoptar un producto ya creado por un intento anterior, o crearlo
         existing = self._find_existing(sku)
@@ -461,12 +532,12 @@ class TiendanubeConnector(StoreConnector):
         if adopted:
             pid, vid = _as_id(existing["id"]), self._variant_for(existing, sku)
         else:
-            variant = {"price": price, "stock": stock, "sku": sku}
+            variant = {"price": price, "stock": stock, "stock_management": True, "sku": sku}
             if cost is not None:
                 variant["cost"] = cost
             if promo is not None:
                 variant["promotional_price"] = promo
-            body = {"name": {LANG: title}, "description": {LANG: _description_html(product.description)},
+            body = {"name": {lang: title}, "description": {lang: _description_html(product.description)},
                     "published": False, "variants": [variant]}
             brand = _clean_text(product.vendor, 255)
             if brand:
@@ -517,7 +588,8 @@ class TiendanubeConnector(StoreConnector):
         log.warning("tiendanube: producto huérfano %s en %s", pid, self._store())
 
     def _put_variant(self, pid: str, vid: str, price: str, stock: int, promo: str | None) -> None:
-        body = {"price": price, "stock": stock}
+        # stock_management SIEMPRE junto con stock: sin él la variante queda con stock ilimitado (null) y se sobrevende
+        body = {"price": price, "stock": stock, "stock_management": True}
         if promo is not None:                                    # nunca se envía null: no se borra lo que el usuario puso
             body["promotional_price"] = promo
         self._call("PUT", f"/products/{pid}/variants/{vid}", body, missing="product")
