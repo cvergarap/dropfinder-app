@@ -14,14 +14,15 @@ TIENDA DE DESARROLLO y revisa estos supuestos:
   6. Búsqueda por SKU: GET /wc/v3/products?sku=<sku>&status=any -> lista; se supone coincidencia EXACTA (el conector
      además filtra por igualdad exacta del campo `sku`). Se supone que `status=any` es válido y que incluye borradores.
   7. Crear: POST /wc/v3/products con name, type "simple", status "draft", sku, regular_price (cadena "19.90"),
-     manage_stock true, stock_quantity, description (HTML), images [{src}], tags [{name}] (WooCommerce crea la etiqueta
-     si no existe), sale_price (cadena, opcional). Respuesta 201 con `id` entero y `status`.
+     manage_stock true, stock_quantity, description (HTML), tags [{name}] (WooCommerce crea la etiqueta si no existe).
+     Respuesta 201 con `id` entero y `status`. Las imágenes van aparte (PUT {images:[{src}]}, mejor esfuerzo).
+     Los productos de la tienda traen `tags` como [{id, name, slug}] y `description`, `name`, `images`.
   8. Valores de `status` aceptados: "draft" y "publish" (también existen "pending", "private"; no se usan).
   9. SKU repetido al crear: HTTP 400 con code `woocommerce_rest_product_sku_already_exists` (ADR 0003); se recuerda que
      versiones reales usan `product_invalid_sku`: el conector trata ambos como señal de adopción.
- 10. Actualizar: PUT /wc/v3/products/{id} con regular_price, manage_stock, stock_quantity, sale_price (opcional) y status.
-     Un producto en borrador o en la papelera sigue aceptando el PUT. Nunca se envía sale_price vacío ("" borraría la
-     oferta que el usuario puso a mano).
+ 10. Actualizar: PUT /wc/v3/products/{id} con regular_price, manage_stock, stock_quantity, status, images.
+     Un producto en borrador o en la papelera sigue aceptando el PUT. `compare_at_price` NO se admite: no se envía
+     nunca sale_price (ni vacío: "" borraría la oferta que el usuario puso a mano).
  11. Borrar: DELETE /wc/v3/products/{id}?force=true (sin force solo va a la papelera) -> 200 con el producto borrado.
  12. 404 de un producto inexistente: code `woocommerce_rest_product_invalid_id` (se acepta también
      `woocommerce_rest_invalid_id`); 404 de ruta inexistente: code `rest_no_route`. Cualquier otro 404 (HTML, otro
@@ -41,9 +42,13 @@ fijada, puerto 443, sin redirecciones, sin http). Credenciales solo en la cabece
 el cuerpo), nunca en excepciones, repr ni registros. Las URL salen de plantillas de CLASE (solo los tests las
 reemplazan) y de ids numéricos validados.
 
-Idempotencia al publicar: ANTES de crear se busca por SKU y se ADOPTA el producto existente en vez de duplicar; si la
-creación responde "SKU repetido" se vuelve a buscar y se adopta. Un producto adoptado nunca se borra en la limpieza
-(puede ser anterior). El producto se crea SIEMPRE como borrador y solo se muestra al final si `product.active`.
+Idempotencia al publicar: ANTES de crear se busca por SKU y se ADOPTA el producto existente en vez de duplicar, pero SOLO
+si lleva todas las etiquetas de esta instalación (`tags_match`: `dropfinder` y `dfi-<id>`); el SKU solo no prueba nada
+(el id es local a cada base de datos). Un producto con nuestro SKU y sin nuestras etiquetas es un CONFLICTO
+(StoreValidationError): ni se adopta ni se crea encima. Si la creación responde "SKU repetido" se vuelve a buscar con la
+misma regla. delete() solo borra productos con la etiqueta `dropfinder` y alguna `dfi-…` (los comprueba con un GET).
+Un producto adoptado nunca se borra en la limpieza (puede ser anterior), y adoptar nunca cambia la visibilidad de un
+producto existente. El producto se crea SIEMPRE como borrador y solo se muestra al final si `product.active`.
 Si ese último paso falla se intenta borrar lo creado (reintentos acotados) y se relanza el error ORIGINAL; si no se
 puede borrar, el error lleva `orphan_external_id` (y el mensaje lo indica).
 """
@@ -62,7 +67,7 @@ import unicodedata
 import urllib.parse
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
-from . import http as shttp, register, scrub
+from . import http as shttp, register, scrub, tags_match
 from .base import (ListingRef, StoreAuthError, StoreConnector, StoreError, StoreInfo, StoreNotFound,
                    StoreProduct, StoreRateLimited, StoreValidationError)
 
@@ -77,8 +82,13 @@ MAX_PRICE = Decimal("1000000000")
 MAX_RETRY_AFTER = 120.0
 DEFAULT_RETRY_AFTER = 5.0
 CLEANUP_TRIES = 3
-CLEANUP_MAX_SLEEP = 10.0
-MAX_ERROR_TEXT = 200
+CLEANUP_DEADLINE = 6.0                  # tiempo total máximo de la limpieza de huérfanos (el hilo de trabajo es único)
+CLEANUP_MAX_SLEEP = 1.5                 # una espera
+CLEANUP_SLEEP_BUDGET = 3.0              # esperas en línea acumuladas
+IMAGES_TIMEOUT = 90.0                   # WooCommerce descarga las imágenes de forma síncrona: puede tardar
+OWN_TAG = "dropfinder"
+INSTALL_TAG_PREFIX = "dfi-"
+MAX_ERROR_TEXT = 120
 API_PREFIX = "/wp-json/wc/v3"
 ROOT_PREFIX = "/wp-json"
 
@@ -97,9 +107,11 @@ _TAG_RE = re.compile(r"<[^>]*>")
 _RESERVED_TLDS = {"localhost", "local", "internal", "localdomain", "lan", "home", "corp", "intranet", "invalid", "test",
                   "example", "onion", "arpa", "private", "box", "router", "gateway", "domain", "wan"}
 
-AUTH_HINT = ("Causas habituales: el hosting elimina la cabecera Authorization (pídele a tu proveedor que la deje pasar), "
-             "el dominio no es exactamente el que usa la tienda (con o sin www) o la clave no tiene permisos de "
-             "Lectura/Escritura")
+AUTH_HINT = ("Causas habituales: la cabecera Authorization se elimina en el servidor o en Apache (pídele a tu proveedor que "
+             "la deje pasar); Cloudflare en modo SSL flexible sin X-Forwarded-Proto (WooCommerce solo acepta Basic con "
+             "SSL); el hosting bloquea PUT/DELETE; el dominio no es exactamente el que usa la tienda (con o sin www); o "
+             "la clave no tiene permisos de Lectura/Escritura")
+_SAFE_SKU_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,255}$")      # sin comas ni espacios: ?sku= acepta listas separadas por comas
 
 
 # ---------------------------------------------------------------- utilidades de módulo
@@ -382,13 +394,13 @@ class WooCommerceConnector(StoreConnector):
     def _text(self, text) -> str:
         return _plain(text, self._secrets())
 
-    def _send(self, method: str, prefix: str, path: str, query: dict | None, payload):
+    def _send(self, method: str, prefix: str, path: str, query: dict | None, payload, limits: dict | None = None):
         url = self.BASE_URL_TEMPLATE.format(host=self._host()) + prefix + path
         if query:
             url += "?" + urllib.parse.urlencode(query, quote_via=urllib.parse.quote)
         try:
             return shttp.request_json(method, url, payload, headers={"Authorization": self._auth_header()},
-                                      timeout=self.TIMEOUT, max_bytes=self.MAX_BYTES)
+                                      **{"timeout": self.TIMEOUT, "max_bytes": self.MAX_BYTES, **(limits or {})})
         except StoreError as e:
             msg = str(e)
             if "redirecci" in msg.lower():
@@ -398,9 +410,9 @@ class WooCommerceConnector(StoreConnector):
             raise StoreError(self._text(msg), retryable=e.retryable, not_sent=e.not_sent) from None
 
     def _call(self, method: str, path: str, *, query: dict | None = None, payload=None, ref_op: bool = False,
-              root: bool = False):
+              root: bool = False, limits: dict | None = None):
         """Una llamada a la API. Devuelve el JSON (dict/list). Todo fallo sale como StoreError tipado."""
-        resp = self._send(method, ROOT_PREFIX if root else API_PREFIX, path, query, payload)
+        resp = self._send(method, ROOT_PREFIX if root else API_PREFIX, path, query, payload, limits)
         data, parsed = None, False
         body = resp.body or b""
         if body.strip():
@@ -433,11 +445,11 @@ class WooCommerceConnector(StoreConnector):
     def _http_error(self, resp, data, ref_op: bool) -> StoreError:
         st = resp.status
         code = ""
+        detail = ""
         if isinstance(data, dict):
             code = str(data.get("code") or "")[:100]
-            detail = self._text(data.get("message", ""))
-        else:
-            detail = self._text(resp.body.decode("utf-8", "replace") if resp.body else "")
+            detail = self._text(data.get("message", "")) if isinstance(data.get("message"), str) else ""
+        # Un cuerpo que no tiene la forma de error de WordPress (HTML de un sitio ajeno, texto) no se refleja
         if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,100}", code):       # el code solo se compara: nunca se muestra ni se confía
             code = ""
         extra = f" Detalle de la tienda: {detail}" if detail else ""
@@ -519,21 +531,34 @@ class WooCommerceConnector(StoreConnector):
             raise StoreError("La tienda no devolvió el id del producto creado", retryable=True)
         return str(pid)
 
+    @staticmethod
+    def _tag_names(prod: dict) -> list[str]:
+        """Nombres y slugs de las etiquetas de un producto de la tienda (WooCommerce: [{id, name, slug}])."""
+        out = []
+        for t in prod.get("tags") or []:
+            if isinstance(t, dict):
+                out += [t[k] for k in ("name", "slug") if isinstance(t.get(k), str)]
+        return out
+
     def _find_by_sku(self, sku: str) -> dict | None:
+        """Producto con ESE SKU (sin distinguir mayúsculas: MySQL no las distingue). Ignora variaciones, papelera y
+        cualquier otro elemento que devuelva ?sku= (el filtro admite listas separadas por comas)."""
         data = self._call("GET", "/products", query={"sku": sku, "status": "any"})
         if not isinstance(data, list):
             raise StoreError("Respuesta inesperada de la tienda al buscar por SKU", retryable=True)
-        found = [d for d in data if isinstance(d, dict) and d.get("sku") == sku and d.get("type") != "variation"
+        found = [d for d in data if isinstance(d, dict) and isinstance(d.get("sku"), str) and d["sku"].lower() == sku.lower()
+                 and d.get("type") != "variation" and d.get("status") != "trash"
                  and isinstance(d.get("id"), int) and not isinstance(d.get("id"), bool) and d["id"] > 0]
         return min(found, key=lambda d: d["id"]) if found else None
 
-    @staticmethod
-    def _sale(price: str, compare) -> str | None:
-        """sale_price solo si se pasó y es MENOR que el precio. Nunca una cadena vacía."""
-        if compare is None:
-            return None
-        c = _money(compare, "precio de comparación")
-        return c if Decimal(c) < Decimal(price) else None
+    def _own_or_conflict(self, existing: dict, tags: list[dict], sku: str) -> dict:
+        """Solo se ADOPTA un producto que lleve TODAS las etiquetas de esta instalación. El SKU `DF-<id>` solo no
+        prueba nada (el id es local a cada base de datos): sería un producto del cliente u de otra instalación."""
+        if not tags_match(self._tag_names(existing), [t["name"] for t in tags]):
+            raise StoreValidationError(
+                f"Ya existe en tu tienda un producto con el SKU {sku} que no creó esta instalación de DropFinder: "
+                "cámbiale el SKU o bórralo antes de publicar")
+        return existing
 
     @_foreign_errors
     def publish(self, product: StoreProduct) -> ListingRef:
@@ -542,48 +567,52 @@ class WooCommerceConnector(StoreConnector):
         if not title:
             raise StoreValidationError("El producto necesita un título")
         sku = product.sku
-        if not isinstance(sku, str) or not sku.strip() or sku != sku.strip() or len(sku) > 255 \
-                or any(ord(c) < 32 or ord(c) == 127 for c in sku):
-            raise StoreValidationError("El producto necesita un SKU válido (sin espacios al borde ni caracteres de control, "
+        if not isinstance(sku, str) or not _SAFE_SKU_RE.fullmatch(sku):
+            raise StoreValidationError("El producto necesita un SKU válido (letras, números, guion, guion bajo y punto; "
                                        "máximo 255)")
         price = _money(product.price)
-        sale = self._sale(price, product.compare_at_price)
         stock = _stock(product.stock)
-        body = {"name": title, "type": "simple", "status": "draft", "sku": sku, "regular_price": price,
-                "manage_stock": True, "stock_quantity": stock, "description": _description_html(product.description)}
-        if sale is not None:
-            body["sale_price"] = sale
-        images = _safe_images(product.image_urls)
-        if images:
-            body["images"] = images
+        if product.compare_at_price is not None:         # no se admite (no se envía nunca sale_price), pero se valida
+            _money(product.compare_at_price, "precio de comparación")
+        description = _description_html(product.description)
         tags = _clean_tags(product.tags)
-        if tags:
-            body["tags"] = tags
+        if not tags:                                     # sin etiquetas no se puede probar que el producto es nuestro
+            raise StoreValidationError("El producto necesita etiquetas de DropFinder para poder reconocerlo en la tienda")
+        body = {"name": title, "type": "simple", "status": "draft", "sku": sku, "regular_price": price,
+                "manage_stock": True, "stock_quantity": stock, "description": description, "tags": tags}
+        images = _safe_images(product.image_urls)
 
-        # 2. Adoptar un producto ya creado por un intento anterior, o crearlo
+        # 2. Adoptar un producto NUESTRO ya creado por un intento anterior, o crearlo (SIN imágenes: ver más abajo)
         existing = self._find_by_sku(sku)
+        if existing is not None:
+            existing = self._own_or_conflict(existing, tags, sku)
         adopted = existing is not None
-        if adopted:
-            pid, status = str(existing["id"]), existing.get("status")
-        else:
+        if not adopted:
             try:
                 created = self._call("POST", "/products", payload=body)
             except StoreValidationError as e:
                 if getattr(e, "wc_code", "") not in SKU_EXISTS_CODES:
                     raise
-                existing = self._find_by_sku(sku)        # SKU repetido: alguien (un intento perdido) lo creó -> adoptar
+                existing = self._find_by_sku(sku)        # SKU repetido: un intento perdido lo creó -> adoptar si es nuestro
                 if existing is None:
                     raise StoreValidationError("El SKU ya está en uso en la tienda por otro producto (¿en la papelera o "
                                                "como variación?): libéralo o cambia el SKU") from None
-                adopted, pid, status = True, str(existing["id"]), existing.get("status")
+                existing = self._own_or_conflict(existing, tags, sku)
+                adopted = True
             else:
                 pid, status = self._pid(created), created.get("status") if isinstance(created, dict) else None
+        if adopted:
+            pid, status = str(existing["id"]), existing.get("status")
         try:
             if adopted:                              # lo adoptado puede venir de otro precio/stock: se deja como se pide
                 upd = {"regular_price": price, "manage_stock": True, "stock_quantity": stock}
-                if sale is not None:
-                    upd["sale_price"] = sale
+                if not existing.get("name"):             # nombre y descripción solo si la tienda no los tiene
+                    upd["name"] = title
+                if not existing.get("description") and description:
+                    upd["description"] = description
                 self._call("PUT", f"/products/{pid}", payload=upd, ref_op=True)
+            # Visibilidad al adoptar: NUNCA se cambia la de un producto existente (ocultar uno que su dueño ya hizo
+            # visible sería peor que dejarlo); solo se publica un borrador si se pide active=True.
             if product.active and status != "publish":
                 self._call("PUT", f"/products/{pid}", payload={"status": "publish"}, ref_op=True)
         except StoreError as e:
@@ -592,20 +621,42 @@ class WooCommerceConnector(StoreConnector):
             if isinstance(e, StoreNotFound):
                 raise StoreError("El producto desapareció de la tienda durante la publicación", retryable=True) from None
             raise
+        if images and not (adopted and existing.get("images")):
+            self._set_images(pid, images)
         return ListingRef(external_id=pid, url=self._admin_url(pid))
 
+    def _set_images(self, pid: str, images: list[dict]) -> None:
+        """Imágenes: mejor esfuerzo. WooCommerce las descarga de forma síncrona (lento) y una imagen mala hace fallar la
+        petición entera con 400; por eso van aparte y un fallo no deshace el producto (el motor no reintentaría)."""
+        try:
+            self._call("PUT", f"/products/{pid}", payload={"images": images}, ref_op=True,
+                       limits={"timeout": IMAGES_TIMEOUT, "total_timeout": IMAGES_TIMEOUT})
+        except StoreError as e:
+            log.warning("woocommerce: no se pudieron poner las imágenes del producto %s en %s: %s", pid, self._host(),
+                        self._text(e))
+
     def _cleanup_orphan(self, pid: str, original: StoreError) -> None:
-        """Borra el producto a medio crear; ante límite de velocidad o error temporal espera y reintenta (acotado)."""
+        """Borra el producto a medio crear (solo uno creado por esta llamada). Plazo total CLEANUP_DEADLINE y esperas en
+        línea acotadas (CLEANUP_SLEEP_BUDGET): el hilo de trabajo es único."""
+        deadline = time.monotonic() + CLEANUP_DEADLINE
+        slept = 0.0
         for attempt in range(CLEANUP_TRIES):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
             try:
-                self._call("DELETE", f"/products/{pid}", query={"force": "true"}, ref_op=True)
+                self._call("DELETE", f"/products/{pid}", query={"force": "true"}, ref_op=True,
+                           limits={"timeout": min(self.TIMEOUT, left), "total_timeout": left})
                 return
             except StoreNotFound:
                 return
             except StoreError as e:
-                if not e.retryable or attempt == CLEANUP_TRIES - 1:
+                wait = min(float(getattr(e, "retry_after", 1.0)), CLEANUP_MAX_SLEEP, CLEANUP_SLEEP_BUDGET - slept,
+                           deadline - time.monotonic())
+                if not e.retryable or attempt == CLEANUP_TRIES - 1 or wait <= 0:
                     break
-                _sleep(min(float(getattr(e, "retry_after", 1.0)), CLEANUP_MAX_SLEEP))
+                slept += wait
+                _sleep(wait)
             except Exception:
                 break
         original.orphan_external_id = pid
@@ -627,11 +678,11 @@ class WooCommerceConnector(StoreConnector):
         pid = self._check_ref(ref)
         p = _money(price)
         n = _stock(stock)
-        body = {"regular_price": p, "manage_stock": True, "stock_quantity": n}
-        sale = self._sale(p, compare_at_price)           # None = no tocar la oferta que haya puesto el usuario
-        if sale is not None:
-            body["sale_price"] = sale
-        self._call("PUT", f"/products/{pid}", payload=body, ref_op=True)
+        if compare_at_price is not None:
+            _money(compare_at_price, "precio de comparación")
+        # compare_at_price no se admite: nunca se envía sale_price (ni vacío: borraría la oferta que puso el usuario)
+        self._call("PUT", f"/products/{pid}", payload={"regular_price": p, "manage_stock": True, "stock_quantity": n},
+                   ref_op=True)
 
     @_foreign_errors
     def set_active(self, ref: ListingRef, active: bool) -> None:
@@ -640,7 +691,18 @@ class WooCommerceConnector(StoreConnector):
 
     @_foreign_errors
     def delete(self, ref: ListingRef) -> None:
+        """Solo borra un producto que creó DropFinder: debe llevar la etiqueta `dropfinder` y alguna `dfi-…`. Uno al que
+        el usuario le quitó las etiquetas a mano (o que nunca las tuvo) NO se borra: sería destruir datos ajenos."""
         pid = self._check_ref(ref)
+        try:
+            prod = self._call("GET", f"/products/{pid}", ref_op=True)
+        except StoreNotFound:
+            return
+        names = {n.strip().lower() for n in self._tag_names(prod if isinstance(prod, dict) else {})}
+        if OWN_TAG not in names or not any(n.startswith(INSTALL_TAG_PREFIX) and len(n) > len(INSTALL_TAG_PREFIX) for n in names):
+            raise StoreValidationError(
+                f"El producto {pid} de tu tienda no lleva las etiquetas de DropFinder (¿se las quitaste a mano?), así que "
+                "DropFinder no lo borra: bórralo desde WooCommerce si ya no lo quieres")
         try:
             self._call("DELETE", f"/products/{pid}", query={"force": "true"}, ref_op=True)
         except StoreNotFound:
