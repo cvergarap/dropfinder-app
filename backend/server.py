@@ -608,6 +608,8 @@ USER_ROUTES = {
     ("POST", r"/api/saved-searches/check"), ("PATCH", r"/api/saved-searches/(\d+)"),
     ("DELETE", r"/api/saved-searches/(\d+)"), ("GET", r"/api/saved-searches/(\d+)/results"),
     ("POST", r"/api/saved-searches/(\d+)/seen"),
+    # panel (indicadores propios; descartar un paso de "primeros pasos" guarda una preferencia propia)
+    ("GET", r"/api/dashboard"), ("POST", r"/api/dashboard/onboarding/([a-z_]+)/dismiss"),
     # colecciones y exportación (propias)
     ("GET", r"/api/collections"), ("POST", r"/api/collections"), ("PATCH", r"/api/collections/(\d+)"),
     ("DELETE", r"/api/collections/(\d+)"), ("GET", r"/api/collections/(\d+)/items"),

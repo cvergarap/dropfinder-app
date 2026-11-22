@@ -336,6 +336,42 @@ def _count_new(conn, sid: int, params: dict) -> int:
     return conn.execute(f"SELECT COUNT(*) {frm}", args).fetchone()[0]
 
 
+def new_counts(conn, user_id: int) -> dict[int, int]:
+    """API pública: {id de búsqueda guardada: productos nuevos} de las búsquedas del usuario, con la misma
+    definición de "nuevo" que el contador de la pestaña. Solo lee (no crea tablas: si la tabla de
+    candidatos aún no existe, no hay candidatos pendientes). En caché hasta que cambie el catálogo, una
+    búsqueda guardada, sus coincidencias o sus marcas de "visto"."""
+    rows = conn.execute("SELECT id, params FROM saved_searches WHERE user_id = ? ORDER BY id", (user_id,)).fetchall()
+    if not rows:
+        return {}
+    sids = [r["id"] for r in rows]
+    marks = {r[0]: r[1] for r in conn.execute(
+        f"SELECT key, value FROM meta WHERE key IN ({','.join('?' * len(sids))})", [f"{SEEN_PREFIX}{i}" for i in sids])}
+    pending = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'saved_search_pending'").fetchone()
+    pend_sig = conn.execute("SELECT COUNT(*), MAX(product_id) FROM saved_search_pending").fetchone()[:] if pending else None
+    hits_sig = conn.execute(f"SELECT COUNT(*), MAX(first_seen_at) FROM saved_search_hits "
+                            f"WHERE saved_search_id IN ({','.join('?' * len(sids))})", sids).fetchone()[:]
+    hwm = _hwm(conn)
+    key = repr(("saved:new_counts", db.DB_PATH, user_id, tuple((r["id"], r["params"]) for r in rows),
+                tuple(sorted(marks.items())), pend_sig, hits_sig, hwm))
+    cand = _CAND if pending else "p.id > ?"
+
+    def build():
+        out = {}
+        for r in rows:
+            try:
+                params = json.loads(r["params"])
+            except ValueError:
+                out[r["id"]] = 0
+                continue
+            sid = r["id"]
+            frm, args = _match_sql(conn, params, [f"({_HIT_AFTER} OR ({cand} AND {_NOT_HIT}))"],
+                                   [sid, marks.get(f"{SEEN_PREFIX}{sid}", ""), hwm, sid])
+            out[sid] = conn.execute(f"SELECT COUNT(*) {frm}", args).fetchone()[0]
+        return out
+    return dict(search.cached(key, build))
+
+
 def _record_hits(conn, sid: int, params: dict, candidates_only: bool = True) -> tuple[str, int]:
     """Agrega a hits las coincidencias que aún no estaban: solo candidatos (revisión, marcar visto) o todas
     (al crear la búsqueda: línea base completa, así nada que ya cumplía se alerta después al actualizarse).

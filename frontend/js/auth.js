@@ -100,6 +100,7 @@
     renderMenu();
     A.open();
     DF.start();
+    if (DF.dashboard && DF.dashboard.home) dfSafe(DF.dashboard.home);   // el Panel es la vista de inicio
   }
 
   A.onUnauthorized = () => {
