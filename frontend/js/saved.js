@@ -195,11 +195,21 @@
     $("#ssCheck", view()).disabled = !items.length;
   }
 
+  /* Solo se aplica la respuesta de la última petición de la lista: una respuesta vieja (p. ej. el refresco
+     diferido de los contadores) no debe pisar a una posterior a "marcar como vista". */
+  let listSeq = 0;
+  async function fetchList() {
+    const seq = ++listSeq;
+    const r = await api("/api/saved-searches");
+    return seq === listSeq ? r.items || [] : null;
+  }
+
   async function loadSaved() {
     renderShell();
     try {
-      const r = await api("/api/saved-searches");
-      items = r.items || [];
+      const fresh = await fetchList();
+      if (!fresh) return;
+      items = fresh;
       renderList();
       updatePill();
     } catch (e) {
@@ -344,7 +354,13 @@
     el.classList.toggle("hidden", !n);
   }
   async function refreshSavedPill() {
-    try { items = (await api("/api/saved-searches")).items || []; updatePill(); if ($("#view-saved.active")) renderList(); }
+    try {
+      const fresh = await fetchList();
+      if (!fresh) return;
+      items = fresh;
+      updatePill();
+      renderList();      // también oculta: al volver a la pestaña no se ve un instante la lista vieja
+    }
     catch { /* el contador es opcional */ }
   }
 

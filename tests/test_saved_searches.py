@@ -162,17 +162,18 @@ class SavedSearchesTest(unittest.TestCase):
         self.assertEqual(hits, it["total"])
         self.assertEqual(ss.check_all()["alerts"], [])
 
-    def test_tope_de_ids(self):
+    def test_tope_de_new_ids(self):
+        it = self.create()
+        self.upload([(self.sku(), f"Tope {i}", 3, CAT, 4, 10) for i in range(4)])
         old = ss.MAX_IDS
-        ss.MAX_IDS = 5
+        ss.MAX_IDS = 2
         try:
-            it = ss.create({"name": "Todo", "params": {}})
             with db.connect() as conn:
-                hits = conn.execute("SELECT COUNT(*) FROM saved_search_hits WHERE saved_search_id = ?",
-                                    (it["id"],)).fetchone()[0]
-            self.assertEqual(hits, 5)
-            self.assertGreater(it["total"], 5)
-            self.assertEqual(it["new"], 0)
+                ids = ss.new_ids(conn, it["id"], it["params"])
+                self.assertEqual(len(ids), 2)
+                self.assertEqual(ids, sorted(ids, reverse=True))      # los más recientes
+            _, lst = self.call("GET", "/api/saved-searches")
+            self.assertEqual(lst["items"][0]["new"], 4)                # el contador no se recorta
         finally:
             ss.MAX_IDS = old
 
@@ -212,9 +213,8 @@ class SavedSearchesTest(unittest.TestCase):
 
     def test_aviso_apagado_no_genera_alerta(self):
         it = self.create(notify=False)
-        with db.connect() as conn:          # sin búsquedas con aviso el hook ni siquiera marca pendiente
-            self.upload([(self.sku(), "Cama sin aviso", 3, CAT, 4, 10)])
-            self.assertIsNone(db._meta(conn, ss.PENDING_KEY))
+        self.upload([(self.sku(), "Cama sin aviso", 3, CAT, 4, 10)])
+        # La búsqueda sin aviso también registra sus coincidencias en la revisión, pero sin alertas
         self.assertEqual(ss.check_all(), {"checked": 0, "alerts": []})
         self.assertEqual(self.alerts_for(it["id"]), [])
         _, lst = self.call("GET", "/api/saved-searches")
@@ -311,6 +311,123 @@ class SavedSearchesTest(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertEqual(r["checked"], 1)
         self.assertEqual([a["saved_search_id"] for a in r["alerts"]], [it["id"]])
+
+    # ------------------------------------------------------------ regresiones de la revisión del PR #3
+    def test_reemplazo_de_csv_no_genera_falsos_nuevos(self):
+        """Hallazgo 1: con la ventana deslizante de los MAX_IDS ids más altos, al desaparecer los productos más
+        recientes entraban productos antiguos nunca registrados y se alertaban como nuevos."""
+        old = ss.MAX_IDS
+        ss.MAX_IDS = 5
+        try:
+            prov = "Prov Reemplazo"
+            self.upload([(f"RZ-{i}", f"Antiguo {i}", 3, CAT, 4, 10) for i in range(10)], supplier=prov)
+            it = self.create(name="Reemplazo")
+            self.assertEqual(it["new"], 0)
+            server.upload_csv({"supplier": prov, "replace": True,
+                               "csv": csv_rows([("RZ-0", "Antiguo 0", 3, CAT, 4, 10)])})
+            self.assertEqual(ss.check_all()["alerts"], [])
+            self.assertEqual(self.alerts_for(it["id"]), [])
+            _, lst = self.call("GET", "/api/saved-searches")
+            self.assertEqual(lst["items"][0]["new"], 0)
+            with db.connect() as conn:
+                self.assertEqual(ss.new_ids(conn, it["id"], it["params"]), [])
+        finally:
+            ss.MAX_IDS = old
+
+    def test_actualizar_productos_que_ya_cumplian_no_alerta_y_uno_que_empieza_a_cumplir_si(self):
+        prov = "Prov Actualiza"
+        self.upload([("UP-1", "Ya cumplía", 3, CAT, 4, 10), ("UP-2", "Sin stock antes", 3, CAT, 4, 0)], supplier=prov)
+        it = self.create(name="Actualiza")
+        # Se vuelve a subir: UP-1 sigue cumpliendo (no es nuevo); UP-2 vuelve a tener stock (sí es nuevo)
+        self.upload([("UP-1", "Ya cumplía", 3, CAT, 4, 12), ("UP-2", "Sin stock antes", 3, CAT, 4, 5)], supplier=prov)
+        alerts = ss.check_all()["alerts"]
+        self.assertEqual([a["title"] for a in alerts], ["Sin stock antes"])
+
+    def test_creaciones_concurrentes_respetan_tope_y_duplicados(self):
+        """Hallazgo 2: el tope de 50 y los duplicados se comprobaban fuera de la transacción de escritura."""
+        orig = ss._sync_fts
+
+        def slow(conn):                     # agranda la ventana entre comprobar e insertar
+            orig(conn)
+            time.sleep(0.2)
+        ss._sync_fts = slow
+        try:
+            def run(body, out):
+                try:
+                    out.append(ss.create(body)["id"])
+                except Exception as e:  # noqa: BLE001
+                    out.append(e)
+            out = []
+            ts = [threading.Thread(target=run, args=({"name": f"D{i}", "params": {"min_orders": 7}}, out))
+                  for i in range(3)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            self.assertEqual(sum(1 for x in out if isinstance(x, int)), 1, out)
+            self.assertTrue(all(getattr(x, "status", None) == 409 for x in out if not isinstance(x, int)))
+            for i in range(ss.MAX_SEARCHES - 2):
+                orig_create = {"name": f"C{i}", "params": {"min_orders": 100 + i}, "notify": False}
+                ss._sync_fts = orig
+                ss.create(orig_create)
+            ss._sync_fts = slow
+            out = []
+            ts = [threading.Thread(target=run, args=({"name": f"E{i}", "params": {"min_score": i}}, out))
+                  for i in range(3)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            with db.connect() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM saved_searches").fetchone()[0], ss.MAX_SEARCHES)
+        finally:
+            ss._sync_fts = orig
+
+    def test_borrar_durante_la_revision_no_la_rompe(self):
+        """Hallazgo 3: si se borraba una búsqueda entre la lectura de la lista y su INSERT en hits, fallaba la
+        FK y se perdía toda la revisión (500)."""
+        a = self.create(name="A", params={**PARAMS, "q": "cargador"})
+        b = self.create(name="B")
+        self.upload([(self.sku(), "Cargador para mascotas", 3, CAT, 4, 10)])
+        orig = ss._record_hits
+        state = {"t": None, "err": []}
+
+        def deleter():
+            try:
+                ss.delete(b["id"])
+            except Exception as e:  # noqa: BLE001
+                state["err"].append(e)
+
+        def patched(*args, **kw):
+            if state["t"] is None:          # el usuario borra B mientras se revisa
+                state["t"] = threading.Thread(target=deleter)
+                state["t"].start()
+                state["t"].join(1.0)        # sin bloqueo de escritura el borrado terminaría aquí
+            return orig(*args, **kw)
+        ss._record_hits = patched
+        try:
+            r = ss.check_all()
+        finally:
+            ss._record_hits = orig
+            if state["t"]:
+                state["t"].join()
+        self.assertEqual(r["checked"], 2)
+        self.assertEqual(len(self.alerts_for(a["id"])), 1)
+        self.assertEqual(state["err"], [])
+        with db.connect() as conn:          # el borrado se aplicó después de la revisión
+            self.assertIsNone(conn.execute("SELECT 1 FROM saved_searches WHERE id = ?", (b["id"],)).fetchone())
+
+    def test_numeros_enormes_dan_400(self):
+        """Hallazgo 4: min_orders=1e30 daba OverflowError al enlazarlo en SQLite (500)."""
+        for params in ({"min_orders": 1e30}, {"min_orders": 10 ** 30}, {"max_cost": 1e300},
+                       {"min_score": "9" * 40}, {"max_ship_days": 2 ** 63}):
+            st, r = self.call("POST", "/api/saved-searches", {"name": "x", "params": params})
+            self.assertEqual(st, 400, params)
+            self.assertIn("error", r)
+        st, _ = self.call("GET", "/api/saved-searches/preview?min_orders=1000000000000000000000000000000")
+        self.assertEqual(st, 400)
+        st, _ = self.call("POST", "/api/saved-searches", {"name": "ok", "params": {"min_orders": 2 ** 53}})
+        self.assertEqual(st, 200)
 
     # ------------------------------------------------------------ hilo en segundo plano
     def test_hilo_revisa_tras_el_commit(self):
