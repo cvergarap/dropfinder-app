@@ -4,9 +4,10 @@
 class ApiError(Exception):
     """Error con código HTTP; el servidor responde {"error": mensaje} con ese código."""
 
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, code: str | None = None):
         super().__init__(message)
         self.status = status
+        self.code = code          # identificador estable para que la interfaz distinga casos con el mismo estado (409…)
 
 
 class FileResponse:

@@ -903,7 +903,10 @@ class Handler(SimpleHTTPRequestHandler):
                     return result.status, result.data, {}
                 return 200, result, {}
             except ApiError as e:
-                return e.status, {"error": str(e)}, getattr(e, "headers", None) or {}
+                payload = {"error": str(e)}
+                if getattr(e, "code", None):
+                    payload["code"] = e.code
+                return e.status, payload, getattr(e, "headers", None) or {}
             except (json.JSONDecodeError, UnicodeDecodeError):
                 return 400, {"error": "JSON inválido"}, {}
             except OverflowError:              # ids enormes (/api/users/99999999999999999999…)

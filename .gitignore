@@ -1,3 +1,7 @@
 __pycache__/
 *.db
 *.zip
+*.key
+*.db-wal
+*.db-shm
+*.db-journal
