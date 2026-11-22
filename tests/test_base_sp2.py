@@ -10,6 +10,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 os.environ.setdefault("DROPFINDER_DB", os.path.join(tempfile.mkdtemp(), "test.db"))
 
+import authtest  # noqa: E402,F401  (contexto y sesión del propietario)
 import db  # noqa: E402
 import hooks  # noqa: E402
 import search  # noqa: E402
@@ -104,7 +105,7 @@ class MigrationV4Test(unittest.TestCase):
             conn.close()
             db.init_db()
             with db.connect() as c:
-                self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 4)
+                self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
                 self.assertEqual(c.execute("PRAGMA foreign_key_check").fetchall(), [])
         finally:
             tmp.close()
@@ -126,3 +127,75 @@ class MigrationV4Test(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MigrationV5Test(unittest.TestCase):
+    """Revisión del PR #6: una migración v5 interrumpida no debe impedir el siguiente arranque."""
+
+    def _as_v4(self):
+        conn = sqlite3.connect(db.DB_PATH)
+        conn.executescript("""
+            PRAGMA foreign_keys = OFF;
+            CREATE TABLE imp_old (id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL UNIQUE REFERENCES products(id),
+              title TEXT NOT NULL, sell_price REAL NOT NULL, last_cost REAL NOT NULL, last_stock INTEGER NOT NULL,
+              status TEXT NOT NULL DEFAULT 'draft', created_at TEXT NOT NULL);
+            INSERT INTO imp_old SELECT id, product_id, title, sell_price, last_cost, last_stock, status, created_at
+              FROM imported_products;
+            DROP TABLE imported_products;
+            ALTER TABLE imp_old RENAME TO imported_products;
+            PRAGMA user_version = 4;
+        """)
+        conn.close()
+
+    def test_failed_migration_can_be_retried(self):
+        tmp = _TempDb()
+        try:
+            db.init_db(seed_size=20)
+            with db.connect() as conn:
+                conn.execute("INSERT INTO imported_products(product_id, title, sell_price, last_cost, last_stock, "
+                             "created_at) VALUES (1, 'x', 10, 1, 1, '2026-01-01')")
+            self._as_v4()
+            original = db._check_fk
+            db._check_fk = lambda conn: (_ for _ in ()).throw(sqlite3.OperationalError("disco lleno (simulado)"))
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    db.init_db()
+            finally:
+                db._check_fk = original
+            db.init_db()                                   # el reintento debe funcionar
+            with db.connect() as conn:
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+                self.assertIsNone(conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name = 'imported_products_v5'").fetchone())
+                self.assertEqual(conn.execute("SELECT COUNT(*), MIN(user_id) FROM imported_products").fetchone()[:],
+                                 (1, 1))
+        finally:
+            tmp.close()
+
+    def test_user_ids_are_never_reused(self):
+        tmp = _TempDb()
+        try:
+            db.init_db(seed_size=5)
+            with db.connect() as conn:
+                for e in ("a@x.co", "b@x.co"):
+                    conn.execute("INSERT INTO users(email, name, password_hash, created_at) VALUES (?, 'n', 'h', 'x')", (e,))
+                conn.execute("DELETE FROM users WHERE email = 'b@x.co'")
+                conn.execute("INSERT INTO users(email, name, password_hash, created_at) VALUES ('c@x.co', 'n', 'h', 'x')")
+                self.assertEqual(conn.execute("SELECT id FROM users WHERE email = 'c@x.co'").fetchone()[0], 3)
+        finally:
+            tmp.close()
+
+
+class AuthContextTest(unittest.TestCase):
+    def test_no_context_means_no_user(self):
+        import auth_context
+        prev = (getattr(auth_context._local, "user_id", None), getattr(auth_context._local, "role", None))
+        self.addCleanup(auth_context.set_current, *prev)      # las demás pruebas usan el contexto de authtest
+        auth_context.clear()
+        with self.assertRaises(auth_context.NoUserContext):
+            auth_context.current_user_id()
+        self.assertIsNone(auth_context.current_role())
+        with auth_context.as_user(5, "member"):
+            self.assertEqual((auth_context.current_user_id(), auth_context.current_role()), (5, "member"))
+        with self.assertRaises(auth_context.NoUserContext):
+            auth_context.current_user_id()

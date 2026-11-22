@@ -39,6 +39,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
+import auth_context
 import db
 import hooks
 import search
@@ -46,7 +47,7 @@ from errors import ApiError
 
 log = logging.getLogger("dropfinder.saved_searches")
 
-MAX_SEARCHES = 50            # búsquedas guardadas por instalación
+MAX_SEARCHES = 50            # búsquedas guardadas por usuario
 MAX_NAME = 80
 MAX_IDS = 5_000              # productos coincidentes considerados por búsqueda (los más recientes)
 MAX_ALERTS_PER_CHECK = 5     # alertas individuales por búsqueda y revisión (+ 1 de resumen)
@@ -335,6 +336,42 @@ def _count_new(conn, sid: int, params: dict) -> int:
     return conn.execute(f"SELECT COUNT(*) {frm}", args).fetchone()[0]
 
 
+def new_counts(conn, user_id: int) -> dict[int, int]:
+    """API pública: {id de búsqueda guardada: productos nuevos} de las búsquedas del usuario, con la misma
+    definición de "nuevo" que el contador de la pestaña. Solo lee (no crea tablas: si la tabla de
+    candidatos aún no existe, no hay candidatos pendientes). En caché hasta que cambie el catálogo, una
+    búsqueda guardada, sus coincidencias o sus marcas de "visto"."""
+    rows = conn.execute("SELECT id, params FROM saved_searches WHERE user_id = ? ORDER BY id", (user_id,)).fetchall()
+    if not rows:
+        return {}
+    sids = [r["id"] for r in rows]
+    marks = {r[0]: r[1] for r in conn.execute(
+        f"SELECT key, value FROM meta WHERE key IN ({','.join('?' * len(sids))})", [f"{SEEN_PREFIX}{i}" for i in sids])}
+    pending = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'saved_search_pending'").fetchone()
+    pend_sig = conn.execute("SELECT COUNT(*), MAX(product_id) FROM saved_search_pending").fetchone()[:] if pending else None
+    hits_sig = conn.execute(f"SELECT COUNT(*), MAX(first_seen_at) FROM saved_search_hits "
+                            f"WHERE saved_search_id IN ({','.join('?' * len(sids))})", sids).fetchone()[:]
+    hwm = _hwm(conn)
+    key = repr(("saved:new_counts", db.DB_PATH, user_id, tuple((r["id"], r["params"]) for r in rows),
+                tuple(sorted(marks.items())), pend_sig, hits_sig, hwm))
+    cand = _CAND if pending else "p.id > ?"
+
+    def build():
+        out = {}
+        for r in rows:
+            try:
+                params = json.loads(r["params"])
+            except ValueError:
+                out[r["id"]] = 0
+                continue
+            sid = r["id"]
+            frm, args = _match_sql(conn, params, [f"({_HIT_AFTER} OR ({cand} AND {_NOT_HIT}))"],
+                                   [sid, marks.get(f"{SEEN_PREFIX}{sid}", ""), hwm, sid])
+            out[sid] = conn.execute(f"SELECT COUNT(*) {frm}", args).fetchone()[0]
+        return out
+    return dict(search.cached(key, build))
+
+
 def _record_hits(conn, sid: int, params: dict, candidates_only: bool = True) -> tuple[str, int]:
     """Agrega a hits las coincidencias que aún no estaban: solo candidatos (revisión, marcar visto) o todas
     (al crear la búsqueda: línea base completa, así nada que ya cumplía se alerta después al actualizarse).
@@ -358,7 +395,9 @@ def _mark_seen(conn, sid: int, params: dict) -> None:
 # ---------------------------------------------------------------- vista
 
 def _row(conn, sid: int):
-    r = conn.execute("SELECT * FROM saved_searches WHERE id = ?", (sid,)).fetchone()
+    """Búsqueda guardada del usuario de la petición; 404 si no existe o es de otro usuario."""
+    r = conn.execute("SELECT * FROM saved_searches WHERE id = ? AND user_id = ?",
+                     (sid, auth_context.current_user_id())).fetchone()
     if not r:
         raise _error(404, "Búsqueda guardada no encontrada")
     return r
@@ -392,7 +431,8 @@ def list_saved(qs=None, body=None) -> dict:
     _ensure_worker()
     with _open() as conn:
         _sync_fts(conn)
-        rows = conn.execute("SELECT * FROM saved_searches ORDER BY created_at DESC, id DESC").fetchall()
+        rows = conn.execute("SELECT * FROM saved_searches WHERE user_id = ? ORDER BY created_at DESC, id DESC",
+                            (auth_context.current_user_id(),)).fetchall()
         return {"items": [_view(conn, r) for r in rows], "max": MAX_SEARCHES}
 
 
@@ -421,19 +461,20 @@ def create(body: dict) -> dict:
     if not isinstance(notify, bool):
         raise _error(400, "notify debe ser true o false")
     canon = json.dumps(params, sort_keys=True, ensure_ascii=False)
+    uid = auth_context.current_user_id()
     with _open() as conn:
         _sync_fts(conn)
         # Tope y duplicados se comprueban con el bloqueo de escritura tomado: dos POST simultáneos se serializan
         conn.execute("BEGIN IMMEDIATE")
-        n = conn.execute("SELECT COUNT(*) FROM saved_searches").fetchone()[0]
+        n = conn.execute("SELECT COUNT(*) FROM saved_searches WHERE user_id = ?", (uid,)).fetchone()[0]
         if n >= MAX_SEARCHES:
             raise _error(409, f"Llegaste al máximo de {MAX_SEARCHES} búsquedas guardadas. Elimina alguna.")
-        for r in conn.execute("SELECT name, params FROM saved_searches"):
+        for r in conn.execute("SELECT name, params FROM saved_searches WHERE user_id = ?", (uid,)):
             if json.dumps(json.loads(r["params"]), sort_keys=True, ensure_ascii=False) == canon:
                 raise _error(409, f"Ya tienes esta búsqueda guardada como «{r['name']}»")
         ts = db.now()
-        sid = conn.execute("INSERT INTO saved_searches(name, params, notify, created_at, last_checked_at) "
-                           "VALUES (?, ?, ?, ?, ?)", (name, canon, int(notify), ts, ts)).lastrowid
+        sid = conn.execute("INSERT INTO saved_searches(user_id, name, params, notify, created_at, last_checked_at) "
+                           "VALUES (?, ?, ?, ?, ?, ?)", (uid, name, canon, int(notify), ts, ts)).lastrowid
         _record_hits(conn, sid, params, candidates_only=False)    # lo que ya existe no genera alertas
         conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)", (HWM_KEY, str(_max_id(conn))))
         _mark_seen(conn, sid, params)
@@ -488,7 +529,8 @@ def mark_seen(sid: int) -> dict:
     with _open() as conn:
         params = json.loads(_row(conn, sid)["params"])
         _mark_seen(conn, sid, params)
-        conn.execute("UPDATE alerts SET read = 1 WHERE saved_search_id = ?", (sid,))
+        conn.execute("UPDATE alerts SET read = 1 WHERE saved_search_id = ? AND user_id = ?",
+                     (sid, auth_context.current_user_id()))
         return _view(conn, _row(conn, sid))
 
 
@@ -503,24 +545,26 @@ def _alert_message(name: str, p) -> str:
             f"envío {days} día{'' if days == 1 else 's'})")
 
 
-def check_all() -> dict:
+def check_all(only_user: int | None = None) -> dict:
     """Revisa los candidatos (productos informados por el hook o con id nuevo) contra todas las búsquedas:
     los que cumplen y nunca cumplieron antes se registran en hits; en las búsquedas con aviso se crean
     alertas (hasta MAX_ALERTS_PER_CHECK, las de mejor score, + una de resumen con el resto).
+    Corre fuera de una petición (hilo de fondo): cada alerta lleva el user_id de su búsqueda, nunca el
+    del contexto. La respuesta incluye todas, o solo las búsquedas/alertas de `only_user` si se indica.
 
     Toda la revisión corre con el bloqueo de escritura tomado (BEGIN IMMEDIATE): las búsquedas se leen ya
     bloqueadas, así que no pueden borrarse a mitad de la revisión."""
-    created, checked = [], 0
+    created, checked = [], []
     with _check_lock, _open() as conn:
         _sync_fts(conn)
         conn.execute("BEGIN IMMEDIATE")
         top_id = _max_id(conn)
         for r in conn.execute("SELECT * FROM saved_searches ORDER BY id").fetchall():
-            sid, name = r["id"], r["name"]
+            sid, name, owner = r["id"], r["name"], r["user_id"]
             ts, n = _record_hits(conn, sid, json.loads(r["params"]))
             if not r["notify"]:
                 continue
-            checked += 1
+            checked.append(owner)
             if n:
                 top = conn.execute(
                     "SELECT p.id, p.title, p.margin, p.shipping_days FROM saved_search_hits h "
@@ -529,27 +573,32 @@ def check_all() -> dict:
                 now = db.now()
                 for p in top:
                     msg = _alert_message(name, p)
-                    conn.execute("INSERT INTO alerts(saved_search_id, product_id, type, message, created_at) "
-                                 "VALUES (?, ?, 'saved_search_new', ?, ?)", (sid, p["id"], msg, now))
-                    created.append({"saved_search_id": sid, "product_id": p["id"], "title": p["title"],
+                    conn.execute("INSERT INTO alerts(user_id, saved_search_id, product_id, type, message, created_at) "
+                                 "VALUES (?, ?, ?, 'saved_search_new', ?, ?)", (owner, sid, p["id"], msg, now))
+                    created.append({"user_id": owner, "saved_search_id": sid, "product_id": p["id"], "title": p["title"],
                                     "type": "saved_search_new", "message": msg})
                 rest = n - len(top)
                 if rest > 0:
                     msg = f"…y {_num_es(rest)} producto{'' if rest == 1 else 's'} nuevo{'' if rest == 1 else 's'} más para «{name}»"
-                    conn.execute("INSERT INTO alerts(saved_search_id, type, message, created_at) "
-                                 "VALUES (?, 'saved_search_new', ?, ?)", (sid, msg, now))
-                    created.append({"saved_search_id": sid, "product_id": None, "title": name,
+                    conn.execute("INSERT INTO alerts(user_id, saved_search_id, type, message, created_at) "
+                                 "VALUES (?, ?, 'saved_search_new', ?, ?)", (owner, sid, msg, now))
+                    created.append({"user_id": owner, "saved_search_id": sid, "product_id": None, "title": name,
                                     "type": "saved_search_new", "message": msg})
             conn.execute("UPDATE saved_searches SET last_checked_at = ? WHERE id = ?", (db.now(), sid))
         # Candidatos consumidos (con el bloqueo tomado ningún escritor pudo agregar otros entretanto)
         conn.execute("DELETE FROM saved_search_pending")
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (HWM_KEY, str(top_id)))
-    return {"checked": checked, "alerts": created}
+    if only_user is not None:
+        checked = [u for u in checked if u == only_user]
+        created = [a for a in created if a["user_id"] == only_user]
+    return {"checked": len(checked), "alerts": [{k: v for k, v in a.items() if k != "user_id"} for a in created]}
 
 
 def check_now() -> dict:
+    """Revisión pedida por un usuario: revisa todo (es la misma revisión del hilo de fondo) pero solo
+    informa sus búsquedas y sus alertas."""
     _ensure_worker()
-    return check_all()
+    return check_all(only_user=auth_context.current_user_id())
 
 
 # ---------------------------------------------------------------- hook + hilo en segundo plano

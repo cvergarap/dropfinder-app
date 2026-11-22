@@ -15,6 +15,7 @@ from datetime import date, timedelta
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 os.environ.setdefault("DROPFINDER_DB", os.path.join(tempfile.mkdtemp(), "test.db"))
 
+import authtest  # noqa: E402,F401  (contexto y sesión del propietario)
 import db  # noqa: E402
 import history  # noqa: E402
 import search  # noqa: E402
@@ -256,7 +257,7 @@ class ApiHistoryTest(unittest.TestCase):
 
     def get(self, path):
         try:
-            with urllib.request.urlopen(self.base + path) as r:
+            with urllib.request.urlopen(urllib.request.Request(self.base + path, headers=authtest.auth_headers())) as r:
                 return r.status, json.load(r)
         except urllib.error.HTTPError as e:
             with e:

@@ -596,9 +596,11 @@
       const v = r[c.key];
       const isBest = c.key in best && v === best[c.key];
       const meter = c.key === "reliability"
-        ? `<span class="hx-meter" aria-hidden="true"><span style="width:${Math.max(0, Math.min(100, v))}%"></span></span>` : "";
+        ? `<span class="hx-meter" aria-hidden="true"><span data-w="${Math.max(0, Math.min(100, Number(v) || 0))}"></span></span>` : "";
       return `<td class="num${isBest ? " hx-best" : ""}">${meter}${c.f(v)}${isBest ? `<span class="sr-only"> (mejor)</span>` : ""}</td>`;
     }).join("")}</tr>`).join("");
+    // Ancho por CSSOM: la CSP (style-src 'self') bloquea los atributos style en el HTML
+    $$(".hx-sup-table .hx-meter span[data-w]").forEach((s) => { s.style.width = `${s.dataset.w}%`; });
     $("#hxFormula").textContent = `Confiabilidad = ${data.formula}. Envío: 2 días o menos = 1, 25 o más = 0. ` +
       "Rating: 3 = 0, 5 = 1. Estabilidad = 1 − % de productos que cambiaron de costo en los últimos 30 días del historial.";
   }

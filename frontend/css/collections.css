@@ -1,0 +1,130 @@
+/* Estilos del módulo collections (ver js/collections.js). Usa los tokens de styles.css (modo oscuro incluido). */
+
+/* Paleta de colecciones (mismos nombres que collections_mod.COLORS). Oscuro: tonos más claros. */
+:root {
+  --coll-indigo: #4f46e5; --coll-teal: #0f766e; --coll-green: #15803d; --coll-amber: #b45309;
+  --coll-orange: #c2410c; --coll-rose: #be123c; --coll-violet: #7c3aed; --coll-slate: #475569;
+  --coll-fav: #e11d48;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    --coll-indigo: #818cf8; --coll-teal: #2dd4bf; --coll-green: #4ade80; --coll-amber: #fbbf24;
+    --coll-orange: #fb923c; --coll-rose: #fb7185; --coll-violet: #a78bfa; --coll-slate: #94a3b8;
+    --coll-fav: #fb7185;
+  }
+}
+:root[data-theme="dark"] {
+  --coll-indigo: #818cf8; --coll-teal: #2dd4bf; --coll-green: #4ade80; --coll-amber: #fbbf24;
+  --coll-orange: #fb923c; --coll-rose: #fb7185; --coll-violet: #a78bfa; --coll-slate: #94a3b8;
+  --coll-fav: #fb7185;
+}
+.c-indigo { --c: var(--coll-indigo); } .c-teal { --c: var(--coll-teal); } .c-green { --c: var(--coll-green); }
+.c-amber { --c: var(--coll-amber); } .c-orange { --c: var(--coll-orange); } .c-rose { --c: var(--coll-rose); }
+.c-violet { --c: var(--coll-violet); } .c-slate { --c: var(--coll-slate); }
+
+/* ---- Tarjeta de producto: botón ♡ arriba a la derecha del cuerpo ---- */
+.card .body { position: relative; }
+.card .body:has(.fav-toggle) .title { padding-right: 30px; }
+.fav-toggle { position: absolute; top: 6px; right: 6px; width: 30px; height: 30px; display: grid; place-items: center;
+  border: 1px solid transparent; border-radius: 999px; background: none; color: var(--muted); font-size: 18px;
+  line-height: 1; cursor: pointer; padding: 0; }
+.fav-toggle:hover, .fav-toggle:focus-visible { color: var(--coll-fav); border-color: var(--border); background: var(--chip); }
+.fav-toggle[aria-pressed="true"] { color: var(--coll-fav); }
+.fav-toggle:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+
+/* ---- Botones de exportar (cabecera de resultados y Mis productos) ---- */
+.coll-export-btn { padding: 5px 12px !important; font-size: 13px; white-space: nowrap; }
+.results-head .coll-export-btn { color: var(--primary); }
+.results-head .coll-export-btn:hover { background: var(--chip); }
+#view-imports .section-head > .coll-export-btn { margin-left: auto; align-self: flex-end; padding: 8px 14px !important; }
+
+/* ---- Diálogos ---- */
+.coll-dialog { max-width: 480px; }
+.coll-form { padding: 18px; display: flex; flex-direction: column; gap: 10px; }
+.coll-form h2 { font-size: 18px; overflow-wrap: anywhere; }
+.coll-form .field { margin: 0; font-size: 13px; }
+.coll-form .field input { width: 100%; }
+.coll-form .small { font-size: 12px; }
+.coll-opts, .coll-colors { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px 10px; margin: 0; min-width: 0; }
+.coll-opts legend, .coll-colors legend { font-size: 12px; color: var(--muted); padding: 0 4px; }
+.coll-opts label { display: flex; gap: 8px; align-items: flex-start; padding: 4px 0; cursor: pointer; }
+.coll-opts input { margin-top: 3px; flex: none; }
+.coll-opts input:disabled + span { opacity: .55; }
+.coll-dlg-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; align-items: center; }
+.coll-error { margin: 0; font-size: 13px; }
+.coll-colors { display: flex; gap: 8px; flex-wrap: wrap; }
+.coll-swatch { position: relative; width: 28px; height: 28px; border-radius: 999px; background: var(--c); cursor: pointer; }
+.coll-swatch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+.coll-swatch:has(input:checked) { box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--c); }
+.coll-swatch:has(input:focus-visible) { outline: 2px solid var(--primary); outline-offset: 4px; }
+
+/* ---- Detalle: "Guardar en colección" ---- */
+.coll-sec { border-top: 1px solid var(--border); padding-top: 10px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.coll-checks { display: flex; flex-direction: column; gap: 2px; max-height: 260px; overflow: auto; }
+.coll-check { display: flex; gap: 8px; align-items: center; padding: 3px 0; cursor: pointer; min-width: 0; }
+.coll-check-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.coll-check small { margin-left: auto; flex: none; }
+.coll-dot { display: inline-block; flex: none; width: 10px; height: 10px; border-radius: 999px; background: var(--c, var(--primary)); }
+.coll-inline-new { display: flex; gap: 6px; }
+.coll-inline-new input { flex: 1; min-width: 0; }
+.coll-check-row { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.coll-row-note { display: block; padding-left: 24px; margin-bottom: 4px; }
+.coll-row-note textarea { font-size: 13px; min-height: 30px; }
+.coll-dialog code { font-size: 12px; }
+.coll-row-note textarea, .coll-note textarea { font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  padding: 6px 10px; resize: vertical; width: 100%; }
+
+/* ---- Pestaña Colecciones ---- */
+.coll-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 220px), 1fr)); gap: 14px; }
+.coll-card { background: var(--surface); border: 1px solid var(--border); border-top: 4px solid var(--c); border-radius: var(--radius);
+  overflow: hidden; cursor: pointer; display: flex; flex-direction: column; min-width: 0; transition: box-shadow .15s; }
+.coll-card:hover { box-shadow: 0 6px 20px rgb(0 0 0 / .08); }
+.coll-mosaic { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: repeat(2, minmax(0, 1fr)); gap: 2px; aspect-ratio: 2 / 1.2; background: var(--border); }
+.coll-cell { display: block; overflow: hidden; background: var(--chip); min-height: 0; }
+.coll-cell img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.coll-cell.empty-cell { background: color-mix(in srgb, var(--c) 10%, var(--surface)); }
+.coll-card-body { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.coll-open { background: none; border: 0; padding: 0; font: inherit; font-weight: 700; color: var(--text); cursor: pointer; text-align: left;
+  overflow-wrap: anywhere; }
+.coll-open:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-radius: 4px; }
+.coll-desc { font-size: 13px; overflow-wrap: anywhere; }
+.coll-card .small, .coll-sec .small { font-size: 12px; }
+.coll-empty { margin-top: 14px; background: var(--surface); border: 1px dashed var(--border); border-radius: var(--radius);
+  padding: 24px 20px; text-align: center; display: flex; flex-direction: column; gap: 8px; align-items: center; }
+.coll-empty p { margin: 0; max-width: 560px; }
+
+/* Una colección abierta */
+.coll-back { margin-bottom: 8px; }
+.coll-head h2 { display: flex; align-items: center; gap: 8px; overflow-wrap: anywhere; }
+.coll-head h2 .coll-dot { width: 14px; height: 14px; }
+.coll-head-text { min-width: 0; }
+.coll-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.coll-items { display: flex; flex-direction: column; gap: 10px; }
+.coll-item { display: grid; grid-template-columns: 72px 1fr auto; gap: 12px; align-items: start; background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 10px; min-width: 0; }
+.coll-thumb { padding: 0; border: 0; border-radius: 8px; overflow: hidden; cursor: pointer; width: 72px; height: 72px; background: var(--chip); }
+.coll-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.coll-item-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.coll-title { text-align: left; font-weight: 600; color: var(--text) !important; overflow-wrap: anywhere; }
+.coll-title:hover { color: var(--primary) !important; text-decoration: underline; }
+.coll-kpis { display: flex; gap: 4px 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+.coll-kpis b { color: var(--text); white-space: nowrap; }
+.coll-kpis b.good { color: var(--good); } .coll-kpis b.bad { color: var(--bad); }
+.coll-note { display: block; }
+.coll-note textarea { font-size: 13px; min-height: 32px; }
+.coll-remove { color: var(--bad) !important; font-size: 13px; padding: 4px 0 !important; }
+.chip.bad { color: var(--bad); }
+
+@media (max-width: 520px) {
+  .coll-item { grid-template-columns: 56px 1fr; }
+  .coll-thumb { width: 56px; height: 56px; }
+  .coll-remove { grid-column: 2; justify-self: start; }
+  .coll-actions { width: 100%; }
+  .coll-actions select { flex: 1 1 100%; }
+  .coll-actions button { flex: 1 1 auto; }
+  .results-head .coll-export-btn { margin-left: 0; }
+  #view-imports .section-head > .coll-export-btn { margin-left: 0; }
+  .coll-inline-new { flex-wrap: wrap; }
+  .coll-inline-new input { flex-basis: 100%; }
+  .coll-inline-new button { flex: 1 1 auto; }
+}

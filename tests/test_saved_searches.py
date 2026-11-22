@@ -14,6 +14,8 @@ import urllib.request
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 os.environ.setdefault("DROPFINDER_DB", os.path.join(tempfile.mkdtemp(), "test.db"))
 
+import authtest  # noqa: E402,F401  (contexto y sesión del propietario)
+import auth_context  # noqa: E402
 import db  # noqa: E402
 import saved_searches as ss  # noqa: E402
 import search  # noqa: E402
@@ -74,7 +76,7 @@ class SavedSearchesTest(unittest.TestCase):
     def call(self, method, path, body=None):
         req = urllib.request.Request(f"{self.base}{path}", method=method,
                                      data=json.dumps(body).encode() if body is not None else None,
-                                     headers={"Content-Type": "application/json"})
+                                     headers={"Content-Type": "application/json", **authtest.auth_headers()})
         try:
             with urllib.request.urlopen(req) as r:
                 return r.status, json.load(r)
@@ -354,7 +356,8 @@ class SavedSearchesTest(unittest.TestCase):
         try:
             def run(body, out):
                 try:
-                    out.append(ss.create(body)["id"])
+                    with auth_context.as_user(1, "owner"):          # hilo nuevo: sin contexto heredado
+                        out.append(ss.create(body)["id"])
                 except Exception as e:  # noqa: BLE001
                     out.append(e)
             out = []
@@ -394,7 +397,8 @@ class SavedSearchesTest(unittest.TestCase):
 
         def deleter():
             try:
-                ss.delete(b["id"])
+                with auth_context.as_user(1, "owner"):          # hilo nuevo: sin contexto heredado
+                    ss.delete(b["id"])
             except Exception as e:  # noqa: BLE001
                 state["err"].append(e)
 

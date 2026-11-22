@@ -19,6 +19,8 @@ from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import auth  # noqa: E402
+import auth_context  # noqa: E402
 import db  # noqa: E402
 import search  # noqa: E402
 import server  # noqa: E402
@@ -38,8 +40,12 @@ QUERIES = [
 ]
 
 
+_cookie: dict = {}
+
+
 def _get(base: str, path: str) -> dict:
-    with urllib.request.urlopen(base + path) as r:
+    req = urllib.request.Request(base + path, headers={"Cookie": _cookie["value"]} if _cookie else {})
+    with urllib.request.urlopen(req) as r:
         return json.load(r)
 
 
@@ -52,6 +58,12 @@ def bench(size: int, runs: int) -> list[tuple[str, float, int]]:
         t0 = time.perf_counter()
         db.init_db(seed_size=size)
         seed_ms = (time.perf_counter() - t0) * 1000
+        # Las rutas exigen sesión: se crea un propietario y una sesión temporales solo para medir
+        with db.connect() as conn:
+            uid = auth.create_first_owner(conn, "bench@local.test", "Bench", auth.hash_password("clave-bench-12345"))
+            token, _csrf = auth.create_session(conn, uid)
+        _cookie["value"] = f"{auth.COOKIE_NAME}={token}"
+        auth_context.set_current(uid, "owner")      # server.update_settings se llama directo, sin HTTP
         srv = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         base = f"http://127.0.0.1:{srv.server_address[1]}"
         threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -77,6 +89,8 @@ def bench(size: int, runs: int) -> list[tuple[str, float, int]]:
         if srv:
             srv.shutdown()
             srv.server_close()
+        auth_context.clear()
+        _cookie.clear()
         db.DB_PATH = old_path
         search.invalidate()
         shutil.rmtree(tmp, ignore_errors=True)
