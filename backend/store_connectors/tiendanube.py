@@ -265,7 +265,7 @@ class TiendanubeConnector(StoreConnector):
         if found:
             raise bad                                            # varios ids distintos en rutas de panel
         # Texto libre: todos los números que aparezcan deben ser el MISMO id (sin signo negativo)
-        if re.match(r"^[a-z][a-z0-9+.-]*:", s, re.I) and not re.match(r"^https?://", s, re.I):
+        if re.match(r"^[a-z][a-z0-9+.-]*:\S", s, re.I) and not re.match(r"^https?://", s, re.I):
             raise bad                                            # javascript:…, data:…, ftp:…
         if re.search(r"-\s*[0-9]", s):
             raise bad
