@@ -1091,6 +1091,7 @@ class InlineTimeBudgetTest(Base):
             self.conn().publish(self.product())
         self.assertLessEqual(sum(self.sleeps), shopify.MAX_INLINE_SLEEP)
         self.assertLessEqual(shopify.CLEANUP_DEADLINE, 6.0)
+        self.assertEqual(self.fake.ops().count("productDelete"), 1)          # presupuesto agotado: sin reintentos inútiles
 
     def test_total_timeout_passed_to_shared_client(self):
         seen = []
