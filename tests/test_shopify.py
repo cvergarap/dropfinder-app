@@ -16,6 +16,7 @@ import store_connectors as sc  # noqa: E402
 from store_connectors import shopify  # noqa: E402
 from store_connectors.base import (ListingRef, StoreAuthError, StoreError, StoreNotFound, StoreProduct,  # noqa: E402
                                    StoreRateLimited, StoreValidationError)
+from store_connectors import http as shttp  # noqa: E402
 from fake_shopify import FakeShopify  # noqa: E402
 
 SHOP = "mitienda.myshopify.com"
@@ -38,6 +39,8 @@ class Base(unittest.TestCase):
         shopify.clear_caches()
         self.addCleanup(shopify.clear_caches)
         self.addCleanup(self.fake.stop)
+        old_loop, shttp.ALLOW_LOOPBACK = shttp.ALLOW_LOOPBACK, True          # solo para el servidor falso local
+        self.addCleanup(lambda: setattr(shttp, "ALLOW_LOOPBACK", old_loop))
 
     def conn(self, mode="token", settings=None, token=TOKEN):
         creds = {"access_token": token} if mode == "token" else {"client_id": CID, "client_secret": CSECRET}
@@ -382,6 +385,67 @@ class ErrorMappingTest(Base):
         self.fake.cost_available = 0
         self.conn().validate()
         self.assertLessEqual(max(self.sleeps), shopify.MAX_PACE_SLEEP)
+
+
+class SharedClientTest(Base):
+    """El conector usa el cliente compartido: sin él no hay IP fijada ni filtros anti-SSRF."""
+
+    def _real(self):
+        shttp.ALLOW_LOOPBACK = False
+        return mock.patch.object(C, "ADMIN_URL_TEMPLATE", "https://{shop}/admin/api/{version}/graphql.json")
+
+    def test_private_resolution_refused(self):
+        for ip in ("10.0.0.5", "127.0.0.1", "169.254.169.254", "192.168.1.9", "::1", "::ffff:10.0.0.1", "100.64.0.1"):
+            fam = 10 if ":" in ip else 2
+            with self._real(), mock.patch("socket.getaddrinfo", return_value=[(fam, 1, 6, "", (ip, 443))]):
+                with self.assertRaises(StoreError, msg=ip) as cm:
+                    self.conn().validate()
+            self.assertFalse(cm.exception.retryable)
+        self.assertEqual(self.fake.requests, [])
+
+    def test_mixed_resolution_refused(self):
+        with self._real(), mock.patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("8.8.8.8", 443)),
+                                                                          (2, 1, 6, "", ("10.0.0.1", 443))]):
+            with self.assertRaises(StoreError):
+                self.conn().validate()
+
+    def test_non_443_port_refused(self):
+        shttp.ALLOW_LOOPBACK = False
+        with mock.patch.object(C, "ADMIN_URL_TEMPLATE", "https://{shop}:8443/admin/api/{version}/graphql.json"):
+            with mock.patch("socket.getaddrinfo") as gai:
+                with self.assertRaises(StoreError):
+                    self.conn().validate()
+        gai.assert_not_called()
+
+    def test_plain_http_refused_without_loopback_flag(self):
+        shttp.ALLOW_LOOPBACK = False
+        with self.assertRaises(StoreError) as cm:
+            self.conn().validate()                               # la plantilla de prueba es http://127.0.0.1
+        self.assertFalse(cm.exception.retryable)
+        self.assertEqual(self.fake.requests, [])
+        with mock.patch.object(C, "ADMIN_URL_TEMPLATE", "http://{shop}/admin/api/{version}/graphql.json"):
+            with self.assertRaises(StoreError):
+                self.conn().validate()
+
+    def test_redirect_refused(self):
+        self.fake.inject("redirect")
+        with self.assertRaises(StoreError) as cm:
+            self.conn().validate()
+        self.assertFalse(cm.exception.retryable)
+        self.assertEqual(self.fake.evil_hits, 0)
+
+    def test_shopify_text_is_scrubbed(self):
+        evil = f"boom {CSECRET} shpat_abcdefghijklmnop0123\x07 fin"
+        for body in ({"errors": [{"message": evil}]},
+                     {"data": {"productCreate": {"product": None, "userErrors": [{"field": ["title"], "message": evil}]}}}):
+            with mock.patch.object(C, "_post", return_value=(200, body, {})):
+                with self.assertRaises(StoreError) as cm:
+                    self.conn(settings={"location_id": "gid://shopify/Location/1"}).publish(self.product()) if "data" in body else self.conn()._graphql("query{x}")
+            text = str(cm.exception)
+            self.assertIn("boom", text)
+            self.assertNotIn(CSECRET, text)
+            self.assertNotIn("shpat_abcdefghijklmnop0123", text)
+            self.assertNotIn("\x07", text)
 
 
 class TokenCacheTest(Base):

@@ -32,21 +32,16 @@ from __future__ import annotations
 
 import hashlib
 import html
-import http.client
 import json
 import logging
 import os
 import re
-import socket
-import ssl
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
-from . import register
+from . import http as shttp, register, scrub
 from .base import (ListingRef, StoreAuthError, StoreConnector, StoreError, StoreInfo, StoreNotFound,
                    StoreProduct, StoreRateLimited, StoreValidationError)
 
@@ -61,7 +56,6 @@ REQUIRED_SCOPES = ("write_products", "write_inventory", "read_locations")
 TOKEN_HEADER = "X-Shopify-Access-Token"
 USER_AGENT = "DropFinder/1.0"
 TIMEOUT = 20.0                                  # segundos por operación de socket
-TOTAL_TIMEOUT = 60.0                            # tope de pared al leer una respuesta (anti goteo lento)
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_IMAGES = 10
 TOKEN_EXPIRY_MARGIN = 300.0                     # se renueva el token 5 min antes de que caduque
@@ -132,12 +126,6 @@ def _api_version() -> str:
     if not API_VERSION_RE.fullmatch(v):
         raise StoreValidationError(f"{API_VERSION_ENV} no es válida (formato AAAA-MM)")
     return v
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Una redirección es un error (anti-SSRF): devolver None hace que urllib lance HTTPError."""
-    def redirect_request(self, *a, **k):
-        return None
 
 
 def _money(value, what: str = "precio") -> str:
@@ -274,68 +262,21 @@ class ShopifyConnector(StoreConnector):
         return [v for k in ("access_token", "client_secret") if isinstance(v := self.credentials.get(k), str) and v]
 
     def _redact(self, text: str) -> str:
-        for s in self._secrets():
-            text = text.replace(s, "***")
-        return text[:500]
+        return scrub(text, self._secrets())
 
     def _post(self, url: str, payload: dict, token: str | None) -> tuple[int, object, dict]:
-        """POST JSON. Devuelve (estado HTTP, JSON o None, cabeceras). Errores de red -> StoreError reintentable."""
-        data = json.dumps(payload).encode()
-        headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": USER_AGENT}
-        if token:
-            headers[TOKEN_HEADER] = token
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=ssl.create_default_context()))
-        resp = None
-        try:
-            try:
-                resp = opener.open(req, timeout=self.TIMEOUT)
-            except urllib.error.HTTPError as e:
-                resp = e                                   # también es una respuesta (4xx/5xx/3xx)
-            except urllib.error.URLError as e:
-                if isinstance(e.reason, ssl.SSLCertVerificationError):
-                    raise StoreError("No se pudo verificar el certificado TLS de la tienda", retryable=False) from None
-                raise StoreError("No se pudo conectar con Shopify", retryable=True) from None
-            except (TimeoutError, socket.timeout):
-                raise StoreError("Shopify tardó demasiado en responder", retryable=True) from None
-            except (OSError, http.client.HTTPException):
-                raise StoreError("Error de red al hablar con Shopify", retryable=True) from None
-            status = getattr(resp, "status", None) or resp.getcode()
-            body = self._read_limited(resp)
-            hdrs = {k.lower(): v for k, v in resp.headers.items()}
-        finally:
-            if resp is not None:
-                resp.close()
-        if 300 <= status < 400:
-            raise StoreError("Shopify respondió con una redirección; no se sigue por seguridad", retryable=False)
+        """POST JSON con el cliente compartido (HTTPS fijo, IP fijada, sin redirecciones, tope de tamaño).
+        Devuelve (estado HTTP, JSON o None, cabeceras). Los fallos de red salen como StoreError."""
+        headers = {TOKEN_HEADER: token} if token else {}
+        resp = shttp.request_json("POST", url, payload, headers=headers, timeout=self.TIMEOUT, max_bytes=self.MAX_BYTES)
         parsed = None
-        if body:
+        if resp.body:
             try:
-                parsed = json.loads(body.decode("utf-8"))
+                parsed = json.loads(resp.body.decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
-                if status < 400:
+                if resp.status < 400:
                     raise StoreError("Shopify devolvió una respuesta que no es JSON válido", retryable=True) from None
-        return status, parsed, hdrs
-
-    def _read_limited(self, resp) -> bytes:
-        deadline = time.monotonic() + TOTAL_TIMEOUT
-        chunks, total = [], 0
-        try:
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > self.MAX_BYTES:
-                    raise StoreError("La respuesta de Shopify es demasiado grande y se descartó", retryable=False)
-                chunks.append(chunk)
-                if time.monotonic() > deadline:
-                    raise StoreError("Shopify tardó demasiado en responder", retryable=True)
-        except (TimeoutError, socket.timeout):
-            raise StoreError("Shopify tardó demasiado en responder", retryable=True) from None
-        except (OSError, http.client.HTTPException):
-            raise StoreError("Se cortó la conexión con Shopify", retryable=True) from None
-        return b"".join(chunks)
+        return resp.status, parsed, resp.headers
 
     @staticmethod
     def _retry_after_header(hdrs: dict, default: float) -> float:
