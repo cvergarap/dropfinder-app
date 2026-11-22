@@ -1,1 +1,47 @@
-/* Estilos del módulo saved (ver js/saved.js) */
+/* Búsquedas guardadas (js/saved.js). Usa los tokens de color de styles.css (modo oscuro incluido). */
+
+/* Botón "☆ Guardar búsqueda" en la cabecera de resultados */
+.results-head { display: flex; align-items: center; gap: 4px 6px; flex-wrap: wrap; }
+.ss-save-btn { margin-left: auto; padding: 5px 12px !important; font-size: 13px; color: var(--primary); white-space: nowrap; }
+.ss-save-btn:hover { background: var(--chip); }
+
+/* Diálogo */
+.ss-dialog { max-width: 480px; }
+.ss-form { padding: 18px; display: flex; flex-direction: column; gap: 10px; }
+.ss-form h2 { font-size: 18px; }
+.ss-form .field { margin: 0; font-size: 13px; }
+.ss-form .field input { width: 100%; }
+.ss-error { margin: 0; font-size: 13px; }
+.ss-form .small { font-size: 12px; }
+.ss-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+
+/* Lista de búsquedas guardadas */
+.ss-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr)); gap: 14px; }
+.ss-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px;
+  display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.ss-card.has-new { border-color: var(--primary); }
+.ss-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.ss-name { overflow-wrap: anywhere; }
+.ss-new-badge { flex: none; background: var(--primary); color: var(--primary-ink); font-size: 12px; font-weight: 700;
+  padding: 2px 9px; border-radius: 999px; white-space: nowrap; }
+.ss-chips { font-size: 12px; }
+.ss-chips .chip { overflow-wrap: anywhere; }
+.ss-stats { margin: 0; font-size: 13px; }
+.ss-notify { padding: 0; font-size: 13px; }
+.ss-card .ss-actions { justify-content: flex-start; margin-top: auto; }
+.ss-empty { background: var(--surface); border: 1px dashed var(--border); border-radius: var(--radius); padding: 28px 20px;
+  text-align: center; display: flex; flex-direction: column; gap: 10px; align-items: center; }
+.ss-empty p { max-width: 560px; }
+
+/* Marca en las tarjetas de producto nuevas para la búsqueda guardada abierta */
+.ss-new-chip { background: var(--primary); color: var(--primary-ink); font-weight: 600; font-size: 11px; }
+.ss-pill { background: var(--primary); color: var(--primary-ink); }
+
+/* Alertas de búsquedas guardadas (pestaña Alertas) */
+.alerts li.saved_search_new { border-left-color: var(--primary); }
+.alerts li.saved_search_new::before { content: "☆ "; color: var(--primary); font-weight: 700; }
+
+@media (max-width: 520px) {
+  .ss-card .ss-actions button { flex: 1 1 auto; }
+  .ss-save-btn { margin-left: 0; }
+}

@@ -67,6 +67,15 @@ class HooksTest(unittest.TestCase):
         with db.connect() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM products WHERE title = 'roto'").fetchone()[0], 0)
 
+    def test_hook_ids_are_exact_within_same_second(self):
+        server.upload_csv({"supplier": "H", "csv": "sku;titulo;costo\nA;Uno;1\nB;Dos;1\n"})
+        self.calls.clear()
+        server.upload_csv({"supplier": "H", "csv": "sku;titulo;costo\nA;Uno;2\n", "replace": True})
+        with db.connect() as conn:
+            a_id = conn.execute("SELECT id FROM products WHERE supplier='H' AND supplier_sku='A'").fetchone()[0]
+            self.assertIsNone(conn.execute("SELECT 1 FROM products WHERE supplier_sku='B' AND supplier='H'").fetchone())
+        self.assertEqual(self.calls[-1][0], [a_id])        # B fue borrado: no debe llegar al hook
+
     def test_reregistering_same_function_is_idempotent(self):
         n = len(hooks._catalog_write)
         hooks.on_catalog_write(self.recorder)
