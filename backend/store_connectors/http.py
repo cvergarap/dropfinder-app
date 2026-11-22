@@ -98,6 +98,7 @@ def request(method: str, url: str, *, headers: dict | None = None, body: bytes |
             c: http.client.HTTPConnection = http.client.HTTPConnection(host, port, timeout=timeout)
         else:
             c = _PinnedHTTPS(host, resolve_public(host, port), port, timeout)
+        r = None
         try:
             try:
                 c.connect()                  # conectar (y TLS) por separado: un fallo aquí significa "no se envió nada"
@@ -114,6 +115,8 @@ def request(method: str, url: str, *, headers: dict | None = None, body: bytes |
                 raise StoreError("La respuesta de la tienda es demasiado grande")
             resp = Response(r.status, {k.lower(): v for k, v in r.getheaders()}, data)
         finally:
+            if r is not None:
+                r.close()                    # higiene: cerrar siempre la respuesta aunque se haya leído solo parte del cuerpo
             c.close()
     except StoreError:
         raise

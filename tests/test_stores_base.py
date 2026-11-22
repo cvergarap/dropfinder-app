@@ -581,6 +581,42 @@ class NotSentSignalTest(unittest.TestCase):
         self.assertTrue(cm.exception.retryable)
         self.assertTrue(cm.exception.not_sent)
 
+    def test_oversized_response_is_refused_without_resource_warnings(self):
+        # Comprueba el comportamiento (error claro y ningún ResourceWarning). Ojo: NO discrimina r.close(); la fuga
+        # que reportó el autor del conector de WooCommerce no se pudo reproducir con este escenario.
+        import gc
+        import socket
+        import threading
+        import warnings
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+
+        def serve():
+            conn, _ = srv.accept()
+            conn.recv(4096)
+            conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n" + b"x" * 20000)   # >> max_bytes
+            conn.close()
+        th = threading.Thread(target=serve, daemon=True)
+        th.start()
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                msg = ""
+                try:
+                    self.shttp.request("GET", f"http://127.0.0.1:{port}/", max_bytes=100)
+                except sc.StoreError as e:
+                    msg = str(e)
+                    e.__traceback__ = None        # la traza mantendría viva la respuesta y el aviso saldría tarde
+                gc.collect()                      # un socket sin cerrar avisa al recolectarse
+        finally:
+            th.join(3)
+            srv.close()
+        self.assertIn("demasiado grande", msg)
+        leaks = [w for w in caught if issubclass(w.category, ResourceWarning)]
+        self.assertEqual(leaks, [], [str(w.message) for w in leaks])
+
     def test_timeout_after_the_request_was_sent_is_ambiguous(self):
         import socket
         import threading
