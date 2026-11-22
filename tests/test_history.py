@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.request
 from datetime import date, timedelta
@@ -29,6 +30,9 @@ class _Env:
     def __init__(self, day=D0):
         self.dir = tempfile.mkdtemp(prefix="dropfinder-hist-")
         self.old_path, self.old_today = db.DB_PATH, history.today
+        self.old_flags = history.BACKGROUND, history.SYNTH_ENABLED
+        history.BACKGROUND = False           # mantenimiento determinista: las pruebas llaman run_maintenance()
+        history.SYNTH_ENABLED = True         # estas pruebas sí usan el historial sintético de la demo
         db.DB_PATH = os.path.join(self.dir, "t.db")
         self.set_day(day)
         search.invalidate()
@@ -39,6 +43,8 @@ class _Env:
 
     def close(self):
         db.DB_PATH, history.today = self.old_path, self.old_today
+        history.BACKGROUND, history.SYNTH_ENABLED = self.old_flags
+        history._maint_state.update(day=None, path=None)
         search.invalidate()
         shutil.rmtree(self.dir, ignore_errors=True)
 
@@ -156,6 +162,8 @@ class SyntheticTest(unittest.TestCase):
     def setUpClass(cls):
         cls.env = _Env()
         db.init_db(seed_size=300)
+        r = history.run_maintenance()
+        assert r["done"] and r["generated"] == 300, r
 
     @classmethod
     def tearDownClass(cls):
@@ -224,7 +232,7 @@ class ApiHistoryTest(unittest.TestCase):
         cls.ids = ids
         n = 730
         put_series(ids["STEADY"], [10] * n)
-        put_series(ids["RISE"], [2] * (n - 7) + [20] * 7)
+        put_series(ids["RISE"], [6] * (n - 7) + [20] * 7)        # 42 → 140: sube, pero no es "nuevo"
         put_series(ids["NEW"], [0] * (n - 5) + [30] * 5, start_cum=0)
         put_series(ids["FALL"], [30] * (n - 7) + [5] * 7)
         season = []
@@ -275,7 +283,7 @@ class ApiHistoryTest(unittest.TestCase):
     def test_rising(self):
         items = self.ranking("rising")
         self.assertEqual(items[0]["id"], self.ids["RISE"])
-        self.assertEqual(items[0]["change_pct"], 900.0)
+        self.assertEqual(items[0]["change_pct"], 233.3)
         self.assertNotIn(self.ids["NEW"], [i["id"] for i in items])   # sin volumen previo no "crece"
         self.assertNotIn(self.ids["STEADY"], [i["id"] for i in items])
 
@@ -328,8 +336,8 @@ class ApiHistoryTest(unittest.TestCase):
         self.assertEqual((d["product_id"], d["days"], d["resolution"], len(d["points"])), (pid, 30, "day", 30))
         self.assertEqual(d["points"][-1], {"date": D0.isoformat(), "orders": 20, "stock": 50, "cost": 10.0,
                                            "total_cost": 11.0})
-        self.assertEqual(d["summary"]["orders_period"], 23 * 2 + 7 * 20)
-        self.assertEqual(d["summary"]["orders_prev_period"], 60)
+        self.assertEqual(d["summary"]["orders_period"], 23 * 6 + 7 * 20)
+        self.assertEqual(d["summary"]["orders_prev_period"], 180)
         self.assertEqual(d["summary"]["peak_date"], (D0 - timedelta(days=6)).isoformat())
         self.assertIsNone(d["seasonality"])
         status, d = self.get(f"/api/products/{pid}/history?days=365")
@@ -354,6 +362,211 @@ class ApiHistoryTest(unittest.TestCase):
         self.assertEqual(d["items"][0]["supplier"], "Prov")
         self.assertEqual(history.reliability(2, 0, 5, 0), 100)
         self.assertEqual(history.reliability(25, 100, 3, 100), 0)
+
+
+def put_rows(pid, rows):
+    """Historial a mano: rows = [(fecha, acumulado, pedidos_desde_la_anterior, costo)]."""
+    with db.connect() as conn:
+        conn.execute("DELETE FROM product_snapshots WHERE product_id = ?", (pid,))
+        conn.executemany("INSERT INTO product_snapshots VALUES (?, ?, ?, ?, ?, 1.0, 50)",
+                         [(pid, d.isoformat(), c, od, cost) for d, c, od, cost in rows])
+    search.invalidate()
+
+
+class ClockAdvanceTest(unittest.TestCase):
+    """Regresión 🔴: con el paso de los días solo algunos productos reciben fotos nuevas. Cada producto se
+    mide hasta su última foto; los no observados no "caen a cero" ni distorsionan nada."""
+
+    def setUp(self):
+        self.env = _Env()
+        db.init_db(seed_size=0)
+        self.ids = upsert([prod("STEADY"), prod("SEASON", category="Hogar"), prod("FRESH")])
+        n = 730
+        put_series(self.ids["STEADY"], [10] * n)                  # última foto: D0
+        season = [20 if (D0 - timedelta(days=n - 1 - i)).month == 12 else 2 for i in range(n)]
+        put_series(self.ids["SEASON"], season)                     # última foto: D0
+
+    def tearDown(self):
+        self.env.close()
+
+    def advance(self, days):
+        """Pasan `days` días y solo FRESH se actualiza (un CSV de un producto)."""
+        self.env.set_day(D0 + timedelta(days=days))
+        upsert([prod("FRESH", orders=100 + days)])
+
+    def test_rankings_miden_cada_producto_hasta_su_ultima_foto(self):
+        self.advance(3)
+        top = history.rankings({"type": ["top"], "days": ["7"]})
+        self.assertEqual(top["until"], (D0 + timedelta(days=3)).isoformat())
+        by = {i["id"]: i for i in top["items"]}
+        steady = by[self.ids["STEADY"]]
+        self.assertEqual((steady["period_orders"], steady["prev_period_orders"]), (70, 70))
+        self.assertEqual(steady["last_observed"], D0.isoformat())
+        self.assertEqual(steady["sparkline"], [10] * 14)
+        falling = history.rankings({"type": ["falling"], "days": ["7"]})["items"]
+        self.assertNotIn(self.ids["STEADY"], [i["id"] for i in falling])          # no "cayó a 0"
+        # Sin fotos dentro de la ventana: fuera de los rankings
+        self.advance(10)
+        for t in ("top", "rising", "falling", "new"):
+            items = history.rankings({"type": [t], "days": ["7"]})["items"]
+            self.assertNotIn(self.ids["STEADY"], [i["id"] for i in items], t)
+
+    def test_historial_con_hueco_sin_datos(self):
+        self.advance(3)
+        h = history.product_history(self.ids["STEADY"], {"days": ["30"]})
+        self.assertEqual(h["last_observed"], D0.isoformat())
+        self.assertEqual(h["until"], (D0 + timedelta(days=3)).isoformat())
+        self.assertEqual([p["orders"] for p in h["points"][-3:]], [None, None, None])
+        self.assertEqual(h["points"][-4]["orders"], 10)
+        self.assertEqual(h["summary"]["orders_period"], 300)                    # 30 días hasta su última foto
+        self.assertEqual(h["summary"]["change_pct"], 0.0)
+
+    def test_estacionalidad_anclada_en_el_producto(self):
+        self.advance(30)
+        with db.connect() as conn:
+            history.refresh_seasonality(conn, [self.ids["SEASON"]])
+        d = history.seasonal({"month": ["12"]})
+        self.assertEqual([i["id"] for i in d["items"]], [self.ids["SEASON"]])
+        self.assertEqual(history.season_from_series(
+            history._Series(rows_of(self.ids["SEASON"])), D0 + timedelta(days=120)), {12: unittest.mock.ANY})
+
+    def test_proveedores_seguidos_y_cambio_en_el_borde(self):
+        ids = upsert([prod("A", supplier="Prov3"), prod("B", supplier="Prov3")])
+        # A: el costo cambió entre la foto anterior a la ventana (D0−40) y la primera dentro (D0−5)
+        put_rows(ids["A"], [(D0 - timedelta(days=40), 10, 10, 10.0), (D0 - timedelta(days=5), 20, 10, 12.0),
+                            (D0, 30, 10, 12.0)])
+        # B: una sola foto (recién cargado): no cuenta como "seguido"
+        put_rows(ids["B"], [(D0, 5, 5, 3.0)])
+        st = {i["supplier"]: i for i in history.supplier_stats()["items"]}
+        self.assertEqual((st["Prov3"]["tracked_products"], st["Prov3"]["price_changes_30d"]), (1, 100.0))
+        # La falta de datos de precio no premia ni castiga: los demás pesos se reescalan
+        self.assertEqual(history.reliability(2, 0, 5, None), 100)
+        self.assertEqual(history.reliability(25, 100, 3, None), 0)
+        self.assertEqual(history.reliability(13.5, 50, 4, None), 50)
+
+
+class DemoAliveTest(unittest.TestCase):
+    """Regresión 🔴/🟠: la demo se genera fuera de init_db (hilo de mantenimiento) y sigue viva día a día."""
+
+    def setUp(self):
+        self.env = _Env()
+
+    def tearDown(self):
+        self.env.close()
+
+    def test_init_db_no_genera_y_el_mantenimiento_si(self):
+        db.init_db(seed_size=120)
+        with db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM product_snapshots").fetchone()[0], 120)
+        self.assertTrue(history.rankings({"type": ["top"], "days": ["7"]})["generating"])
+        r = history.run_maintenance()
+        self.assertTrue(r["done"])
+        self.assertEqual(r["generated"], 120)
+        search.invalidate()
+        self.assertFalse(history.rankings({"type": ["top"], "days": ["7"]})["generating"])
+        self.assertEqual(history.run_maintenance()["generated"], 0)                # idempotente
+
+    def test_interruptor_desactiva_la_demo(self):
+        history.SYNTH_ENABLED = False
+        db.init_db(seed_size=50)
+        self.assertEqual(history.run_maintenance()["generated"], 0)
+        self.assertFalse(history.rankings({"type": ["top"], "days": ["7"]})["generating"])
+
+    def test_la_demo_sigue_viva(self):
+        db.init_db(seed_size=150)
+        history.run_maintenance()
+        with db.connect() as conn:
+            pid, before = conn.execute("SELECT product_id, orders FROM product_snapshots WHERE date = ? "
+                                       "ORDER BY orders DESC LIMIT 1", (D0.isoformat(),)).fetchone()
+        self.env.set_day(D0 + timedelta(days=7))
+        upsert([prod("NUEVO")])                    # solo un producto real recibe foto nueva
+        r = history.run_maintenance()
+        self.assertEqual(r["extended"], 150)
+        rows = rows_of(pid)
+        self.assertEqual(rows[-1]["date"], (D0 + timedelta(days=7)).isoformat())
+        self.assertGreaterEqual(rows[-1]["orders"], before)
+        self.assertEqual(sum(r["orders_day"] for r in rows[-7:]), rows[-1]["orders"] - before)
+        top = history.rankings({"type": ["top"], "days": ["7"], "limit": ["50"]})["items"]
+        self.assertGreater(sum(1 for i in top if i["source"] == "mock"), 20)
+        falling = history.rankings({"type": ["falling"], "days": ["7"], "limit": ["100"]})["items"]
+        self.assertFalse([i for i in falling if i["source"] == "mock" and i["change_pct"] == -100.0])
+        # Determinista: la misma extensión en otra base da los mismos pedidos
+        with db.connect() as conn:
+            p = conn.execute("SELECT p.*, h.end0, h.last_date, h.rate, h.growth, h.amp FROM products p "
+                             "JOIN history_synth h ON h.product_id = p.id WHERE p.id = ?", (pid,)).fetchone()
+        st = dict(p)
+        st["last_date"] = D0.isoformat()
+        again = history.extend_rows(p, st, before, D0 + timedelta(days=7))
+        self.assertEqual([x[2] for x in again], [r["orders"] for r in rows[-7:]])
+
+
+class ReadOnlyGetTest(unittest.TestCase):
+    """Regresión 🟠: los GET no escriben. Con la base bloqueada por otra escritura larga responden enseguida."""
+
+    def setUp(self):
+        self.env = _Env()
+        db.init_db(seed_size=60)
+        with db.connect() as conn:                 # base "anterior al módulo": sin tablas propias ni fotos
+            for t in ("history_meta", "history_seasonality", "history_season_state", "history_synth"):
+                conn.execute(f"DROP TABLE IF EXISTS {t}")
+            conn.execute("DELETE FROM product_snapshots")
+        search.invalidate()
+
+    def tearDown(self):
+        self.env.close()
+
+    def test_get_con_la_base_bloqueada(self):
+        import sqlite3
+        import time
+        lock = sqlite3.connect(db.DB_PATH)
+        try:
+            lock.execute("BEGIN IMMEDIATE")
+            lock.execute("UPDATE products SET stock = stock WHERE id = 1")
+            t0 = time.perf_counter()
+            r = history.rankings({"type": ["top"], "days": ["30"]})
+            self.assertTrue(r["generating"])
+            self.assertEqual(r["items"], [])
+            self.assertEqual(history.seasonal({"month": ["12"]})["items"], [])
+            self.assertEqual(history.product_history(1, {"days": ["30"]})["points"], [])
+            history.supplier_stats()
+            self.assertLess(time.perf_counter() - t0, 1.5)
+            # El mantenimiento tampoco espera indefinidamente: lo deja para después
+            old = history.MAINT_BUSY_MS
+            history.MAINT_BUSY_MS = 100
+            try:
+                self.assertFalse(history.run_maintenance()["done"])
+            finally:
+                history.MAINT_BUSY_MS = old
+        finally:
+            lock.rollback()
+            lock.close()
+        with db.connect() as conn:
+            self.assertFalse(history.schema_ready(conn))       # ningún GET creó tablas
+        r = history.run_maintenance()
+        self.assertTrue(r["done"])
+        self.assertEqual(r["generated"], 60)
+
+
+class NewRankingTest(unittest.TestCase):
+    """Regresión 🟠: "nuevos" compara con un período anterior de igual duración que la ventana."""
+
+    def setUp(self):
+        self.env = _Env()
+        db.init_db(seed_size=0)
+        self.ids = upsert([prod("NEW90"), prod("OLDRISE")])
+        n = 730
+        put_series(self.ids["NEW90"], [0] * (n - 60) + [15] * 60)                 # lanzado hace 60 días
+        put_series(self.ids["OLDRISE"], [6] * (n - 90) + [18] * 90)               # vende hace años y sube
+
+    def tearDown(self):
+        self.env.close()
+
+    def test_nuevos_90_dias(self):
+        items = history.rankings({"type": ["new"], "days": ["90"]})["items"]
+        self.assertEqual([i["id"] for i in items], [self.ids["NEW90"]])
+        self.assertEqual(items[0]["prev_period_orders"], 0)
+        rising = history.rankings({"type": ["rising"], "days": ["90"]})["items"]
+        self.assertEqual([i["id"] for i in rising], [self.ids["OLDRISE"]])
 
 
 if __name__ == "__main__":

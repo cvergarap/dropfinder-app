@@ -130,3 +130,14 @@ details.hx-table { border-top: 0; padding: 0; }
   .hx-filters { gap: 8px; }
   .hx-filters > * { max-width: 100%; }
 }
+
+/* Sin datos / generando */
+.hx-nodata { fill: var(--hx-wash); }
+.hx-key.none { background: transparent; }
+.hx-stale-note { margin-bottom: 8px; }
+.hx-generating { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; }
+.hx-generating[hidden] { display: none; }
+.hx-spin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--border); border-top-color: var(--primary);
+  animation: hx-spin 0.9s linear infinite; flex: none; }
+@keyframes hx-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .hx-spin { animation: none; } }

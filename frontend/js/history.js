@@ -46,15 +46,23 @@
   }
 
   /* ================= Detalle del producto: sección "Historial" ================= */
-  const histCache = new Map();          // "id:días" -> respuesta de la API
+  /* Caché del historial: clave "id:updated_at:días" (si el producto cambia, la clave cambia), vence en
+     60 s (la foto del día y la demo avanzan en segundo plano) y se vacía tras cada búsqueda (DF.onResults),
+     que es lo que la app vuelve a pedir después de una carga de CSV o del monitor. */
+  const histCache = new Map();          // clave -> { at, promise }
+  const HIST_TTL_MS = 60_000;
   let histDays = 30;
 
-  async function getHistory(id, days) {
-    const key = `${id}:${days}`;
-    if (!histCache.has(key)) {
-      histCache.set(key, api(`/api/products/${id}/history?days=${days}`).catch((e) => { histCache.delete(key); throw e; }));
-    }
-    return histCache.get(key);
+  async function getHistory(p, days) {
+    const key = `${p.id}:${p.updated_at || ""}:${days}`;
+    const hit = histCache.get(key);
+    if (hit && Date.now() - hit.at < HIST_TTL_MS) return hit.promise;
+    const promise = api(`/api/products/${p.id}/history?days=${days}`).then((h) => {
+      if (h.generating) histCache.delete(key);          // la demo se está generando: no guardar
+      return h;
+    }, (e) => { histCache.delete(key); throw e; });
+    histCache.set(key, { at: Date.now(), promise });
+    return promise;
   }
 
   function detailSection(p, container) {
@@ -75,9 +83,10 @@
       $$(".hx-seg button", sec).forEach((b) => b.setAttribute("aria-pressed", String(Number(b.dataset.days) === days)));
       body.classList.add("hx-stale");
       try {
-        const h = await getHistory(p.id, days);
+        const h = await getHistory(p, days);
         if (!sec.isConnected || histDays !== days) return;
         renderHistory(body, h);
+        if (h.generating && !h.points.length) setTimeout(() => { if (sec.isConnected && histDays === days) load(days); }, 2500);
       } catch (e) {
         body.innerHTML = `<p class="muted">No se pudo cargar el historial: ${esc(e.message)}</p>`;
       } finally {
@@ -96,8 +105,16 @@
     const s = h.summary;
     const unit = h.resolution === "week" ? "semana" : "día";
     if (!pts.length) {
-      body.innerHTML = `<p class="muted">Aún no hay historial para este producto. DropFinder guarda una foto por día
+      body.innerHTML = h.generating
+        ? `<p class="muted hx-generating" role="status"><span class="hx-spin" aria-hidden="true"></span> Generando el historial de la demostración… aparece en unos segundos.</p>`
+        : `<p class="muted">Aún no hay historial para este producto. DropFinder guarda una foto por día
         cada vez que se actualiza el catálogo o corre el monitor.</p>`;
+      return;
+    }
+    const stale = h.last_observed && h.last_observed < h.until;
+    if (pts.every((x) => x.orders === null)) {
+      body.innerHTML = `<p class="muted">Sin datos en este período: la última foto de este producto es del
+        ${esc(dayLabel(h.last_observed || h.until, { day: "numeric", month: "long", year: "numeric" }))}. Prueba con un período más largo.</p>`;
       return;
     }
     const season = h.seasonality
@@ -110,6 +127,8 @@
         <div class="hx-stat"><span class="hx-label">Mejor ${unit}</span><b class="hx-peak">${esc(peak)}</b></div>
         ${season ? `<div class="hx-stat hx-season-stat">${season}</div>` : ""}
       </div>
+      ${stale ? `<p class="note hx-stale-note">Sin datos desde el ${esc(dayLabel(h.last_observed, { day: "numeric", month: "long" }))}:
+        este producto no se actualizó después. Las cifras se miden hasta esa fecha.</p>` : ""}
       <div class="hx-charts">
         <p class="hx-chart-title">Pedidos por ${unit}</p>
         <div class="hx-chart hx-orders"></div>
@@ -121,7 +140,7 @@
         <div class="table-wrap"><table class="table"><thead><tr><th>${h.resolution === "week" ? "Semana al" : "Fecha"}</th>
           <th class="num">Pedidos</th><th class="num">Costo total</th><th class="num">Stock</th></tr></thead>
           <tbody>${pts.slice().reverse().map((x) => `<tr><td>${esc(dayLabel(x.date, { day: "numeric", month: "short", year: "numeric" }))}</td>
-            <td class="num">${fmt(x.orders)}</td><td class="num">${x.total_cost === null ? "—" : money(x.total_cost)}</td>
+            <td class="num">${x.orders === null ? "—" : fmt(x.orders)}</td><td class="num">${x.total_cost === null ? "—" : money(x.total_cost)}</td>
             <td class="num">${x.stock === null ? "—" : fmt(x.stock)}</td></tr>`).join("")}</tbody></table></div>
       </details>`;
     drawHistoryCharts(body, h);
@@ -143,7 +162,7 @@
       // Margen izquierdo según la etiqueta más larga (los montos en COP son anchos); igual en ambos gráficos
       const costVals = pts.map((x) => x.total_cost).filter((v) => v !== null);
       const labels = [money(Math.min(...costVals)), money(Math.max(...costVals)),
-        fmt(niceTicks(Math.max(...pts.map((x) => x.orders))).max)];
+        fmt(niceTicks(Math.max(0, ...pts.map((x) => x.orders || 0))).max)];
       const L = Math.round(Math.max(36, 6.6 * Math.max(...labels.map((t) => t.length)) + 10)), R = 10;
       const plotW = W - L - R;
       const slot = plotW / n;
@@ -152,15 +171,18 @@
 
       /* --- pedidos --- */
       const H = 150, T = 8, B = 22, y0 = H - B;
-      const maxO = Math.max(...pts.map((x) => x.orders));
+      const known = pts.filter((x) => x.orders !== null);
+      const maxO = Math.max(0, ...known.map((x) => x.orders));
       const { max, ticks } = niceTicks(maxO);
       const yAt = (v) => y0 - (v / max) * (y0 - T);
-      const total = pts.reduce((a, x) => a + x.orders, 0);
-      const best = pts.reduce((a, x) => (x.orders > a.orders ? x : a), pts[0]);
+      const total = known.reduce((a, x) => a + x.orders, 0);
+      const best = known.reduce((a, x) => (x.orders > a.orders ? x : a), known[0] || { orders: 0, date: pts[0].date });
+      const gapFrom = pts.findIndex((x, i) => x.orders === null && i > 0 && pts[i - 1].orders !== null);
       const svg = el("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img", tabindex: "0",
         "aria-label": `Pedidos por ${unit}, últimos ${h.days} días: ${fmt(total)} en total` +
           (h.summary.change_pct !== null ? `, ${pct(h.summary.change_pct)} frente al período anterior` : "") +
           (best.orders ? `. Máximo: ${fmt(best.orders)} (${dayLabel(best.date)}).` : ".") +
+          (gapFrom > 0 ? ` Sin datos desde el ${dayLabel(pts[gapFrom - 1].date)}.` : "") +
           " Use las flechas para recorrer los valores." });
       for (const t of ticks) {
         const y = yAt(t);
@@ -172,11 +194,21 @@
       const bw = Math.max(1, Math.min(24, slot - 2));
       const bars = el("g", { class: "hx-bars" });
       pts.forEach((x, i) => {
-        if (x.orders <= 0) return;
+        if (!(x.orders > 0)) return;
         const p = el("path", { d: colPath(xAt(i) - bw / 2, yAt(x.orders), bw, y0), "data-i": i });
         bars.appendChild(p);
       });
       svg.appendChild(bars);
+      // Tramo sin datos (después de la última foto): banda tenue con rótulo, no barras en cero
+      if (gapFrom > 0) {
+        const gx = L + slot * gapFrom;
+        svg.appendChild(el("rect", { class: "hx-nodata", x: gx, y: T, width: W - R - gx, height: y0 - T }));
+        if (W - R - gx > 56) {
+          const tx = el("text", { class: "hx-axis", x: (gx + W - R) / 2, y: T + 14, "text-anchor": "middle" });
+          tx.textContent = "Sin datos";
+          svg.appendChild(tx);
+        }
+      }
       svg.appendChild(el("line", { class: "hx-base", x1: L, x2: W - R, y1: y0, y2: y0 }));
       // Etiquetas del eje X: inicio, medio y fin
       [0, Math.floor((n - 1) / 2), n - 1].forEach((i, k) => {
@@ -196,7 +228,8 @@
       const lo = Math.max(0, cmin - pad), hi = cmax + pad;
       const cy = (v) => cy0 - ((v - lo) / (hi - lo)) * (cy0 - CT);
       const first = pts.find((x) => x.total_cost !== null);
-      const last = pts[n - 1];
+      const lastIdx = pts.map((x) => x.total_cost !== null).lastIndexOf(true);
+      const last = pts[lastIdx];
       const csvg = el("svg", { width: W, height: CH, viewBox: `0 0 ${W} ${CH}`, role: "img",
         "aria-label": `Costo total: de ${money(first.total_cost)} a ${money(last.total_cost)}` +
           (cmin !== cmax ? ` (mínimo ${money(cmin)}, máximo ${money(cmax)}).` : ", sin cambios.") });
@@ -208,13 +241,13 @@
       });
       let d = "";
       pts.forEach((x, i) => {
-        if (x.total_cost === null) return;
+        if (x.total_cost === null) { d += " "; return; }
         // escalones: el costo se mantiene hasta que cambia
         const X = xAt(i), Y = cy(x.total_cost);
-        d += d ? `H${X}V${Y}` : `M${X},${Y}`;
+        d += d && !d.endsWith(" ") ? `H${X}V${Y}` : `M${X},${Y}`;
       });
       csvg.appendChild(el("path", { class: "hx-line", d }));
-      csvg.appendChild(el("circle", { class: "hx-dot", cx: xAt(n - 1), cy: cy(last.total_cost), r: 4 }));
+      csvg.appendChild(el("circle", { class: "hx-dot", cx: xAt(lastIdx), cy: cy(last.total_cost), r: 4 }));
       csvg.appendChild(el("line", { class: "hx-cross", x1: 0, x2: 0, y1: 2, y2: CH - 2, visibility: "hidden" }));
 
       $(".hx-orders", wrap).replaceChildren(svg);
@@ -248,7 +281,8 @@
         r.append(k, b, s);
         tip.appendChild(r);
       };
-      row("orders", fmt(x.orders), x.orders === 1 ? "pedido" : "pedidos");
+      if (x.orders === null) row("none", "Sin datos", "");
+      else row("orders", fmt(x.orders), x.orders === 1 ? "pedido" : "pedidos");
       if (x.total_cost !== null) row("cost", money(x.total_cost), "costo total");
       if (x.stock !== null) row("stock", x.stock > 0 ? fmt(x.stock) : "Sin stock", x.stock > 0 ? "en stock" : "");
       tip.hidden = false;
@@ -326,7 +360,8 @@
       </div>
       <div class="hx-filters">
         <div class="hx-tabs" role="tablist" aria-label="Tipo de ranking">
-          ${TYPES.map(([k, l]) => `<button type="button" role="tab" data-type="${k}" aria-selected="${k === state.type}">${l}</button>`).join("")}
+          ${TYPES.map(([k, l]) => `<button type="button" role="tab" id="hx-tab-${k}" aria-controls="hxList" data-type="${k}"
+            aria-selected="${k === state.type}" tabindex="${k === state.type ? 0 : -1}">${l}</button>`).join("")}
         </div>
         <div class="hx-seg" role="group" aria-label="Período">
           ${[7, 30, 90].map((d) => `<button type="button" data-days="${d}" aria-pressed="${d === state.days}">${d} días</button>`).join("")}
@@ -335,7 +370,9 @@
         <select id="hxCat"><option value="">Todas las categorías</option></select>
       </div>
       <p class="muted hx-def" id="hxDef"></p>
-      <div id="hxList" class="hx-list" role="tabpanel" aria-live="polite"></div>
+      <p id="hxGenerating" class="note hx-generating" role="status" hidden><span class="hx-spin" aria-hidden="true"></span>
+        Generando el historial de la demostración… los rankings se completan solos en unos segundos.</p>
+      <div id="hxList" class="hx-list" role="tabpanel" aria-labelledby="hx-tab-${state.type}" tabindex="0" aria-live="polite"></div>
 
       <section class="panel hx-season-panel">
         <div class="hx-season-head">
@@ -360,9 +397,11 @@
       loadRanking();
     });
     $(".hx-tabs", v).addEventListener("keydown", (e) => {
-      if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+      if (!["ArrowRight", "ArrowLeft", "Home", "End"].includes(e.key)) return;
+      e.preventDefault();
       const i = TYPES.findIndex(([k]) => k === state.type);
-      const j = (i + (e.key === "ArrowRight" ? 1 : TYPES.length - 1)) % TYPES.length;
+      const j = e.key === "Home" ? 0 : e.key === "End" ? TYPES.length - 1
+        : (i + (e.key === "ArrowRight" ? 1 : TYPES.length - 1)) % TYPES.length;
       state.type = TYPES[j][0];
       loadRanking();
       $(`.hx-tabs [data-type="${state.type}"]`).focus();
@@ -410,6 +449,7 @@
       b.setAttribute("aria-selected", String(on));
       b.tabIndex = on ? 0 : -1;
     });
+    $("#hxList").setAttribute("aria-labelledby", `hx-tab-${state.type}`);
     $$(".hx-filters .hx-seg button").forEach((b) => b.setAttribute("aria-pressed", String(Number(b.dataset.days) === state.days)));
     $("#hxDef").textContent = TYPES.find(([k]) => k === state.type)[2];
     const seq = ++state.seq;
@@ -429,9 +469,21 @@
     }
   }
 
+  let pollTimer = null;
+  function pollWhileGenerating(flag) {
+    $("#hxGenerating").hidden = !flag;
+    clearTimeout(pollTimer);
+    if (flag) {
+      pollTimer = setTimeout(() => {
+        if ($("#view-trends").classList.contains("active")) loadTrends();
+      }, 3000);
+    }
+  }
+
   function renderRanking() {
     const data = state.rank;
     if (!data) return;
+    pollWhileGenerating(Boolean(data.generating));
     if (data.until) {
       $("#hxUntil").textContent = `Datos hasta el ${dayLabel(data.until, { day: "numeric", month: "long", year: "numeric" })}. ` +
         "Lo que más se vende, lo que sube y lo que cae, a partir del historial diario.";
@@ -571,6 +623,7 @@
 
   DF.detailSections.push(detailSection);
   DF.viewLoaders.trends = loadTrends;
+  DF.onResults.push(() => histCache.clear());
   DF.currencyChange.push(() => {
     if (!state.built) return;
     renderRanking();
