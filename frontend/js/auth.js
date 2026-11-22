@@ -349,3 +349,9 @@
   }
   boot();
 }());
+
+/* Si la sesión termina a mitad de uso, api() ya mostró la pantalla de acceso; las llamadas que no capturan
+   su error (carga de listas, etc.) no deben dejar un aviso suelto en la consola. */
+window.addEventListener("unhandledrejection", (e) => {
+  if (e.reason && e.reason.status === 401) e.preventDefault();
+});
