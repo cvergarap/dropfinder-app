@@ -14,6 +14,18 @@ _TOKEN_RE = re.compile(r"(?i)\b(?:shp(?:at|ca|pa|ss)_[a-z0-9]{8,}|c[ks]_[a-f0-9]
                        r"|(?:bearer|token|secret|key|password)\s*[:=]?\s*[\w.+/=-]{8,}|[a-f0-9]{32,}|[A-Za-z0-9_+/=-]{40,})")
 
 
+def tags_match(existing, expected) -> bool:
+    """¿El producto que ya está en la tienda fue creado por esta instalación de DropFinder? Se comprueba que lleve TODAS
+    las etiquetas que DropFinder pone al publicar (`dropfinder` y la de la instalación, `dfi-<id>`). El SKU `DF-<id>`
+    por sí solo NO prueba nada: el id es local a cada base de datos y puede coincidir con un producto del cliente o de
+    otra instalación. Sin etiquetas esperadas no hay nada que comprobar y la respuesta es siempre False."""
+    def norm(t):
+        return str(t).strip().lower()
+    want = {norm(t) for t in (expected or []) if str(t).strip()}
+    have = {norm(t) for t in (existing or []) if str(t).strip()}
+    return bool(want) and want <= have
+
+
 def scrub(text, secrets=(), limit: int = 300) -> str:
     """Quita de un mensaje de error todo lo que parezca una credencial (y los valores secretos conocidos) y lo
     acorta. Se aplica a CUALQUIER texto que venga de una tienda antes de guardarlo, registrarlo o mostrarlo."""

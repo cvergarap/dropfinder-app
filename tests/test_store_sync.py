@@ -170,7 +170,9 @@ class PublishTest(Base):
         self.assertNotIn("Proveedor Secreto", raw)
         self.assertNotIn("7.77", prod["description"])
         self.assertIn("Hogar", prod["description"])
-        self.assertEqual((prod["tags"], prod["active"], prod["price"]), (["dropfinder"], False, 20.0))
+        self.assertEqual((prod["tags"][0], prod["active"], prod["price"]), ("dropfinder", False, 20.0))
+        self.assertRegex(prod["tags"][1], r"^dfi-[0-9a-f]{8}$")        # marca de ESTA instalación (ver installation_tag)
+        self.assertEqual(len(prod["tags"]), 2)
 
     def test_not_draft_publishes_visible(self):
         store = self.connect()

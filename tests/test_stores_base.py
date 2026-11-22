@@ -644,6 +644,327 @@ class NotSentSignalTest(unittest.TestCase):
         self.assertFalse(cm.exception.not_sent)                  # → no se puede repetir una publicación a ciegas
 
 
+class SharedClientHardeningTest(unittest.TestCase):
+    """Revisión del PR de WooCommerce: tiempo total, redes bloqueadas, todas las IP, mensajes uniformes y TLS real."""
+
+    def setUp(self):
+        from store_connectors import http as shttp
+        self.shttp = shttp
+        self.old = shttp.ALLOW_LOOPBACK
+        shttp.ALLOW_LOOPBACK = True
+        self.cleanups = []
+
+    def tearDown(self):
+        self.shttp.ALLOW_LOOPBACK = self.old
+        for fn in reversed(self.cleanups):
+            fn()
+
+    def _server(self, handler):
+        import socket
+        import threading
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(2)
+        th = threading.Thread(target=handler, args=(srv,), daemon=True)
+        th.start()
+        self.cleanups += [lambda: th.join(5), srv.close]
+        return srv.getsockname()[1]
+
+    def test_slow_drip_body_cannot_hold_the_worker_forever(self):
+        import threading
+        import time
+        stop = threading.Event()
+
+        def handler(srv):
+            conn, _ = srv.accept()
+            conn.recv(4096)
+            conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 1000000\r\n\r\n")
+            try:
+                for _ in range(200):
+                    if stop.wait(0.3):
+                        break
+                    conn.sendall(b"x")        # 1 byte cada 0,3 s: cada lectura individual NO agota el tiempo por operación
+            except OSError:
+                pass
+            conn.close()
+        port = self._server(handler)
+        self.cleanups.append(stop.set)
+        t0 = time.monotonic()
+        with self.assertRaises(sc.StoreError) as cm:
+            self.shttp.request("GET", f"http://127.0.0.1:{port}/", timeout=5, total_timeout=1.2)
+        self.assertLess(time.monotonic() - t0, 4.0)
+        self.assertIn("tardó demasiado", str(cm.exception))
+        self.assertTrue(cm.exception.retryable)
+        self.assertFalse(cm.exception.not_sent)                  # el servidor sí recibió la petición: ambiguo
+
+    def test_slow_drip_headers_are_also_bounded(self):
+        import threading
+        import time
+        stop = threading.Event()
+
+        def handler(srv):
+            conn, _ = srv.accept()
+            conn.recv(4096)
+            try:
+                for ch in b"HTTP/1.0 200 OK\r\nX-Lento: " + b"a" * 400:
+                    if stop.wait(0.25):
+                        break
+                    conn.sendall(bytes([ch]))
+            except OSError:
+                pass
+            conn.close()
+        port = self._server(handler)
+        self.cleanups.append(stop.set)
+        t0 = time.monotonic()
+        with self.assertRaises(sc.StoreError) as cm:
+            self.shttp.request("GET", f"http://127.0.0.1:{port}/", timeout=5, total_timeout=1.2)
+        self.assertLess(time.monotonic() - t0, 4.0)
+        self.assertIn("tardó demasiado", str(cm.exception))
+
+    def test_fast_response_is_not_affected_by_the_watchdog(self):
+        def handler(srv):
+            conn, _ = srv.accept()
+            conn.recv(4096)
+            conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\": true}")
+            conn.close()
+        port = self._server(handler)
+        r = self.shttp.request("GET", f"http://127.0.0.1:{port}/", total_timeout=5)
+        self.assertEqual((r.status, r.json()), (200, {"ok": True}))
+
+    def test_endless_body_is_cut_at_the_size_cap_not_at_the_time_limit(self):
+        import threading
+        import time
+        stop = threading.Event()
+
+        def handler(srv):
+            conn, _ = srv.accept()
+            conn.recv(4096)
+            conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n")    # sin Content-Length: hasta cerrar
+            try:
+                while not stop.is_set():
+                    conn.sendall(b"x" * 8192)
+                    time.sleep(0.005)
+            except OSError:
+                pass
+            conn.close()
+        port = self._server(handler)
+        self.cleanups.append(stop.set)
+        t0 = time.monotonic()
+        with self.assertRaises(sc.StoreError) as cm:
+            self.shttp.request("GET", f"http://127.0.0.1:{port}/", max_bytes=50_000, total_timeout=6)
+        self.assertLess(time.monotonic() - t0, 3.0)                # cortado por el TOPE, mucho antes del tiempo total
+        self.assertIn("demasiado grande", str(cm.exception))       # y no por "tardó demasiado"
+
+    def test_blocked_networks_table(self):
+        import ipaddress
+        blocked = ["127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.0.1", "169.254.169.254", "0.0.0.0",
+                   "100.64.0.1", "192.0.0.1", "192.0.2.5", "192.88.99.1", "198.18.0.1", "198.51.100.7", "203.0.113.9",
+                   "224.0.0.1", "240.0.0.1", "255.255.255.255", "::", "::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1",
+                   "::ffff:169.254.169.254", "64:ff9b::7f00:1", "2002:7f00:1::", "2001::1", "2001:db8::1", "fc00::1",
+                   "fd12:3456::1", "fe80::1", "fec0::1", "ff02::1", "100::1"]
+        public = ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111", "2a00:1450:4001:81a::200e", "172.32.0.1",
+                  "100.63.255.255", "192.0.3.1"]
+        for ip in blocked:
+            self.assertFalse(self.shttp._is_public(ipaddress.ip_address(ip)), ip)
+        for ip in public:
+            self.assertTrue(self.shttp._is_public(ipaddress.ip_address(ip)), ip)
+
+    def test_blocked_and_unresolvable_names_look_the_same(self):
+        import socket
+        from unittest import mock
+        with mock.patch("socket.getaddrinfo", side_effect=socket.gaierror("no resuelve")):
+            with self.assertRaises(sc.StoreError) as unresolved:
+                self.shttp.resolve_all_public("interno.example", 443)
+        fake = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 443))]
+        with mock.patch("socket.getaddrinfo", return_value=fake):
+            with self.assertRaises(sc.StoreError) as blocked:
+                self.shttp.resolve_all_public("interno.example", 443)
+        self.assertEqual(str(unresolved.exception), str(blocked.exception))     # no se puede enumerar la red interna
+        self.assertTrue(blocked.exception.not_sent and unresolved.exception.not_sent)
+        mixed = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443)),
+                 (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.1", 443))]
+        with mock.patch("socket.getaddrinfo", return_value=mixed):
+            with self.assertRaises(sc.StoreError):
+                self.shttp.resolve_all_public("mixto.example", 443)
+
+    def test_every_validated_ip_is_tried_in_order(self):
+        import socket
+        import threading
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        srv.settimeout(4)
+        port = srv.getsockname()[1]
+        got = []
+
+        def acceptor():
+            try:
+                conn, _ = srv.accept()
+                got.append(True)
+                conn.close()
+            except OSError:
+                pass
+        th = threading.Thread(target=acceptor, daemon=True)
+        th.start()
+        self.cleanups += [lambda: th.join(5), srv.close]
+        # 127.0.0.2 no tiene a nadie escuchando en ese puerto: debe pasar a la siguiente IP en vez de rendirse
+        c = self.shttp._PinnedHTTPS("example.test", ["127.0.0.2", "127.0.0.1"], port, 2)
+        try:
+            with self.assertRaises(Exception):          # la conexión TCP llega, pero el servidor no habla TLS
+                c.connect()
+        finally:
+            c.close()
+        th.join(5)
+        self.assertEqual(got, [True])                    # el servidor SÍ recibió la conexión: se probó la segunda IP
+
+    def test_loopback_exception_is_exactly_127_0_0_1_over_http_and_without_userinfo(self):
+        import socket
+        import threading
+        srv = socket.socket()
+        try:
+            srv.bind(("127.0.0.2", 0))
+        except OSError:
+            self.skipTest("este sistema no enruta 127.0.0.2")
+        srv.listen(1)
+        srv.settimeout(1.5)
+        port = srv.getsockname()[1]
+        hit = []
+
+        def acceptor():
+            try:
+                conn, _ = srv.accept()
+                hit.append(True)
+                conn.close()
+            except OSError:
+                pass
+        th = threading.Thread(target=acceptor, daemon=True)
+        th.start()
+        self.cleanups += [lambda: th.join(5), srv.close]
+        with self.assertRaises(sc.StoreError) as cm:
+            self.shttp.request("GET", f"http://127.0.0.2:{port}/", timeout=1)
+        self.assertIn("HTTPS", str(cm.exception))        # se rechaza por política, antes de conectar
+        th.join(5)
+        self.assertEqual(hit, [])                         # y el servidor de 127.0.0.2 no recibió NADA
+        for url in ("http://127.1.2.3:9/", "http://user@127.0.0.1:9/", "http://user:pw@127.0.0.1:9/", "http://localhost:9/"):
+            with self.assertRaises(sc.StoreError):
+                self.shttp.request("GET", url, timeout=1)
+
+    # ---- TLS real (certificado autofirmado generado con openssl; se omite si openssl no está)
+    def _tls_server(self):
+        import shutil
+        import ssl
+        import subprocess
+        import tempfile
+        import threading
+        if not shutil.which("openssl"):
+            self.skipTest("openssl no disponible")
+        d = tempfile.mkdtemp(prefix="df-tls-")
+        cert, key = d + "/c.pem", d + "/k.pem"
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert, "-days", "2",
+                        "-subj", "/CN=example.test", "-addext", "subjectAltName=DNS:example.test"],
+                       check=True, capture_output=True)
+        sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        sctx.load_cert_chain(cert, key)
+        seen = {"sni": None}
+        sctx.sni_callback = lambda sock, name, ctx: seen.__setitem__("sni", name)
+        import socket
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(2)
+
+        def serve():
+            for _ in range(3):
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    tls = sctx.wrap_socket(conn, server_side=True)
+                    tls.recv(4096)
+                    tls.sendall(b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{}")
+                    tls.close()
+                except (ssl.SSLError, OSError):
+                    conn.close()
+        th = threading.Thread(target=serve, daemon=True)
+        th.start()
+        self.cleanups += [lambda: th.join(5), srv.close]
+        return srv.getsockname()[1], cert, seen
+
+    def _get_over_tls(self, host, port, ctx=None):
+        from unittest import mock
+        patches = [mock.patch.object(self.shttp, "resolve_all_public", return_value=["127.0.0.1"]),
+                   mock.patch.object(self.shttp, "_PinnedHTTPS", lambda h, ips, p, t: self.PINNED(h, ["127.0.0.1"], port, t))]
+        if ctx is not None:
+            patches.append(mock.patch.object(self.shttp, "_ctx", ctx))
+        for p in patches:
+            p.start()
+            self.cleanups.append(p.stop)
+        return self.shttp.request("GET", f"https://{host}/", timeout=5)
+
+    def test_tls_certificate_is_verified_by_default(self):
+        port, cert, seen = self._tls_server()
+        self.PINNED = self.shttp._PinnedHTTPS
+        with self.assertRaises(sc.StoreError) as cm:
+            self._get_over_tls("example.test", port)             # autofirmado y no confiable: debe rechazarse
+        self.assertIn("certificado", str(cm.exception))
+
+    def test_tls_uses_hostname_for_sni_and_hostname_verification(self):
+        import ssl
+        port, cert, seen = self._tls_server()
+        self.PINNED = self.shttp._PinnedHTTPS
+        ctx = ssl.create_default_context()
+        ctx.load_verify_locations(cert)                           # confiamos en ese certificado: solo se prueba nombre/SNI
+        r = self._get_over_tls("example.test", port, ctx)
+        self.assertEqual(r.status, 200)
+        self.assertEqual(seen["sni"], "example.test")             # SNI con el nombre real, no con la IP
+        self.assertTrue(ctx.check_hostname)                        # y el nombre del certificado se comprueba
+
+    def test_tls_wrong_hostname_is_rejected_even_with_trusted_cert(self):
+        import ssl
+        port, cert, seen = self._tls_server()
+        self.PINNED = self.shttp._PinnedHTTPS
+        ctx = ssl.create_default_context()
+        ctx.load_verify_locations(cert)
+        with self.assertRaises(sc.StoreError) as cm:
+            self._get_over_tls("otro.test", port, ctx)            # el certificado es de example.test
+        self.assertIn("certificado", str(cm.exception))
+
+
+class OwnershipMarkTest(unittest.TestCase):
+    """El SKU DF-<id> no prueba que un producto sea nuestro: se exige la marca de esta instalación."""
+
+    def test_tags_match(self):
+        m = sc.tags_match
+        self.assertTrue(m(["dropfinder", "DFI-ab12cd34", "otra"], ["dropfinder", "dfi-ab12cd34"]))   # sin distinguir mayúsculas
+        self.assertFalse(m(["dropfinder"], ["dropfinder", "dfi-ab12cd34"]))        # falta la marca de la instalación
+        self.assertFalse(m(["dropfinder", "dfi-otra0000"], ["dropfinder", "dfi-ab12cd34"]))   # de OTRA instalación
+        self.assertFalse(m([], ["dropfinder"]))
+        self.assertFalse(m(["dropfinder"], []))                                    # sin etiquetas esperadas no hay prueba
+        self.assertFalse(m(None, None))
+        self.assertFalse(m(["dropfinder"], ["  "]))
+
+    def test_installation_tag_is_stable_and_per_installation(self):
+        import store_sync
+        tmp = _TempDb()
+        try:
+            db.init_db(seed_size=5)
+            with db.connect() as conn:
+                a = store_sync.installation_tag(conn)
+                b = store_sync.installation_tag(conn)
+            self.assertEqual(a, b)
+            self.assertRegex(a, r"^dfi-[0-9a-f]{8}$")
+        finally:
+            tmp.close()
+        tmp2 = _TempDb()
+        try:
+            db.init_db(seed_size=5)
+            with db.connect() as conn:
+                c = store_sync.installation_tag(conn)
+            self.assertNotEqual(a, c)                                              # otra instalación, otra marca
+        finally:
+            tmp2.close()
+
+
 class RouteClassificationTest(unittest.TestCase):
     def test_store_routes_are_user_routes(self):
         for method, pattern, _fn in stores_mod.ROUTES:

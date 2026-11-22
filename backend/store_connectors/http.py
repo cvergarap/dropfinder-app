@@ -18,13 +18,15 @@ import ipaddress
 import json
 import socket
 import ssl
+import threading
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from .base import StoreError
 
 ALLOW_LOOPBACK = False          # SOLO pruebas: permite http://127.0.0.1:<puerto> (nunca se lee de datos del usuario)
-DEFAULT_TIMEOUT = 20.0
+DEFAULT_TIMEOUT = 20.0          # por operación de red (conectar, enviar, recibir un trozo)
+TOTAL_TIMEOUT = 45.0            # TOTAL de la petición: un servidor que gotea bytes no puede retener el hilo del motor
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 USER_AGENT = "DropFinder/1.0"
 _ctx = ssl.create_default_context()      # verificación de certificado y nombre activas
@@ -43,44 +45,79 @@ class Response:
             raise StoreError("Respuesta inválida de la tienda (no es JSON)", retryable=True) from None
 
 
+# Redes que nunca se contactan, listadas explícitamente (no dependen de la versión de Python ni de ip.is_private)
+_BLOCKED_NETS = [ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24",
+    "192.0.2.0/24", "192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24",
+    "224.0.0.0/4", "240.0.0.0/4",
+    "::/96", "::ffff:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64", "2001::/23", "2001:db8::/32",
+    "2002::/16", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8")]
+
+
 def _is_public(ip: ipaddress._BaseAddress) -> bool:
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
         ip = ip.ipv4_mapped
-    return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved
-                or ip.is_unspecified or (isinstance(ip, ipaddress.IPv4Address) and ip in ipaddress.ip_network("100.64.0.0/10")))
+    if any(ip.version == n.version and ip in n for n in _BLOCKED_NETS):
+        return False
+    return ip.is_global                       # además de la lista: cualquier cosa que Python considere no global
 
 
-def resolve_public(host: str, port: int) -> str:
-    """IP pública de `host`; lanza StoreError si el nombre no resuelve o apunta a una red no pública."""
+_UNREACHABLE = "No se pudo conectar con el dominio de la tienda: comprueba que esté bien escrito y sea público"
+
+
+def resolve_all_public(host: str, port: int) -> list[str]:
+    """Todas las IP de `host`, ya validadas como públicas. Un nombre que no resuelve y uno que apunta a una red no
+    pública dan el MISMO mensaje: un miembro no debe poder distinguir (y así enumerar) nombres de la red interna."""
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError:
-        raise StoreError("No se pudo resolver el dominio de la tienda", retryable=True, not_sent=True) from None
-    ips = []
+        raise StoreError(_UNREACHABLE, retryable=True, not_sent=True) from None
+    ips: list[str] = []
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            raise StoreError(_UNREACHABLE, not_sent=True) from None
         if not _is_public(ip):
-            raise StoreError("El dominio de la tienda apunta a una dirección no permitida")
-        ips.append(info[4][0])
+            raise StoreError(_UNREACHABLE, not_sent=True)
+        if info[4][0] not in ips:
+            ips.append(info[4][0])
     if not ips:
-        raise StoreError("No se pudo resolver el dominio de la tienda", retryable=True, not_sent=True)
-    return ips[0]
+        raise StoreError(_UNREACHABLE, retryable=True, not_sent=True)
+    return ips
+
+
+def resolve_public(host: str, port: int) -> str:
+    return resolve_all_public(host, port)[0]
 
 
 class _PinnedHTTPS(http.client.HTTPSConnection):
-    """Conecta a una IP ya validada, pero habla TLS con el nombre real (SNI y verificación de certificado)."""
+    """Conecta a IP ya validadas (prueba cada una en orden), pero habla TLS con el nombre real (SNI y verificación)."""
 
-    def __init__(self, host: str, ip: str, port: int, timeout: float):
+    def __init__(self, host: str, ips, port: int, timeout: float):
         super().__init__(host, port, timeout=timeout, context=_ctx)
-        self._ip = ip
+        self._ips = [ips] if isinstance(ips, str) else list(ips)
 
     def connect(self):
-        sock = socket.create_connection((self._ip, self.port), self.timeout)
-        self.sock = _ctx.wrap_socket(sock, server_hostname=self.host)
+        last: Exception | None = None
+        for ip in self._ips:
+            try:
+                sock = socket.create_connection((ip, self.port), self.timeout)
+            except OSError as e:
+                last = e
+                continue
+            try:
+                self.sock = _ctx.wrap_socket(sock, server_hostname=self.host)
+            except Exception:
+                sock.close()
+                raise
+            return
+        raise last or OSError("sin direcciones")
 
 
 def request(method: str, url: str, *, headers: dict | None = None, body: bytes | None = None,
-            timeout: float = DEFAULT_TIMEOUT, max_bytes: int = MAX_RESPONSE_BYTES) -> Response:
+            timeout: float = DEFAULT_TIMEOUT, max_bytes: int = MAX_RESPONSE_BYTES,
+            total_timeout: float = TOTAL_TIMEOUT) -> Response:
     parts = urlsplit(url)
     host = parts.hostname or ""
     if parts.username or parts.password or not host:
@@ -93,11 +130,33 @@ def request(method: str, url: str, *, headers: dict | None = None, body: bytes |
         raise StoreError("Puerto de tienda no permitido")
     path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
     hdrs = {"User-Agent": USER_AGENT, "Accept": "application/json", **(headers or {})}
+
+    # Vigilante: el tiempo por operación NO limita el total (un servidor que envía 1 byte cada pocos segundos
+    # retendría el hilo del motor para siempre). Al vencer el tiempo total se corta el socket, aunque esté en una lectura.
+    state = {"fired": False, "sock": None}
+
+    def abort():
+        state["fired"] = True
+        sock = state["sock"]
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    watchdog = threading.Timer(max(0.05, total_timeout), abort)
+    watchdog.daemon = True
+    watchdog.start()
+    too_slow = StoreError("La tienda tardó demasiado en responder", retryable=True)
     try:
         if loopback_test:
             c: http.client.HTTPConnection = http.client.HTTPConnection(host, port, timeout=timeout)
         else:
-            c = _PinnedHTTPS(host, resolve_public(host, port), port, timeout)
+            c = _PinnedHTTPS(host, resolve_all_public(host, port), port, timeout)
         r = None
         try:
             try:
@@ -108,9 +167,15 @@ def request(method: str, url: str, *, headers: dict | None = None, body: bytes |
                 raise StoreError("No se pudo verificar el certificado de la tienda") from None
             except OSError:
                 raise StoreError("No se pudo conectar con la tienda", retryable=True, not_sent=True) from None
+            state["sock"] = c.sock
+            if state["fired"]:
+                abort()
+                raise StoreError("No se pudo conectar con la tienda a tiempo", retryable=True, not_sent=True)
             c.request(method, path, body=body, headers=hdrs)
             r = c.getresponse()
             data = r.read(max_bytes + 1)
+            if state["fired"]:               # el corte puede dejar una lectura "completa" pero truncada
+                raise too_slow
             if len(data) > max_bytes:
                 raise StoreError("La respuesta de la tienda es demasiado grande")
             resp = Response(r.status, {k.lower(): v for k, v in r.getheaders()}, data)
@@ -121,11 +186,13 @@ def request(method: str, url: str, *, headers: dict | None = None, body: bytes |
     except StoreError:
         raise
     except (socket.timeout, TimeoutError):
-        raise StoreError("La tienda tardó demasiado en responder", retryable=True) from None
+        raise too_slow from None
     except ssl.SSLError:
         raise StoreError("No se pudo verificar el certificado de la tienda") from None
     except (OSError, http.client.HTTPException):
-        raise StoreError("No se pudo conectar con la tienda", retryable=True) from None
+        raise (too_slow if state["fired"] else StoreError("No se pudo conectar con la tienda", retryable=True)) from None
+    finally:
+        watchdog.cancel()
     if 300 <= resp.status < 400:
         raise StoreError("La tienda respondió con una redirección (no se sigue por seguridad)")
     return resp
