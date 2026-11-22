@@ -10,11 +10,15 @@ import itertools
 import json
 import re
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-OPS = ("productCreate", "productVariantsBulkUpdate", "inventorySetQuantities", "inventoryActivate", "productUpdate",
+OPS = ("products", "productCreate", "productVariantsBulkUpdate", "inventorySetQuantities", "inventoryActivate", "productUpdate",
        "productDelete")
-OP_SCOPE = {"productCreate": "write_products", "productVariantsBulkUpdate": "write_products",
+OPERATION_NAMES = {"DropFinderValidate", "DropFinderLocations", "DropFinderFindByTag", "ProductCreate", "VariantsBulkUpdate",
+                   "InventorySet", "InventoryActivate", "ProductUpdate", "ProductDelete"}
+IDEMPOTENT_FROM = (2026, 4)          # creencia compartida con el conector (SIN VERIFICAR)
+OP_SCOPE = {"products": "read_products", "productCreate": "write_products", "productVariantsBulkUpdate": "write_products",
             "productUpdate": "write_products", "productDelete": "write_products",
             "inventorySetQuantities": "write_inventory", "inventoryActivate": "write_inventory"}
 MONEY_RE = re.compile(r"^\d+\.\d{2}$")
@@ -169,6 +173,13 @@ class FakeShopify:
             inj = self._take_injection("oauth")
             if inj and self._apply_injection(h, inj):
                 return
+            ctype = rec["headers"].get("content-type", "")
+            if ctype.startswith("application/x-www-form-urlencoded"):
+                body = {k: v[0] for k, v in urllib.parse.parse_qs(raw.decode(), keep_blank_values=True).items()}
+                rec["body"] = body
+            else:
+                body = None                      # el token se pide con form-encoded; JSON no se acepta
+                rec["body"] = None
             ok = (isinstance(body, dict) and body.get("grant_type") == "client_credentials"
                   and st["apps"].get(body.get("client_id")) == body.get("client_secret") and not st["revoked"])
             if not ok:
@@ -188,17 +199,90 @@ class FakeShopify:
         with self.lock:
             self.requests.append(rec)
         inj = self._take_injection(op)
-        if inj and self._apply_injection(h, inj):
+        drop_after = bool(inj and inj["kind"] == "execute_then_drop")
+        if inj and not drop_after and self._apply_injection(h, inj):
             return
         token = rec["headers"].get("x-shopify-access-token", "")
         if st["revoked"] or not (token in st["tokens"] or st["issued"].get(token)):
             self._send(h, 401, {"errors": "[API] Invalid API key or access token (unrecognized login or wrong password)"})
             return
+        version = re.search(r"/api/([^/]+)/", h.path).group(1)
+        bad = self._validate_request(op, query, variables, version)
+        if bad:
+            self._send(h, 200, {"errors": [{"message": bad, "extensions": {"code": "INVALID_FIELD_ARGUMENTS"}}]})
+            return
         with self.lock:
             resp = self._execute(st, op, variables)
+        if drop_after:                           # la mutación se aplicó pero la respuesta se pierde
+            h.close_connection = True
+            h.connection.shutdown(2)
+            return
         resp.setdefault("extensions", {"cost": {"requestedQueryCost": 10, "actualQueryCost": 10, "throttleStatus": {
             "maximumAvailable": 1000.0, "currentlyAvailable": self.cost_available, "restoreRate": 50.0}}})
         self._send(h, 200, resp)
+
+    # ------------------------------------------------------------ validación de peticiones (esquema simulado)
+    def _validate_request(self, op: str, query: str, v: dict, version: str):
+        """Devuelve un mensaje de error GraphQL realista si la petición no cumple el esquema simulado."""
+        m = re.match(r"\s*(?:query|mutation)\s+(\w+)", query)
+        if not m or m.group(1) not in OPERATION_NAMES:
+            return f"Operación desconocida o sin nombre en la lista permitida: {m.group(1) if m else None}"
+        key = tuple(int(x) for x in version.split("-"))
+        if op in ("inventorySetQuantities", "inventoryActivate"):
+            has = "@idempotent(key: $key)" in query
+            if key >= IDEMPOTENT_FROM and not has:
+                return f"The @idempotent directive is required for {op}"
+            if key < IDEMPOTENT_FROM and has:
+                return "Unknown directive @idempotent"
+            if has and not (isinstance(v.get("key"), str) and re.fullmatch(r"[0-9a-f-]{36}", v["key"])):
+                return "Variable $key of type String! was provided invalid value"
+
+        def need(d, name, typ, path):
+            if not isinstance(d, dict) or name not in d or d[name] is None or not isinstance(d[name], typ) \
+                    or isinstance(d[name], bool) and typ is int:
+                return f"Variable ${path} of type {typ.__name__} is required (invalid value for {name})"
+            return None
+        if op == "products":
+            return need(v, "q", str, "q")
+        if op == "productCreate":
+            return need(v, "product", dict, "product") or need(v["product"], "title", str, "product.title") or (
+                "Variable $media of type [CreateMediaInput!] was provided invalid value" if v.get("media") is not None and not (
+                    isinstance(v["media"], list) and all(isinstance(x, dict) and isinstance(x.get("originalSource"), str)
+                                                          and x.get("mediaContentType") == "IMAGE" for x in v["media"])) else None)
+        if op == "productVariantsBulkUpdate":
+            r = need(v, "productId", str, "productId") or need(v, "variants", list, "variants")
+            if r:
+                return r
+            for x in v["variants"]:
+                r = need(x, "id", str, "variants.id")
+                if r:
+                    return r
+                if "price" in x and not isinstance(x["price"], str):
+                    return "Variable $variants.price must be a Money string"
+                if "compareAtPrice" in x and x["compareAtPrice"] is not None and not isinstance(x["compareAtPrice"], str):
+                    return "Variable $variants.compareAtPrice must be a Money string"
+            return None
+        if op == "inventorySetQuantities":
+            r = need(v, "input", dict, "input")
+            if r:
+                return r
+            i = v["input"]
+            r = need(i, "name", str, "input.name") or need(i, "reason", str, "input.reason") or need(i, "quantities", list, "input.quantities")
+            if r or not isinstance(i.get("ignoreCompareQuantity"), bool):
+                return r or "Variable $input.ignoreCompareQuantity is required"
+            for q in i["quantities"]:
+                r = (need(q, "inventoryItemId", str, "quantities.inventoryItemId") or need(q, "locationId", str, "quantities.locationId")
+                     or need(q, "quantity", int, "quantities.quantity"))
+                if r:
+                    return r
+            return None
+        if op == "inventoryActivate":
+            return need(v, "inventoryItemId", str, "inventoryItemId") or need(v, "locationId", str, "locationId")
+        if op == "productUpdate":
+            return need(v, "product", dict, "product") or need(v["product"], "id", str, "product.id")
+        if op == "productDelete":
+            return need(v, "input", dict, "input") or need(v["input"], "id", str, "input.id")
+        return None
 
     # ------------------------------------------------------------ semántica
     @staticmethod
@@ -224,7 +308,7 @@ class FakeShopify:
                 return {"data": None, "errors": [self._denied("locations", "read_locations")]}
             return {"data": {"locations": {"nodes": [dict(x) for x in st["locations"]]}}}
         scope = OP_SCOPE[op]
-        if scope not in st["scopes"]:
+        if scope not in st["scopes"] and not (scope.startswith("read_") and "write_" + scope[5:] in st["scopes"]):
             return {"data": None, "errors": [self._denied(op, scope)]}
         return {"data": {op: getattr(self, "_" + op)(st, v)}}
 
@@ -233,6 +317,16 @@ class FakeShopify:
         if code is not None:
             e["code"] = code
         return e
+
+    def _products(self, st, v):
+        m = re.fullmatch(r"tag:'([^']*)'", v.get("q", ""))
+        nodes = []
+        for pid, rec in st["products"].items():
+            if m and m.group(1) in (rec["tags"] or []):
+                var = st["variants"][rec["variant"]]
+                nodes.append({"id": pid, "status": rec["status"], "tags": rec["tags"],
+                              "variants": {"nodes": [{"id": var["id"], "inventoryItem": {"id": var["item"]}}]}})
+        return {"nodes": nodes[:5]}
 
     def _productCreate(self, st, v):
         p = v.get("product") or {}
@@ -284,6 +378,9 @@ class FakeShopify:
             if not isinstance(q.get("quantity"), int) or q["quantity"] < 0:
                 return {"inventoryAdjustmentGroup": None, "userErrors": [self._ue(["input", "quantities", str(k), "quantity"],
                         "Quantity must be non-negative", "INVALID_QUANTITY_NEGATIVE")]}
+            if q.get("locationId") not in {x["id"] for x in st["locations"]}:
+                return {"inventoryAdjustmentGroup": None, "userErrors": [self._ue(["input", "quantities", str(k), "locationId"],
+                        "The specified location could not be found.", "LOCATION_NOT_FOUND")]}
             key = (q["inventoryItemId"], q.get("locationId"))
             if key not in st["levels"]:
                 return {"inventoryAdjustmentGroup": None, "userErrors": [self._ue(["input", "quantities", str(k)],
