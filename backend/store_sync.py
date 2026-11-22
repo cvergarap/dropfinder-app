@@ -56,6 +56,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import threading
@@ -283,7 +284,18 @@ def _https_image(url) -> str | None:
     return None
 
 
-def _snapshot(crow, imp, state: dict, as_draft: bool) -> tuple[dict | None, str, str]:
+OWNER_TAG = "dropfinder"
+
+
+def installation_tag(conn) -> str:
+    """Etiqueta propia de ESTA instalación (`dfi-<8 hex>`, aleatoria, guardada en `meta`). Junto con `dropfinder` es la
+    marca con la que los conectores reconocen lo que creó esta instalación: el SKU `DF-<id>` por sí solo no basta, porque
+    el id es local a cada base de datos y puede coincidir con un producto del cliente o de otra instalación."""
+    conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('installation_id', ?)", (secrets.token_hex(4),))
+    return "dfi-" + str(conn.execute("SELECT value FROM meta WHERE key = 'installation_id'").fetchone()[0])
+
+
+def _snapshot(crow, imp, state: dict, as_draft: bool, install_tag: str) -> tuple[dict | None, str, str]:
     """(payload del trabajo publish, razón de omisión, mensaje). payload None si no se puede publicar."""
     code = (crow["currency"] or "").upper()
     if code not in SUPPORTED_CURRENCIES:
@@ -295,7 +307,7 @@ def _snapshot(crow, imp, state: dict, as_draft: bool) -> tuple[dict | None, str,
     prod = {"title": imp["title"][:200], "price": price, "sku": f"DF-{imp['pid']}", "stock": _cap_stock(imp["stock"]),
             "description": _description(imp["title"], imp["category"]), "image_urls": [image] if image else [],
             "vendor": (crow["name"] or "")[:80], "product_type": (imp["category"] or "")[:100],
-            "tags": ["dropfinder"], "active": not as_draft}
+            "tags": [OWNER_TAG, install_tag], "active": not as_draft}
     return {"product": prod, "cost_usd": round(imp["cost"] + imp["shipping_cost"], 4), "currency": code}, "", ""
 
 
@@ -344,6 +356,7 @@ def publish(cid: int, body: dict) -> dict:
             raise ApiError(404, "Tienda no encontrada")
         as_draft = stores_mod.load_settings(crow)["publish_as_draft"] if as_draft_req is None else as_draft_req
         state = currency.get_state(conn, user_id=uid)
+        itag = installation_tag(conn)
         imps = {r["id"]: r for r in conn.execute(
             _IMP_SQL + f" WHERE i.user_id = ? AND i.id IN ({','.join('?' * len(ids))})", [uid, *ids])}
         existing = {r["imported_id"] for r in conn.execute(
@@ -364,7 +377,7 @@ def publish(cid: int, body: dict) -> dict:
             skipped.append({"imported_id": iid, "reason": "demo_not_allowed",
                             "message": "Es un producto de demostración (ficticio); confirma que quieres publicarlo"})
         else:
-            payload, reason, msg = _snapshot(crow, imp, state, as_draft)
+            payload, reason, msg = _snapshot(crow, imp, state, as_draft, itag)
             if payload is None:
                 skipped.append({"imported_id": iid, "reason": reason, "message": msg})
             else:
@@ -572,7 +585,7 @@ def _retry(conn, r, uid: int) -> str | None:
             warning = ("Es posible que el producto ya exista en tu tienda: si lo reintentas podría duplicarse. "
                        f"Revisa el SKU {_sku_of(old)} antes de continuar.")
         as_draft = not old.get("product", {}).get("active", not stores_mod.load_settings(crow)["publish_as_draft"])
-        payload, reason, msg = _snapshot(crow, imp, currency.get_state(conn, user_id=uid), as_draft)
+        payload, reason, msg = _snapshot(crow, imp, currency.get_state(conn, user_id=uid), as_draft, installation_tag(conn))
         if payload is None:
             raise ApiError(409, msg)
         conn.execute("UPDATE store_listings SET status = 'pending', external_id = NULL, external_variant_id = NULL, "
