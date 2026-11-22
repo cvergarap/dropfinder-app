@@ -113,6 +113,49 @@ actúen como ese usuario (sin contraseña ni CSRF). Solo vale para peticiones di
 `DROPFINDER_TRUSTED_PROXY`, hosts permitidos que no son locales o un `--host` que no es local. Nunca lo uses con
 datos reales.
 
+## Conectar una tienda (Shopify)
+
+Desde la pestaña **Tiendas** conectas tu tienda y desde **Mis productos** publicas con «Publicar en tienda». DropFinder
+mantiene después el stock al día y, si lo activas, sube el precio cuando sube el costo. **Todo producto se publica como
+borrador**: lo revisas en tu tienda y solo lo haces visible tú, con confirmación.
+
+> ⚠️ **Antes de usarlo con una tienda de verdad: pruébalo primero en una tienda de desarrollo de Shopify.**
+> El conector se escribió contra la documentación pública de Shopify y se probó contra un servidor simulado, porque
+> el entorno de desarrollo no tiene acceso a internet. No se pudo verificar contra la Shopify real:
+> la versión de API que se usa (`API_VERSION` en `backend/store_connectors/shopify.py`), la forma exacta de algunas
+> operaciones, el flujo de credenciales de cliente (ID y secreto), si las operaciones de inventario exigen una clave de
+> idempotencia desde la versión `2026-04`, y el texto de ayuda para crear la aplicación. Si Shopify devuelve un error
+> de directiva o de versión en la primera conexión, cambia `API_VERSION` a `2026-01` (variable de entorno
+> `DROPFINDER_SHOPIFY_API_VERSION`). La lista completa está en el encabezado de ese archivo.
+
+**Cómo conectar** (la pantalla de conexión repite estos pasos y puede quedar desactualizada: verifica en la
+documentación de Shopify):
+1. En tu panel de Shopify crea una aplicación con estos permisos de la API de administración: `write_products`,
+   `write_inventory` y `read_locations` (se piden también lectura de productos).
+2. Usa la forma que tu tienda permita: el **token de acceso** de una aplicación personalizada, o el **ID y el secreto**
+   de una aplicación del Dev Dashboard instalada en tu tienda.
+3. En **Tiendas → Conectar una tienda** pega el dominio (`tutienda.myshopify.com`; puedes pegar el enlace completo) y
+   las credenciales. DropFinder las valida contra tu tienda antes de guardarlas.
+
+**Reglas de seguridad y de dinero que conviene conocer**
+- Las credenciales se guardan **cifradas** y nunca vuelven al navegador. La clave de cifrado vive en
+  `%LOCALAPPDATA%\DropFinder\dropfinder.key` (Linux/macOS: `~/.local/share/dropfinder/`), **fuera del proyecto y de la base
+  de datos**. **Respáldala aparte**: si se pierde, hay que volver a conectar las tiendas (la app te lo dice con claridad).
+- Los **productos de demostración** son ficticios: solo se publican si lo confirmas expresamente y **nunca** se
+  sincronizan solos con una tienda real.
+- DropFinder **nunca baja un precio por su cuenta**. Subirlo automáticamente es opcional (por tienda), con un tope por
+  cambio y un máximo total de 2 veces el precio publicado.
+- Si el proveedor se queda sin stock, el producto se **oculta** en tu tienda; si el stock vuelve, solo se vuelve a mostrar
+  si lo había ocultado esa regla (nunca un borrador ni algo que ocultaste tú).
+- Si una publicación termina en un resultado dudoso (por ejemplo, la tienda tardó en responder), DropFinder **no la
+  repite a ciegas**: marca el producto con un aviso para que revises tu tienda (SKU `DF-<id>`) antes de reintentar.
+- Desconectar una tienda **no borra** los productos ya publicados: seguirán en tu tienda, pero DropFinder dejará de
+  sincronizarlos.
+- Un monitor programado (solo el propietario, apagado por defecto) puede revisar precios y stock cada cierto tiempo.
+
+Diseño, seguridad y límites conocidos: [`docs/adr/0002-integracion-tiendas.md`](docs/adr/0002-integracion-tiendas.md) y
+contrato de la API en [`docs/stores-api.md`](docs/stores-api.md).
+
 ## Pruebas
 ```bash
 python3 -W error::ResourceWarning -m unittest discover tests
