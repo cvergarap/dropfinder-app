@@ -1,7 +1,6 @@
 /* Estilos del módulo auth (ver js/auth.js). Usa los tokens de styles.css (claro/oscuro). */
 
 /* Sin sesión: solo la pantalla de acceso */
-body.df-locked > header, body.df-locked > main:not(.auth-screen), body.df-locked #toast ~ * { display: none; }
 body.df-locked > header, body.df-locked > main:not(.auth-screen) { display: none; }
 
 /* Interfaz según el rol */

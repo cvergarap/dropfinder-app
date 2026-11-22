@@ -439,7 +439,7 @@
     const di = new Map(dates.map((d, i) => [d, i]));
     series.forEach((s) => {
       const d = s.points.map((p, k) => `${k ? "L" : "M"}${x(di.get(p.date)).toFixed(1)},${y(p.v).toFixed(1)}`).join("");
-      el("path", { d, class: "cmp-line", style: `stroke:var(--cmp-s${s.idx + 1})` });
+      el("path", { d, class: `cmp-line cmp-k${s.idx + 1}` });
     });
     // Puntos finales con anillo y número de serie (etiqueta directa; se separan con una guía si chocan)
     const ends = series.map((s) => { const p = s.points[s.points.length - 1]; return { s, cx: x(di.get(p.date)), cy: y(p.v) }; })
@@ -448,7 +448,7 @@
     ends.forEach((e) => { e.ly = Math.max(e.cy, prev + 12); prev = e.ly; });
     ends.forEach((e) => {
       if (Math.abs(e.ly - e.cy) > 1) el("line", { x1: e.cx + 5, y1: e.cy, x2: e.cx + 12, y2: e.ly - 4, class: "cmp-leader" });
-      el("circle", { cx: e.cx, cy: e.cy, r: 4, class: "cmp-dot", style: `fill:var(--cmp-s${e.s.idx + 1})` });
+      el("circle", { cx: e.cx, cy: e.cy, r: 4, class: `cmp-dot cmp-k${e.s.idx + 1}` });
       el("text", { x: e.cx + 14, y: e.ly, class: "cmp-endlabel" }).textContent = String(e.s.idx + 1);
     });
     // Capa de interacción: línea vertical que sigue al puntero + tooltip con todas las series

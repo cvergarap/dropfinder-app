@@ -351,9 +351,27 @@ def user_tables(conn) -> list[str]:
     return ordered
 
 
+# Módulos con datos por usuario que exponen ayudas propias (opcionales: si el módulo aún no las tiene, se
+# usa el tratamiento genérico por columna user_id de user_tables()).
+DATA_MODULES = ("collections_mod", "dashboard")
+
+
+def _module_hook(name: str, conn, *args) -> None:
+    import importlib  # noqa: PLC0415
+    for mod_name in DATA_MODULES:
+        try:
+            mod = importlib.import_module(mod_name)
+        except ImportError:
+            continue
+        fn = getattr(mod, name, None)
+        if callable(fn):
+            fn(conn, *args)
+
+
 def _delete_user_data(conn, uid: int) -> None:
     for fn in list(_user_delete_hooks.values()):
         fn(conn, uid)
+    _module_hook("delete_user_data", conn, uid)
     for (sid,) in conn.execute("SELECT id FROM saved_searches WHERE user_id = ?", (uid,)).fetchall():
         conn.execute("DELETE FROM meta WHERE key = ?", (f"saved_search_seen:{sid}",))
     for t in user_tables(conn):
@@ -382,6 +400,7 @@ def create_first_owner(conn, email: str, name: str, pw_hash: str) -> int:
         raise ApiError(403, "Ya existe una cuenta de propietario. Pide al propietario que te cree una cuenta.")
     uid = conn.execute("INSERT INTO users(email, name, password_hash, role, created_at, last_login_at) "
                        "VALUES (?, ?, ?, 'owner', ?, ?)", (email, name, pw_hash, db.now(), db.now())).lastrowid
+    _module_hook("reassign_user", conn, auth_context.LEGACY_USER_ID, uid)   # p. ej. une los "Favoritos"
     for t in user_tables(conn):
         # OR IGNORE: si una fila chocara con un índice único por usuario (p. ej. la colección "Favoritos" de
         # collections), se omite en vez de impedir el registro. No debería pasar: el nuevo usuario aún no tiene datos.
