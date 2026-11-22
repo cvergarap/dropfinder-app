@@ -51,8 +51,6 @@
 .coll-opts input { margin-top: 3px; flex: none; }
 .coll-opts input:disabled + span { opacity: .55; }
 .coll-dlg-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; align-items: center; }
-a.btn.coll-download { background: var(--primary); color: var(--primary-ink); padding: 8px 16px; border-radius: 8px; align-self: auto; }
-a.btn.coll-download:hover { filter: brightness(1.08); background: var(--primary); }
 .coll-error { margin: 0; font-size: 13px; }
 .coll-colors { display: flex; gap: 8px; flex-wrap: wrap; }
 .coll-swatch { position: relative; width: 28px; height: 28px; border-radius: 999px; background: var(--c); cursor: pointer; }
@@ -62,17 +60,19 @@ a.btn.coll-download:hover { filter: brightness(1.08); background: var(--primary)
 
 /* ---- Detalle: "Guardar en colección" ---- */
 .coll-sec { border-top: 1px solid var(--border); padding-top: 10px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-.coll-checks { display: flex; flex-direction: column; gap: 2px; max-height: 180px; overflow: auto; }
+.coll-checks { display: flex; flex-direction: column; gap: 2px; max-height: 260px; overflow: auto; }
 .coll-check { display: flex; gap: 8px; align-items: center; padding: 3px 0; cursor: pointer; min-width: 0; }
 .coll-check-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .coll-check small { margin-left: auto; flex: none; }
 .coll-dot { display: inline-block; flex: none; width: 10px; height: 10px; border-radius: 999px; background: var(--c, var(--primary)); }
 .coll-inline-new { display: flex; gap: 6px; }
 .coll-inline-new input { flex: 1; min-width: 0; }
-.coll-note-field { margin: 0; }
-.coll-sec textarea, .coll-note textarea { font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+.coll-check-row { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.coll-row-note { display: block; padding-left: 24px; margin-bottom: 4px; }
+.coll-row-note textarea { font-size: 13px; min-height: 30px; }
+.coll-dialog code { font-size: 12px; }
+.coll-row-note textarea, .coll-note textarea { font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
   padding: 6px 10px; resize: vertical; width: 100%; }
-.coll-note-actions { display: flex; justify-content: flex-end; }
 
 /* ---- Pestaña Colecciones ---- */
 .coll-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 220px), 1fr)); gap: 14px; }

@@ -169,30 +169,74 @@
         <label><input type="radio" name="currency" value="USD"> <span>USD — dólar</span></label>
         <label><input type="radio" name="currency" value="COP"> <span>COP — peso colombiano <small class="muted" id="collCopHint"></small></span></label>
       </fieldset>
-      <p class="muted small">Se descarga un archivo CSV (UTF-8) que se abre con doble clic en Excel.</p>
+      <p class="muted small">Se descarga un archivo CSV (UTF-8) que se abre con doble clic en Excel.
+        Los SKU que Excel convertiría en número o fecha (por ejemplo <code>0012</code>, <code>1-2</code> o un código de 13 dígitos)
+        y los textos que empiezan con <code>=</code>, <code>+</code>, <code>-</code> o <code>@</code> llevan un apóstrofo (<code>'</code>) delante
+        para que se vean tal cual y no se ejecuten como fórmula.</p>
+      <p class="coll-error bad hidden" id="collExportError" role="alert"></p>
       <div class="coll-dlg-actions">
         <button type="submit" class="ghost" value="cancel">Cancelar</button>
-        <a class="btn primary coll-download" id="collExportGo" download>⬇ Descargar CSV</a>
+        <button type="button" class="primary coll-download" id="collExportGo">⬇ Descargar CSV</button>
       </div></form>`;
     document.body.appendChild(dlg);
-    dlg.addEventListener("change", updateExportHref);
     dlg.addEventListener("click", (e) => { if (e.target === dlg) dlg.close(); });
-    $("#collExportGo", dlg).addEventListener("click", () => {
-      writePrefs({ sep: $("input[name=sep]:checked", dlg).value, currency: $("input[name=currency]:checked", dlg).value });
-      toast("Descargando el archivo…");
-      setTimeout(() => dlg.close(), 0);
-    });
+    $("#collExportGo", dlg).addEventListener("click", () => download(dlg));
     return dlg;
   }
+
   let exportReq = null;
-  function updateExportHref() {
-    const dlg = exportDialog();
-    if (!exportReq) return;
+  function exportUrl(dlg) {
     const p = new URLSearchParams(exportReq.params);
     p.delete("page"); p.delete("page_size");
     p.set("sep", $("input[name=sep]:checked", dlg).value);
     p.set("currency", $("input[name=currency]:checked", dlg).value);
-    $("#collExportGo", dlg).href = `/api/export/${exportReq.kind}.csv?${p}`;
+    return `/api/export/${exportReq.kind}.csv?${p}`;
+  }
+  /* Nombre del archivo: el de Content-Disposition o, si falta, uno calculado igual que el servidor */
+  function fileName(res) {
+    const m = /filename="?([^";]+)"?/i.exec(res.headers.get("Content-Disposition") || "");
+    if (m) return m[1];
+    const d = new Date();
+    const day = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+    return `dropfinder-${exportReq.kind}-${day}.csv`;
+  }
+  /* Descarga con fetch + blob: si el servidor responde con error (401 sin sesión, 400, 500) se muestra
+     el mensaje en el diálogo en vez de guardar un archivo con el JSON del error. */
+  async function download(dlg) {
+    if (!exportReq) return;
+    const btn = $("#collExportGo", dlg);
+    const err = $("#collExportError", dlg);
+    err.classList.add("hidden");
+    btn.disabled = true;
+    btn.textContent = "Preparando…";
+    try {
+      const res = await fetch(exportUrl(dlg), { credentials: "same-origin" });
+      if (!res.ok) {
+        let msg = res.statusText || `Error ${res.status}`;
+        try { msg = (await res.json()).error || msg; } catch { /* sin JSON */ }
+        if (res.status === 401) msg = "Tu sesión terminó: vuelve a iniciar sesión para exportar.";
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fileName(res);
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+      writePrefs({ sep: $("input[name=sep]:checked", dlg).value, currency: $("input[name=currency]:checked", dlg).value });
+      dlg.close();
+      toast(`Archivo descargado: ${a.download}`);
+    } catch (e) {
+      err.textContent = `No se pudo exportar: ${e.message}`;
+      err.classList.remove("hidden");
+      toast(`No se pudo exportar: ${e.message}`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "⬇ Descargar CSV";
+    }
   }
   function openExport(req) {
     exportReq = req;
@@ -206,7 +250,7 @@
     $("#collCopHint", dlg).textContent = cop.disabled ? "(sin tasa de cambio disponible)" : "— precios con tu redondeo";
     const cur = !cop.disabled && (prefs.currency || Currency.code()) === "COP" ? "COP" : "USD";
     $(`input[name=currency][value=${cur}]`, dlg).checked = true;
-    updateExportHref();
+    $("#collExportError", dlg).classList.add("hidden");
     if (!dlg.open) dlg.showModal();
   }
 
@@ -297,48 +341,75 @@
     }
   }
 
+  /* Cada colección marcada tiene SU nota: se muestra y se guarda solo en ella (nunca se copia a otras). */
   function renderDetailSec(p, sec, d) {
-    const typed = $("textarea", sec);
-    const withNote = d.items.find((c) => c.contains && c.note);
-    const note = typed && typed.dataset.dirty ? typed.value : withNote ? withNote.note : "";
+    // Notas que el usuario está escribiendo (sin guardar) se conservan al volver a dibujar
+    const typing = new Map($$("textarea[data-cid]", sec).filter((t) => t.dataset.dirty).map((t) => [t.dataset.cid, t.value]));
     sec.innerHTML = `<h3 id="collSecTitle">Guardar en colección</h3>
       <div class="coll-checks" role="group" aria-labelledby="collSecTitle">
-        ${d.items.map((c) => `<label class="coll-check"><input type="checkbox" data-cid="${c.id}" ${c.is_favorites ? 'data-fav="1"' : ""} ${c.contains ? "checked" : ""}>
-          <span class="coll-dot c-${esc(c.color)}" aria-hidden="true"></span><span class="coll-check-name">${c.is_favorites ? "♥ " : ""}${esc(c.name)}</span>
-          <small class="muted">${fmt(c.count)}</small></label>`).join("")}
+        ${d.items.map((c) => {
+          const key = c.virtual ? "fav" : String(c.id);
+          const name = `${c.is_favorites ? "♥ " : ""}${esc(c.name)}`;
+          return `<div class="coll-check-row">
+            <label class="coll-check"><input type="checkbox" data-cid="${key}" ${c.is_favorites ? 'data-fav="1"' : ""} ${c.contains ? "checked" : ""}>
+              <span class="coll-dot c-${esc(c.color)}" aria-hidden="true"></span><span class="coll-check-name">${name}</span>
+              <small class="muted">${fmt(c.count)}</small></label>
+            ${c.contains ? `<label class="coll-row-note"><span class="sr-only">Nota en ${esc(c.name)}</span>
+              <textarea rows="1" maxlength="500" data-cid="${key}" placeholder="Nota para esta colección (opcional)">${esc(typing.has(key) ? typing.get(key) : c.note)}</textarea></label>` : ""}
+          </div>`;
+        }).join("")}
       </div>
+      <p class="muted small">La nota se guarda al salir del campo (o con Enter) y solo en esa colección.</p>
       <form class="coll-inline-new">
         <label class="sr-only" for="collInlineName">Nombre de la nueva colección</label>
         <input id="collInlineName" maxlength="60" placeholder="Nueva colección…" autocomplete="off">
         <button type="submit" class="ghost">+ Crear y guardar</button>
-      </form>
-      <label class="field coll-note-field">Nota (opcional; se guarda en las colecciones marcadas)
-        <textarea rows="2" maxlength="500" placeholder="ej. pedir muestra, probar en marzo">${esc(note)}</textarea></label>
-      <div class="coll-note-actions"><button type="button" class="ghost coll-save-note">Guardar nota</button></div>`;
-    const area = $("textarea", sec);
-    if (typed && typed.dataset.dirty) area.dataset.dirty = "1";
-    area.addEventListener("input", () => { area.dataset.dirty = "1"; });
+      </form>`;
+    $$("textarea[data-cid]", sec).forEach((t) => {
+      if (typing.has(t.dataset.cid)) t.dataset.dirty = "1";
+    });
     const reload = () => { changed = true; loadDetailSec(p, sec, detailCache.get(p.id)); };
 
     $(".coll-checks", sec).addEventListener("change", async (e) => {
       const box = e.target.closest("input[type=checkbox]");
       if (!box) return;
-      const cid = Number(box.dataset.cid);
       box.disabled = true;
       try {
-        if (box.checked) {
-          const body = { product_ids: [p.id] };
-          if (area.value.trim()) body.note = area.value;
-          await api(`/api/collections/${cid}/items`, { method: "POST", body });
+        if (box.dataset.fav) {
+          // Favoritos puede ser «virtual» (aún sin crear): el endpoint de favoritos lo crea si hace falta
+          const want = box.checked;
+          let r = await api(`/api/favorites/${p.id}`, { method: "POST" });
+          if (r.favorite !== want) r = await api(`/api/favorites/${p.id}`, { method: "POST" });
+          markFav(p.id, r.favorite);
+          setFavTotal(r.total);
+          toast(r.favorite ? "Agregado a Favoritos" : "Quitado de Favoritos");
+        } else if (box.checked) {
+          await api(`/api/collections/${box.dataset.cid}/items`, { method: "POST", body: { product_ids: [p.id] } });
           toast("Guardado en la colección");
         } else {
-          await api(`/api/collections/${cid}/items/${p.id}`, { method: "DELETE" });
+          await api(`/api/collections/${box.dataset.cid}/items/${p.id}`, { method: "DELETE" });
           toast("Quitado de la colección");
         }
-        if (box.dataset.fav) { markFav(p.id, box.checked); refreshFavPill(); }
         reload();
       } catch (ex) { box.checked = !box.checked; toast(ex.message); }
       finally { box.disabled = false; }
+    });
+
+    sec.addEventListener("input", (e) => { if (e.target.matches("textarea[data-cid]")) e.target.dataset.dirty = "1"; });
+    sec.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey && e.target.matches("textarea[data-cid]")) { e.preventDefault(); e.target.blur(); }
+    });
+    sec.addEventListener("change", async (e) => {
+      const t = e.target.closest("textarea[data-cid]");
+      if (!t || !t.dataset.dirty) return;
+      const cid = t.dataset.cid === "fav" ? (detailCache.get(p.id) || { items: [] }).items.find((c) => c.is_favorites)?.id : t.dataset.cid;
+      if (!cid) return;
+      try {
+        await api(`/api/collections/${cid}/items/${p.id}`, { method: "PATCH", body: { note: t.value } });
+        delete t.dataset.dirty;
+        toast("Nota guardada");
+        reload();
+      } catch (ex) { toast(ex.message); }
     });
 
     $(".coll-inline-new", sec).addEventListener("submit", async (e) => {
@@ -348,22 +419,8 @@
       if (!name) { input.focus(); return; }
       try {
         const c = await api("/api/collections", { method: "POST", body: { name } });
-        const body = { product_ids: [p.id] };
-        if (area.value.trim()) body.note = area.value;
-        await api(`/api/collections/${c.id}/items`, { method: "POST", body });
+        await api(`/api/collections/${c.id}/items`, { method: "POST", body: { product_ids: [p.id] } });
         toast(`Guardado en «${c.name}»`);
-        reload();
-      } catch (ex) { toast(ex.message); }
-    });
-
-    $(".coll-save-note", sec).addEventListener("click", async () => {
-      const boxes = $$(".coll-checks input:checked", sec);
-      if (!boxes.length) { toast("Marca al menos una colección para guardar la nota"); return; }
-      try {
-        await Promise.all(boxes.map((b) => api(`/api/collections/${b.dataset.cid}/items/${p.id}`,
-          { method: "PATCH", body: { note: area.value } })));
-        delete area.dataset.dirty;
-        toast("Nota guardada");
         reload();
       } catch (ex) { toast(ex.message); }
     });
@@ -381,7 +438,22 @@
   let list = null;          // respuesta de GET /api/collections
   let current = null;       // colección abierta: {id, sort, page, data}
 
+  /* Favoritos aún no existe en el servidor (id null): se muestra vacío; el primer ♡ lo crea */
+  function openVirtualFavorites() {
+    const fav = (list && list.items.find((c) => c.is_favorites)) || { name: "Favoritos", color: "rose", is_favorites: true, virtual: true };
+    current = { id: null, sort: "added", page: 1, data: { collection: fav, items: [], total: 0, page: 1, pages: 0 } };
+    renderCollection();
+  }
+
   async function loadView() {
+    if (current && current.id === null) {        // ¿ya se creó Favoritos (♡ desde otra pestaña)?
+      try {
+        list = await api("/api/collections");
+        const fav = list.items.find((c) => c.is_favorites);
+        if (fav && !fav.virtual) return loadCollection(fav.id);
+        return openVirtualFavorites();
+      } catch (e) { toast(e.message); return undefined; }
+    }
     if (current) return loadCollection(current.id, { keep: true });
     try {
       list = await api("/api/collections");
@@ -412,10 +484,10 @@
         <div><h2>Colecciones</h2><p class="muted">Agrupa productos para decidir después: «Ideas Navidad», «Probar en marzo»… Toca ♡ en una tarjeta para guardarla en Favoritos.</p></div>
         <button type="button" class="primary" id="collNew">+ Nueva colección</button>
       </div>
-      <div class="coll-grid">${items.map((c) => `<article class="coll-card c-${esc(c.color)}" data-cid="${c.id}">
+      <div class="coll-grid">${items.map((c) => `<article class="coll-card c-${esc(c.color)}" data-cid="${c.id ?? ""}">
           ${mosaic(c)}
           <div class="coll-card-body">
-            <h3><button type="button" class="coll-open" data-cid="${c.id}">${c.is_favorites ? "♥ " : ""}${esc(c.name)}</button></h3>
+            <h3><button type="button" class="coll-open">${c.is_favorites ? "♥ " : ""}${esc(c.name)}</button></h3>
             ${c.description ? `<p class="muted coll-desc">${esc(c.description)}</p>` : ""}
             <p class="muted small">${nProducts(c.count)} · ${esc(fmtDate(c.updated_at))}</p>
           </div></article>`).join("")}</div>
@@ -470,7 +542,7 @@
           <label class="sr-only" for="collSort">Ordenar productos</label>
           <select id="collSort">${SORTS.map(([k, l]) => `<option value="${k}" ${k === sort ? "selected" : ""}>${l}</option>`).join("")}</select>
           <button type="button" class="ghost" id="collExport" ${data.total ? "" : "disabled"}>⬇ Exportar a Excel (CSV)</button>
-          <button type="button" class="ghost" id="collEdit">${c.is_favorites ? "Editar color" : "Editar"}</button>
+          ${c.virtual ? "" : `<button type="button" class="ghost" id="collEdit">${c.is_favorites ? "Editar color" : "Editar"}</button>`}
           ${c.is_favorites ? "" : '<button type="button" class="ghost danger" id="collDelete">Eliminar</button>'}
         </div>
       </div>
@@ -492,7 +564,11 @@
       const t = e.target;
       if (t.closest("#collNew")) { openEdit(null, () => loadView()); return; }
       const card = t.closest(".coll-card");
-      if (!current && card) { loadCollection(Number(card.dataset.cid)); return; }
+      if (!current && card) {
+        if (card.dataset.cid) loadCollection(Number(card.dataset.cid));
+        else openVirtualFavorites();
+        return;
+      }
       if (t.closest("#collBack")) { current = null; loadView(); return; }
       if (t.closest("#collGoSearch")) { const tab = $('.tab[data-view="search"]'); if (tab) tab.click(); return; }
       const det = t.closest("[data-open]");
@@ -538,7 +614,7 @@
       if (e.key === "Enter" && !e.shiftKey && e.target.matches("textarea[data-note]")) { e.preventDefault(); e.target.blur(); }
     });
     r.addEventListener("change", async (e) => {
-      if (e.target.id === "collSort" && current) {
+      if (e.target.id === "collSort" && current && current.id !== null) {
         current.sort = e.target.value; current.page = 1;
         loadCollection(current.id, { keep: true });
         return;

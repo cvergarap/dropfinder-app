@@ -138,7 +138,7 @@ def _best_effort(conn, fn, *args) -> None:
         conn.execute("PRAGMA busy_timeout = 5000")
 
 
-def search_products(qs: dict) -> dict:
+def search_products(qs: dict, *, log: bool = True) -> dict:
     """Búsqueda con texto completo, filtros, orden y paginación en SQL.
 
     Además de total/page/page_size/pages/items devuelve:
@@ -151,6 +151,7 @@ def search_products(qs: dict) -> dict:
       took_ms         tiempo de la consulta en el servidor (milisegundos)
 
     Con `exact=1` no se autocorrige (el usuario pidió buscar su texto tal cual).
+    log=False: no registra la consulta para el autocompletado (p. ej. al exportar resultados).
     """
     started = time.perf_counter()
     exact = qs.get("exact", ["0"])[0] == "1"
@@ -184,7 +185,7 @@ def search_products(qs: dict) -> dict:
                         total, items, corrected_from, effective = t2, i2, q, fix
                 elif _query(conn, fix_tokens, use_fts, where, args, sort, page, size, count_only=True)[0] > total:
                     suggestion = fix
-        if tokens and page == 1:      # para el autocompletado se guarda la consulta ya corregida
+        if tokens and page == 1 and log:   # para el autocompletado se guarda la consulta ya corregida
             _best_effort(conn, search.log_search, effective, total, db.now())
     return {
         "total": total, "page": page, "page_size": size, "pages": math.ceil(total / size) if total else 0,

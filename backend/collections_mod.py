@@ -6,10 +6,17 @@ Módulo de funcionalidad: expone ROUTES (método, regex, handler(match, qs, body
 Datos por usuario: cada consulta filtra por auth_context.current_user_id(). Una colección de otro
 usuario responde 404 (no 403), igual que una que no existe: no se revela que existe.
 
-Tablas (se crean al primer uso con ensure_schema, sin tocar db.py):
+Los GET nunca escriben (ni crean tablas ni Favoritos): si otra conexión tiene la base bloqueada para
+escribir (carga de CSV, monitor), igual responden. Las tablas se crean en la primera escritura, una vez
+por proceso (_open_write).
+
+Para la capa de cuentas: reassign_user, delete_user_data y count_for_user (ver más abajo).
+
+Tablas (se crean en la primera escritura con ensure_schema, sin tocar db.py):
   collections        id, user_id, name, description, color, is_favorites, created_at, updated_at
-                     "Favoritos" es una colección especial por usuario (is_favorites = 1): se crea al
-                     primer uso, no se puede borrar ni renombrar y no cuenta para el tope de colecciones.
+                     "Favoritos" es una colección especial por usuario (is_favorites = 1): se crea en la
+                     primera escritura (los GET muestran uno «virtual» con id None hasta entonces), no se
+                     puede borrar ni renombrar y no cuenta para el tope de colecciones.
   collection_items   id (orden de llegada: el más reciente primero), collection_id, product_id, note,
                      added_at. UNIQUE (collection_id, product_id): agregar dos veces no duplica.
                      ON DELETE CASCADE hacia collections y products: si el proveedor retira el producto
@@ -24,18 +31,20 @@ Exportación (GET /api/export/{search|collection|imports}.csv): CSV pensado para
   - currency=USD|COP (por defecto, la moneda que ve el usuario). En COP: precios de venta con el
     redondeo comercial del usuario (currency.round_price); costo, envío y ganancia con redondeo simple
     (currency.convert). Los encabezados de dinero llevan la moneda: "Costo (COP)".
-  - Inyección de fórmulas: las celdas de TEXTO que empiezan con = + - @ tab o CR llevan un apóstrofo
-    delante (Excel/LibreOffice las ejecutarían como fórmula). Las celdas numéricas las genera la app
-    (p. ej. una ganancia negativa "-3,50") y no se alteran.
+  - Inyección de fórmulas: las celdas de TEXTO que empiezan (también tras espacios, NBSP o caracteres
+    de ancho cero) con = + - @ | % tab, CR o LF llevan un apóstrofo delante. Las celdas numéricas las
+    genera la app (p. ej. una ganancia negativa "-3,50") y no se alteran.
+  - SKU que Excel convertiría en número o fecha (0012, 1-2, EAN de 13 dígitos) llevan un apóstrofo
+    delante (ver _EXCEL_MANGLES).
 """
 from __future__ import annotations
 
 import csv
 import io
 import math
-import os
 import re
 import sys
+import threading
 from datetime import datetime
 
 import auth_context
@@ -86,15 +95,50 @@ SCHEMA = (
 
 
 def ensure_schema(conn) -> None:
-    """Crea las tablas del módulo si faltan (idempotente y barato: se llama en cada petición)."""
+    """Crea las tablas del módulo si faltan (idempotente). Solo se llama desde escrituras."""
     for stmt in SCHEMA:
         conn.execute(stmt)
 
 
-def _open():
+def _has_tables(conn) -> bool:
+    return conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
+                        "AND name IN ('collections', 'collection_items')").fetchone()[0] == 2
+
+
+# Bases (ruta) donde ya se sabe que las tablas existen: el esquema se comprueba/crea una vez por proceso
+_ready: set = set()
+_schema_lock = threading.Lock()
+
+
+def tables_exist(conn) -> bool:
+    if db.DB_PATH in _ready:
+        return True
+    if _has_tables(conn):
+        _ready.add(db.DB_PATH)
+        return True
+    return False
+
+
+def _open_read():
+    """Conexión para las peticiones GET: nunca escribe ni crea tablas. Así un GET responde aunque otra
+    conexión tenga la base bloqueada para escribir (carga de CSV, monitor)."""
+    return db.connect()
+
+
+def _open_write():
+    """Conexión para las peticiones que modifican datos: crea las tablas la primera vez (una vez por
+    proceso y base, con candado)."""
     conn = db.connect()
-    ensure_schema(conn)
-    conn.commit()
+    if db.DB_PATH not in _ready:
+        try:
+            with _schema_lock:
+                if not tables_exist(conn):
+                    ensure_schema(conn)
+                    conn.commit()
+                    _ready.add(db.DB_PATH)
+        except BaseException:
+            conn.close()
+            raise
     return conn
 
 
@@ -110,19 +154,12 @@ def _srv():
     return mod
 
 
-# SOLO DESARROLLO: DROPFINDER_DEV_USER=<id> hace que las peticiones sin usuario actúen como ese usuario
-# (para probar este módulo en una rama sin el middleware de autenticación). Nunca usarlo en producción:
-# con cuentas de usuario, server.py fija el usuario real de cada petición y esta variable no debe existir.
-_DEV_USER = os.environ.get("DROPFINDER_DEV_USER", "").strip()
-
-
 def _uid() -> int:
-    """Usuario de la petición. Sin usuario (sin sesión) → 401."""
+    """Usuario de la petición. Sin usuario (sin sesión) → 401. No hay modo de desarrollo propio: la
+    rama de cuentas define uno solo, en un único lugar."""
     try:
         return auth_context.current_user_id()
     except auth_context.NoUserContext:
-        if _DEV_USER.isdigit():
-            return int(_DEV_USER)
         raise ApiError(401, "Inicia sesión") from None
 
 
@@ -224,7 +261,7 @@ def _view(conn, r) -> dict:
                         "ORDER BY ci.id DESC LIMIT 4", (r["id"],)).fetchall()
     return {
         "id": r["id"], "name": r["name"], "description": r["description"], "color": r["color"],
-        "is_favorites": bool(r["is_favorites"]), "count": _count(conn, r["id"]),
+        "is_favorites": bool(r["is_favorites"]), "virtual": False, "count": _count(conn, r["id"]),
         "created_at": r["created_at"], "updated_at": r["updated_at"],
         # Las fotos pueden venir vacías: `preview` trae título y categoría para dibujar la ilustración
         "preview_images": [p["image"] or "" for p in prev],
@@ -232,15 +269,26 @@ def _view(conn, r) -> dict:
     }
 
 
+def _virtual_favorites() -> dict:
+    """Favoritos aún no creado: los GET no escriben, así que se muestra uno «virtual» (id None) hasta la
+    primera escritura (el primer ♡ o agregar a Favoritos lo crea)."""
+    return {"id": None, "name": FAVORITES_NAME, "description": "", "color": FAVORITES_COLOR,
+            "is_favorites": True, "virtual": True, "count": 0, "created_at": None, "updated_at": None,
+            "preview_images": [], "preview": []}
+
+
 # ---------------------------------------------------------------- colecciones
 
 def list_collections() -> dict:
-    with _open() as conn:
-        _favorites_id(conn)       # Favoritos siempre existe (se crea la primera vez)
-        rows = conn.execute("SELECT * FROM collections WHERE user_id = ? "
-                            "ORDER BY is_favorites DESC, updated_at DESC, id DESC", (_uid(),)).fetchall()
-        return {"items": [_view(conn, r) for r in rows], "max": MAX_COLLECTIONS, "max_items": MAX_ITEMS,
-                "colors": list(COLORS)}
+    items = []
+    with _open_read() as conn:
+        if tables_exist(conn):
+            rows = conn.execute("SELECT * FROM collections WHERE user_id = ? "
+                                "ORDER BY is_favorites DESC, updated_at DESC, id DESC", (_uid(),)).fetchall()
+            items = [_view(conn, r) for r in rows]
+    if not (items and items[0]["is_favorites"]):
+        items.insert(0, _virtual_favorites())
+    return {"items": items, "max": MAX_COLLECTIONS, "max_items": MAX_ITEMS, "colors": list(COLORS)}
 
 
 def create_collection(body) -> dict:
@@ -248,7 +296,7 @@ def create_collection(body) -> dict:
     name = _clean_text(body.get("name"), "Nombre", MAX_NAME, required=True)
     desc = _clean_text(body.get("description"), "Descripción", MAX_DESCRIPTION)
     color = _clean_color(body.get("color"))
-    with _open() as conn:
+    with _open_write() as conn:
         conn.execute("BEGIN IMMEDIATE")    # tope y nombre repetido con el bloqueo de escritura tomado
         n = conn.execute("SELECT COUNT(*) FROM collections WHERE user_id = ? AND is_favorites = 0",
                          (_uid(),)).fetchone()[0]
@@ -264,7 +312,7 @@ def create_collection(body) -> dict:
 
 def update_collection(cid: int, body) -> dict:
     body = _body(body)
-    with _open() as conn:
+    with _open_write() as conn:
         r = _get(conn, cid)
         sets, args = [], []
         if "name" in body:
@@ -290,7 +338,7 @@ def update_collection(cid: int, body) -> dict:
 
 
 def delete_collection(cid: int) -> dict:
-    with _open() as conn:
+    with _open_write() as conn:
         if _get(conn, cid)["is_favorites"]:
             raise ApiError(400, "La colección Favoritos no se puede eliminar")
         conn.execute("DELETE FROM collections WHERE id = ?", (cid,))     # ítems: ON DELETE CASCADE
@@ -328,7 +376,9 @@ def list_items(cid: int, qs: dict) -> dict:
     size = _int_param(qs, "page_size", PAGE_SIZE, 1, 100)
     page = _int_param(qs, "page", 1, 1, 10_000)
     item = _srv()._item
-    with _open() as conn:
+    with _open_read() as conn:
+        if not tables_exist(conn):
+            raise ApiError(404, "Colección no encontrada")
         coll = _view(conn, _get(conn, cid))
         total = coll["count"]
         rows = conn.execute(_items_sql(sort) + " LIMIT ? OFFSET ?",
@@ -369,14 +419,14 @@ def add_items(cid: int, body) -> dict:
     body = _body(body)
     ids = _product_ids(body.get("product_ids", body.get("product_id")))
     note = _clean_note(body["note"]) if body.get("note") is not None else None
-    with _open() as conn:
+    with _open_write() as conn:
         conn.execute("BEGIN IMMEDIATE")
         _get(conn, cid)
         return _add(conn, cid, ids, note)
 
 
 def remove_item(cid: int, pid: int) -> dict:
-    with _open() as conn:
+    with _open_write() as conn:
         _get(conn, cid)
         n = conn.execute("DELETE FROM collection_items WHERE collection_id = ? AND product_id = ?",
                          (cid, pid)).rowcount
@@ -390,7 +440,7 @@ def update_item(cid: int, pid: int, body) -> dict:
     if "note" not in body:
         raise ApiError(400, "Indica la nota")
     note = _clean_note(body["note"])
-    with _open() as conn:
+    with _open_write() as conn:
         _get(conn, cid)
         n = conn.execute("UPDATE collection_items SET note = ? WHERE collection_id = ? AND product_id = ?",
                          (note, cid, pid)).rowcount
@@ -403,7 +453,7 @@ def update_item(cid: int, pid: int, body) -> dict:
 # ---------------------------------------------------------------- favoritos
 
 def toggle_favorite(pid: int) -> dict:
-    with _open() as conn:
+    with _open_write() as conn:
         conn.execute("BEGIN IMMEDIATE")
         if not conn.execute("SELECT 1 FROM products WHERE id = ?", (pid,)).fetchone():
             raise ApiError(404, "Producto no encontrado")
@@ -428,8 +478,8 @@ def favorite_ids(qs: dict) -> dict:
     ids = list(dict.fromkeys(int(x) for x in parts))
     if len(ids) > MAX_IDS_QUERY:
         raise ApiError(400, f"Máximo {MAX_IDS_QUERY} ids")
-    with _open() as conn:
-        fid = _favorites_id(conn, create=False)
+    with _open_read() as conn:
+        fid = _favorites_id(conn, create=False) if tables_exist(conn) else None
         if fid is None:
             return {"ids": [], "total": 0}
         have = set()
@@ -443,23 +493,122 @@ def favorite_ids(qs: dict) -> dict:
 def product_collections(pid: int) -> dict:
     """Todas mis colecciones con contains/note para un producto (casillas del detalle);
     collection_ids = las que lo contienen."""
-    with _open() as conn:
+    rows = []
+    with _open_read() as conn:
         if not conn.execute("SELECT 1 FROM products WHERE id = ?", (pid,)).fetchone():
             raise ApiError(404, "Producto no encontrado")
-        _favorites_id(conn)
-        rows = conn.execute(
-            "SELECT c.id, c.name, c.color, c.is_favorites, ci.note, ci.product_id IS NOT NULL AS has_it, "
-            "(SELECT COUNT(*) FROM collection_items x WHERE x.collection_id = c.id) AS n "
-            "FROM collections c LEFT JOIN collection_items ci ON ci.collection_id = c.id AND ci.product_id = ? "
-            "WHERE c.user_id = ? ORDER BY c.is_favorites DESC, c.updated_at DESC, c.id DESC", (pid, _uid())).fetchall()
+        if tables_exist(conn):
+            rows = conn.execute(
+                "SELECT c.id, c.name, c.color, c.is_favorites, ci.note, ci.product_id IS NOT NULL AS has_it, "
+                "(SELECT COUNT(*) FROM collection_items x WHERE x.collection_id = c.id) AS n "
+                "FROM collections c LEFT JOIN collection_items ci ON ci.collection_id = c.id AND ci.product_id = ? "
+                "WHERE c.user_id = ? ORDER BY c.is_favorites DESC, c.updated_at DESC, c.id DESC",
+                (pid, _uid())).fetchall()
     items = [{"id": r["id"], "name": r["name"], "color": r["color"], "is_favorites": bool(r["is_favorites"]),
-              "contains": bool(r["has_it"]), "note": r["note"] or "", "count": r["n"]} for r in rows]
+              "virtual": False, "contains": bool(r["has_it"]), "note": r["note"] or "", "count": r["n"]} for r in rows]
+    if not (items and items[0]["is_favorites"]):
+        v = _virtual_favorites()
+        items.insert(0, {k: v[k] for k in ("id", "name", "color", "is_favorites", "virtual", "count")}
+                     | {"contains": False, "note": ""})
     return {"product_id": pid, "collection_ids": [c["id"] for c in items if c["contains"]], "items": items}
+
+
+# ---------------------------------------------------------------- capa de cuentas
+# Funciones públicas para la rama de cuentas de usuario. Reciben la conexión del llamador (no hacen commit:
+# corren dentro de su transacción) y toleran que las tablas aún no existan (nadie usó colecciones).
+
+def _unique_name(name: str, taken: set) -> str:
+    """name, o "name (2)", "name (3)"… sin chocar con `taken` (casefold) y sin pasar de MAX_NAME."""
+    if name.casefold() not in taken:
+        return name
+    n = 2
+    while True:
+        suffix = f" ({n})"
+        cand = name[:MAX_NAME - len(suffix)].rstrip() + suffix
+        if cand.casefold() not in taken:
+            return cand
+        n += 1
+
+
+def reassign_user(conn, old_user_id: int, new_user_id: int) -> dict:
+    """Pasa las colecciones de old_user_id a new_user_id (p. ej. datos heredados del usuario 1 al primer
+    propietario):
+    - Favoritos: si ambos tienen, los productos del viejo se agregan al nuevo sin duplicar (si el producto
+      ya estaba, se conserva la nota del nuevo salvo que esté vacía) y el Favoritos viejo se borra. Así
+      nunca hay dos Favoritos para el índice único parcial.
+    - Nombres repetidos (sin distinguir mayúsculas): la colección que llega se renombra "Nombre (2)".
+    Los topes (100 colecciones, 2.000 productos) no se aplican en la fusión: no se pierden datos.
+    Devuelve {"moved", "merged_favorites", "renamed"}."""
+    out = {"moved": 0, "merged_favorites": 0, "renamed": 0}
+    if old_user_id == new_user_id or not _has_tables(conn):
+        return out
+    fav = {u: (r[0] if r else None) for u in (old_user_id, new_user_id) for r in [conn.execute(
+        "SELECT id FROM collections WHERE user_id = ? AND is_favorites = 1", (u,)).fetchone()]}
+    if fav[old_user_id] is not None and fav[new_user_id] is not None:
+        old_f, new_f = fav[old_user_id], fav[new_user_id]
+        conn.execute("UPDATE collection_items SET note = (SELECT o.note FROM collection_items o "
+                     "WHERE o.collection_id = ? AND o.product_id = collection_items.product_id) "
+                     "WHERE collection_id = ? AND note = '' AND product_id IN "
+                     "(SELECT product_id FROM collection_items WHERE collection_id = ? AND note != '')",
+                     (old_f, new_f, old_f))
+        out["merged_favorites"] = conn.execute(
+            "INSERT OR IGNORE INTO collection_items(collection_id, product_id, note, added_at) "
+            "SELECT ?, product_id, note, added_at FROM collection_items WHERE collection_id = ? ORDER BY id",
+            (new_f, old_f)).rowcount
+        conn.execute("DELETE FROM collection_items WHERE collection_id = ?", (old_f,))
+        conn.execute("DELETE FROM collections WHERE id = ?", (old_f,))
+        conn.execute("UPDATE collections SET updated_at = ? WHERE id = ?", (db.now(), new_f))
+    taken = {r[0].casefold() for r in conn.execute(
+        "SELECT name FROM collections WHERE user_id = ? AND is_favorites = 0", (new_user_id,))}
+    for cid, name in conn.execute("SELECT id, name FROM collections WHERE user_id = ? AND is_favorites = 0 "
+                                  "ORDER BY id", (old_user_id,)).fetchall():
+        new_name = _unique_name(name, taken)
+        taken.add(new_name.casefold())
+        if new_name != name:
+            conn.execute("UPDATE collections SET name = ? WHERE id = ?", (new_name, cid))
+            out["renamed"] += 1
+    out["moved"] = conn.execute("UPDATE collections SET user_id = ? WHERE user_id = ?",
+                                (new_user_id, old_user_id)).rowcount
+    return out
+
+
+def delete_user_data(conn, user_id: int) -> int:
+    """Borra todas las colecciones (y sus productos y notas) de un usuario. Devuelve cuántas borró."""
+    if not _has_tables(conn):
+        return 0
+    conn.execute("DELETE FROM collection_items WHERE collection_id IN "
+                 "(SELECT id FROM collections WHERE user_id = ?)", (user_id,))   # por si foreign_keys está OFF
+    return conn.execute("DELETE FROM collections WHERE user_id = ?", (user_id,)).rowcount
+
+
+def count_for_user(conn, user_id: int) -> dict:
+    """Resumen para el panel (onboarding): {"collections": sin contar Favoritos, "favorites": productos en
+    Favoritos, "items": productos guardados en total (con repeticiones entre colecciones)}."""
+    if not _has_tables(conn):
+        return {"collections": 0, "favorites": 0, "items": 0}
+    r = conn.execute(
+        "SELECT COALESCE(SUM(c.is_favorites = 0), 0), "
+        "(SELECT COUNT(*) FROM collection_items i JOIN collections f ON f.id = i.collection_id "
+        " WHERE f.user_id = ? AND f.is_favorites = 1), "
+        "(SELECT COUNT(*) FROM collection_items i JOIN collections a ON a.id = i.collection_id WHERE a.user_id = ?) "
+        "FROM collections c WHERE c.user_id = ?", (user_id, user_id, user_id)).fetchone()
+    return {"collections": r[0], "favorites": r[1], "items": r[2]}
 
 
 # ---------------------------------------------------------------- exportación CSV
 
-FORMULA_CHARS = ("=", "+", "-", "@", "\t", "\r")
+# Caracteres que inician una fórmula (o un DDE como |cmd) en Excel, LibreOffice o Google Sheets, incluidas
+# sus variantes de ancho completo. Se miran después de quitar espacios, NBSP y caracteres de ancho cero,
+# porque algunas importaciones los recortan (" =1+1" acabaría como fórmula).
+FORMULA_CHARS = tuple("=+-@|%\t\r\n\uff1d\uff0b\uff0d\uff20")
+_INVISIBLE_LEAD = " \u00a0\u2007\u202f\u200b\u200c\u200d\u2060\ufeff"
+# SKU que Excel cambiaría al abrir el CSV: ceros a la izquierda (0012 → 12), 12+ dígitos (EAN-13 →
+# 7,70123E+12), fechas (1-2, 3/4, 2024-01-05 → fecha), notación científica (1E5) o decimales (12.50).
+# Opciones evaluadas: ="0012" es una fórmula (lo que justamente se neutraliza); un carácter invisible
+# delante ensucia el SKU al copiarlo o buscarlo (BUSCARV no lo encontraría); el apóstrofo delante es lo
+# menos malo: conserva el valor completo y es visible ('0012), así nadie lo confunde. Solo se agrega a
+# los valores que Excel alteraría; un SKU como ABC-12 o 12345 queda igual.
+_EXCEL_MANGLES = re.compile(r"0\d+|\d{12,}|\d{1,4}[-/.]\d{1,2}([-/.]\d{1,4})?|\d+(\.\d+)?[eE][+-]?\d+|\d+[.,]\d+")
 BASE_COLUMNS = ["Título", "Proveedor", "SKU", "Categoría", "Costo", "Envío", "Costo total", "Precio sugerido",
                 "Ganancia", "Margen %", "Días de envío", "Almacén", "Stock", "Pedidos", "Rating", "Score", "Enlace"]
 MONEY_COLUMNS = {"Costo", "Envío", "Costo total", "Precio sugerido", "Ganancia", "Precio de venta"}
@@ -467,9 +616,20 @@ STATUS_NAMES = {"active": "Activo", "draft": "Borrador"}
 
 
 def safe_text(value) -> str:
-    """Texto de una celda, neutralizando fórmulas (=1+1, +cmd, -2+3, @SUM…) con un apóstrofo."""
+    """Texto de una celda, neutralizando fórmulas (=1+1, +cmd, -2+3, @SUM, |cmd, " =1+1"…) con un
+    apóstrofo delante."""
     s = "" if value is None else str(value)
-    return "'" + s if s.startswith(FORMULA_CHARS) else s
+    lead = s.lstrip(_INVISIBLE_LEAD)
+    if s.startswith(FORMULA_CHARS) or lead.startswith(FORMULA_CHARS):
+        return "'" + s
+    return s
+
+
+def safe_code(value) -> str:
+    """Identificador (SKU): como safe_text y, además, apóstrofo si Excel lo convertiría en número o fecha
+    (ver _EXCEL_MANGLES)."""
+    s = safe_text(value)
+    return "'" + s if _EXCEL_MANGLES.fullmatch(s.strip()) else s
 
 
 class _Formatter:
@@ -504,7 +664,7 @@ class _Formatter:
 
 def _row(p: dict, f: _Formatter, profit=None, margin=None) -> list:
     return [
-        safe_text(p["title"]), safe_text(p["supplier"]), safe_text(p["supplier_sku"]), safe_text(p["category"]),
+        safe_text(p["title"]), safe_text(p["supplier"]), safe_code(p["supplier_sku"]), safe_text(p["category"]),
         f.amount(p["cost"]), f.amount(p["shipping_cost"]), f.amount(p["total_cost"]),
         f.price(p["suggested_price"]),
         f.amount(p["profit"] if profit is None else profit),
@@ -556,7 +716,7 @@ def search_export_items(qs: dict, cap: int = EXPORT_CAP) -> tuple[list, int]:
     srv = _srv()
     q = {k: list(v) for k, v in qs.items() if k not in ("page", "page_size", "sep", "currency", "id")}
     q["page_size"] = ["100"]
-    first = srv.search_products({**q, "page": ["1"]})
+    first = srv.search_products({**q, "page": ["1"]}, log=False)    # exportar no es buscar
     total = first["total"]
     items, seen = [], set()
 
@@ -571,7 +731,7 @@ def search_export_items(qs: dict, cap: int = EXPORT_CAP) -> tuple[list, int]:
     page = 1
     while len(items) < min(total, cap) and page < first["pages"]:
         page += 1
-        batch = srv.search_products({**q, "page": [str(page)]})["items"]
+        batch = srv.search_products({**q, "page": [str(page)]}, log=False)["items"]
         if not batch:
             break
         take(batch)
@@ -579,13 +739,15 @@ def search_export_items(qs: dict, cap: int = EXPORT_CAP) -> tuple[list, int]:
 
 
 def export_csv(kind: str, qs: dict) -> FileResponse:
-    with _open() as conn:
+    with _open_read() as conn:
         sep, f = _export_opts(qs, conn)
         if kind == "collection":
             raw = qs.get("id", [""])[0].strip()
             if not raw.isdigit():
                 raise ApiError(400, "Indica la colección (id)")
             cid = int(raw)
+            if not tables_exist(conn):
+                raise ApiError(404, "Colección no encontrada")
             _get(conn, cid)
             item = _srv()._item
             data = [item(r) for r in conn.execute(_items_sql(_sort(qs)) + " LIMIT ?", (_uid(), cid, EXPORT_CAP))]

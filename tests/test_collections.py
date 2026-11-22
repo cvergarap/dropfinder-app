@@ -6,10 +6,13 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -124,8 +127,11 @@ class CollectionsTest(unittest.TestCase):
 
     def test_favoritos_no_se_borra_ni_renombra(self):
         with owner():
+            virtual = cm.list_collections()["items"][0]
+            self.assertEqual((virtual["is_favorites"], virtual["virtual"], virtual["id"]), (True, True, None))
+            cm.toggle_favorite(self.pids[0])                   # la primera escritura lo crea
             fav = cm.list_collections()["items"][0]
-            self.assertTrue(fav["is_favorites"])
+            self.assertEqual((fav["is_favorites"], fav["virtual"], fav["count"]), (True, False, 1))
             self.err(400, cm.delete_collection, fav["id"])
             self.err(400, cm.update_collection, fav["id"], {"name": "Otra"})
             self.assertEqual(cm.update_collection(fav["id"], {"color": "violet"})["color"], "violet")
@@ -252,18 +258,79 @@ class CollectionsTest(unittest.TestCase):
             self.assertEqual([(p["id"], p["note"]) for p in d["items"]], [(a, "mía")])
             self.assertEqual(cm.favorite_ids({"ids": [str(a)]})["total"], 1)
 
-    def test_sin_usuario_401_y_modo_desarrollo(self):
+    def test_sin_usuario_401_sin_modo_desarrollo(self):
         auth_context.clear()
         e = self.err(401, self.route, "GET", "/api/collections")
         self.assertEqual(str(e), "Inicia sesión")
         self.err(401, self.route, "POST", "/api/collections", None, {"name": ""})    # 401 antes que 400
         self.err(401, self.route, "GET", "/api/export/search.csv")
-        old = cm._DEV_USER
-        cm._DEV_USER = "1"
-        try:
-            self.assertEqual(self.route("GET", "/api/collections")["items"][0]["name"], "Favoritos")
-        finally:
-            cm._DEV_USER = old
+        # El módulo no tiene modo de desarrollo propio: la variable de entorno no abre nada
+        self.assertFalse(hasattr(cm, "_DEV_USER"))
+        with mock.patch.dict(os.environ, {"DROPFINDER_DEV_USER": "1"}):
+            self.err(401, self.route, "GET", "/api/collections")
+            self.err(401, self.route, "POST", "/api/favorites/1")
+
+    # ------------------------------------------------------------ capa de cuentas
+    def _setup_two_users(self):
+        a, b, c = self.pids[:3]
+        with owner():
+            cm.toggle_favorite(a)
+            cm.toggle_favorite(b)
+            fav1 = cm.list_collections()["items"][0]["id"]
+            cm.update_item(fav1, b, {"note": "nota vieja"})
+            cm.create_collection({"name": "Navidad"})
+            m = cm.create_collection({"name": "Marzo"})["id"]
+            cm.add_items(m, {"product_ids": [c]})
+            cm.create_collection({"name": "L" * 60})
+        with auth_context.as_user(5):
+            cm.toggle_favorite(b)
+            cm.toggle_favorite(c)
+            cm.create_collection({"name": "navidad"})
+            cm.create_collection({"name": "l" * 60})
+        return a, b, c
+
+    def test_reassign_user_fusiona_favoritos_y_renombra(self):
+        a, b, c = self._setup_two_users()
+        with db.connect() as conn:
+            r = cm.reassign_user(conn, 1, 5)
+        self.assertEqual(r, {"moved": 3, "merged_favorites": 1, "renamed": 2})
+        with owner():
+            self.assertTrue(cm.list_collections()["items"][0]["virtual"])   # al usuario 1 no le queda nada
+        with auth_context.as_user(5):
+            items = cm.list_collections()["items"]
+            favs = [x for x in items if x["is_favorites"]]
+            self.assertEqual(len(favs), 1)
+            names = sorted(x["name"] for x in items if not x["is_favorites"])
+            self.assertEqual(names, sorted(["navidad", "Navidad (2)", "Marzo", "l" * 60, "L" * 56 + " (2)"]))
+            self.assertTrue(all(len(n) <= cm.MAX_NAME for n in names))
+            fav_items = {p["id"]: p["note"] for p in cm.list_items(favs[0]["id"], {})["items"]}
+            self.assertEqual(fav_items, {a: "", b: "nota vieja", c: ""})     # sin duplicados; nota conservada
+            self.assertEqual(cm.favorite_ids({"ids": [f"{a},{b},{c}"]})["total"], 3)
+        with db.connect() as conn:                                            # idempotente / sin datos
+            self.assertEqual(cm.reassign_user(conn, 1, 5), {"moved": 0, "merged_favorites": 0, "renamed": 0})
+            self.assertEqual(cm.reassign_user(conn, 5, 5)["moved"], 0)
+
+    def test_reassign_user_sin_favoritos_en_destino(self):
+        with owner():
+            cm.toggle_favorite(self.pids[0])
+            cm.create_collection({"name": "Solo"})
+        with db.connect() as conn:
+            self.assertEqual(cm.reassign_user(conn, 1, 9), {"moved": 2, "merged_favorites": 0, "renamed": 0})
+        with auth_context.as_user(9):
+            self.assertEqual(cm.favorite_ids({"ids": [str(self.pids[0])]})["ids"], [self.pids[0]])
+
+    def test_delete_user_data_y_count_for_user(self):
+        a, b, c = self._setup_two_users()
+        with db.connect() as conn:
+            self.assertEqual(cm.count_for_user(conn, 1), {"collections": 3, "favorites": 2, "items": 3})
+            self.assertEqual(cm.count_for_user(conn, 5), {"collections": 2, "favorites": 2, "items": 2})
+            self.assertEqual(cm.count_for_user(conn, 42), {"collections": 0, "favorites": 0, "items": 0})
+            self.assertEqual(cm.delete_user_data(conn, 1), 4)
+            self.assertEqual(cm.count_for_user(conn, 1), {"collections": 0, "favorites": 0, "items": 0})
+            self.assertEqual(cm.count_for_user(conn, 5)["favorites"], 2)        # el otro usuario intacto
+            orphan = conn.execute("SELECT COUNT(*) FROM collection_items WHERE collection_id NOT IN "
+                                  "(SELECT id FROM collections)").fetchone()[0]
+            self.assertEqual(orphan, 0)
 
     # ------------------------------------------------------------ exportación
     def test_export_formato_excel(self):
@@ -342,6 +409,25 @@ class CollectionsTest(unittest.TestCase):
         self.assertEqual(cm.safe_text("-3,50"), "'-3,50")                  # texto, no número
         self.assertEqual(cm.safe_text("\rx"), "'\rx")
         self.assertEqual(cm.safe_text("normal"), "normal")
+        for evil in (" =1+1", "\xa0=1+1", "\u200b=1+1", "\ufeff@SUM(1)", "|cmd", "%0A", "\uff1d1+1", "\n=1"):
+            self.assertEqual(cm.safe_text(evil), "'" + evil, repr(evil))
+        for ok in ("Lámpara 50% off", "100% algodón", "A|B"):                 # solo cuenta el inicio
+            self.assertEqual(cm.safe_text(ok), ok)
+
+    def test_sku_que_excel_alteraria(self):
+        for sku in ("0012", "007", "1-2", "3/4", "2024-01-05", "7701234567890", "1E5", "12.50", "12,5"):
+            self.assertEqual(cm.safe_code(sku), "'" + sku, sku)
+        for sku in ("12345", "ABC-12", "AL-100002", "X1-2", "0"):
+            self.assertEqual(cm.safe_code(sku), sku, sku)
+        self.assertEqual(cm.safe_code("=1"), "'=1")                            # no doble apóstrofo
+        with owner():
+            server.upload_csv({"supplier": "Prov Codigos", "csv": "sku;titulo;costo\n0012;Con ceros;5\n1-2;Fecha;5\n"})
+            with db.connect() as conn:
+                ids = [r[0] for r in conn.execute("SELECT id FROM products WHERE supplier = 'Prov Codigos'")]
+            col = cm.create_collection({"name": "Códigos"})["id"]
+            cm.add_items(col, {"product_ids": ids})
+            rows = parse_csv(cm.export_csv("collection", {"id": [str(col)]}).body)[1:]
+        self.assertEqual(sorted(r[2] for r in rows), ["'0012", "'1-2"])
 
     def test_export_ganancia_negativa_no_se_altera(self):
         f = cm._Formatter({"settings": {}, "rates": {"USD": 1.0}}, "USD", dec_comma=True)
@@ -370,6 +456,20 @@ class CollectionsTest(unittest.TestCase):
             rows2 = parse_csv(cm.export_csv("imports", {}).body)
         self.assertEqual([r[0] for r in rows2[1:]], [f"Mi título {b}"])
 
+    def test_export_no_registra_busquedas(self):
+        def logged():
+            with db.connect() as conn:
+                return conn.execute("SELECT COUNT(*) FROM search_log").fetchone()[0]
+        with db.connect() as conn:
+            conn.execute("DELETE FROM search_log")      # la ventana anti-repetición no debe ocultar el registro
+        with owner():
+            before = logged()
+            cm.export_csv("search", {"q": ["lampara"]})
+            cm.search_export_items({"q": ["lampara"]})
+            self.assertEqual(logged(), before)
+            server.search_products({"q": ["lampara"]})                           # una búsqueda real sí
+            self.assertEqual(logged(), before + 1)
+
     def test_export_busqueda_igual_a_la_api(self):
         cases = [{"sort": ["score"]}, {"q": ["lampara"], "in_stock": ["1"]},
                  {"category": ["Mascotas"], "sort": ["price_asc"], "min_margin": ["10"]}]
@@ -397,16 +497,100 @@ class CollectionsTest(unittest.TestCase):
         self.assertEqual([p["id"] for p in items], [p["id"] for p in d1["items"] + d2["items"]][:150])
 
 
+class GetSinEscriturasTest(unittest.TestCase):
+    """Los GET no escriben: responden aunque otra conexión tenga la base bloqueada (BEGIN IMMEDIATE) y no
+    crean tablas ni Favoritos. El esquema se crea una sola vez, en la primera escritura."""
+
+    def setUp(self):
+        self.tmp = _TempDb()                 # base nueva: las tablas del módulo aún no existen
+        db.init_db(seed_size=60)
+        with db.connect() as conn:
+            self.pid = conn.execute("SELECT id FROM products LIMIT 1").fetchone()[0]
+
+    def tearDown(self):
+        self.tmp.close()
+
+    def _tables(self):
+        with db.connect() as conn:
+            return cm._has_tables(conn)
+
+    def _gets(self, uid):
+        with auth_context.as_user(uid):
+            t = time.perf_counter()
+            items = cm.list_collections()["items"]
+            pc = cm.product_collections(self.pid)
+            fi = cm.favorite_ids({"ids": [str(self.pid)]})
+            cm.export_csv("imports", {})
+            for fn, args in [(cm.list_items, (1, {})), (cm.export_csv, ("collection", {"id": ["1"]}))]:
+                with self.assertRaises(ApiError) as ctx:
+                    fn(*args)
+                self.assertEqual(ctx.exception.status, 404)
+            return time.perf_counter() - t, items, pc, fi
+
+    def _locked(self):
+        w = sqlite3.connect(db.DB_PATH, isolation_level=None)
+        w.execute("BEGIN IMMEDIATE")
+        w.execute("UPDATE settings SET value = value")
+        return w
+
+    def test_get_sin_tablas_con_base_bloqueada(self):
+        w = self._locked()
+        try:
+            took, items, pc, fi = self._gets(77)
+        finally:
+            w.execute("ROLLBACK")
+            w.close()
+        self.assertLess(took, 1.0)
+        self.assertEqual([(x["name"], x["virtual"], x["id"]) for x in items], [("Favoritos", True, None)])
+        self.assertEqual((pc["collection_ids"], pc["items"][0]["virtual"]), ([], True))
+        self.assertEqual(fi, {"ids": [], "total": 0})
+        self.assertFalse(self._tables())                       # ningún GET creó las tablas
+
+    def test_get_de_usuario_sin_favoritos_con_base_bloqueada(self):
+        with auth_context.as_user(1):
+            cm.create_collection({"name": "Existe"})            # tablas creadas por una escritura
+        w = self._locked()
+        try:
+            took, items, pc, _ = self._gets(78)                 # usuario sin Favoritos: antes hacía INSERT
+        finally:
+            w.execute("ROLLBACK")
+            w.close()
+        self.assertLess(took, 1.0)
+        self.assertTrue(items[0]["virtual"])
+        with db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM collections WHERE user_id = 78").fetchone()[0], 0)
+
+    def test_esquema_una_vez_por_proceso(self):
+        calls = []
+        real = cm.ensure_schema
+        with mock.patch.object(cm, "ensure_schema", side_effect=lambda conn: (calls.append(1), real(conn))):
+            with auth_context.as_user(1):
+                cm.list_collections()
+                self.assertEqual(calls, [])                     # un GET no crea el esquema
+                cm.create_collection({"name": "Uno"})
+                cm.toggle_favorite(self.pid)
+                cm.create_collection({"name": "Dos"})
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(self._tables())
+
+    def test_helpers_sin_tablas(self):
+        with db.connect() as conn:
+            self.assertEqual(cm.count_for_user(conn, 1), {"collections": 0, "favorites": 0, "items": 0})
+            self.assertEqual(cm.delete_user_data(conn, 1), 0)
+            self.assertEqual(cm.reassign_user(conn, 1, 2), {"moved": 0, "merged_favorites": 0, "renamed": 0})
+        self.assertFalse(self._tables())
+
+
 class CollectionsHttpTest(unittest.TestCase):
-    """Cabeceras de la descarga sobre HTTP real. Esta rama aún no tiene el middleware de sesión: el
-    servidor fija el usuario con el modo de desarrollo (DROPFINDER_DEV_USER)."""
+    """Cabeceras de la descarga sobre HTTP real. Esta rama aún no tiene el middleware de sesión: la prueba
+    sustituye auth_context.current_user_id (usuario 1) mientras corre el servidor."""
 
     @classmethod
     def setUpClass(cls):
         cls.tmp = _TempDb()
         db.init_db(seed_size=120)
-        cls.old_dev = cm._DEV_USER
-        cm._DEV_USER = "1"
+        cls.patch = mock.patch.object(auth_context, "current_user_id", lambda: 1)
+        cls.patch.start()
         cls.srv = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         cls.base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
@@ -415,7 +599,7 @@ class CollectionsHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.srv.shutdown()
         cls.srv.server_close()
-        cm._DEV_USER = cls.old_dev
+        cls.patch.stop()
         cls.tmp.close()
 
     def call(self, method, path, body=None):
