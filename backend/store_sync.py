@@ -714,11 +714,13 @@ def _run_job(job, now: datetime) -> bool:
             if handler is None:
                 raise sc.StoreValidationError(f"Acción desconocida: {job['action']}")
             handler(job, lst, crow, connector, payload, now)
+            _reeval(lst["id"])
             return True
         except _Skip as e:
             _write(lambda c: (c.execute("UPDATE store_jobs SET locked_until = NULL, status = 'done', last_error = ?, updated_at = ? "
                                         "WHERE id = ?", (str(e), _ts(now), job["id"])),
                               _log(c, uid, crow["id"], lst["id"], job["action"], True, str(e))))
+            _reeval(lst["id"])
             return True
         except secrets_store.SecretError:
             _on_error(job, lst, crow, sc.StoreAuthError("No se pudieron descifrar las credenciales guardadas; "
@@ -730,6 +732,13 @@ def _run_job(job, now: datetime) -> bool:
             _on_error(job, lst, crow, sc.StoreError("Error interno al procesar el trabajo", retryable=True),
                       secrets, now)
         return False
+
+
+def _reeval(listing_id: int) -> None:
+    try:
+        _write(lambda c: reevaluate(c, listing_id))
+    except Exception:  # noqa: BLE001 — la próxima pasada del hook lo corregirá; no se pierde el resultado del trabajo
+        log.exception("No se pudieron reevaluar las reglas del anuncio %s", listing_id)
 
 
 def _done(conn, job, lst, action: str, message: str, updates: dict | None = None, now=None) -> None:
@@ -984,6 +993,11 @@ def _on_catalog_write(conn, ids) -> None:
         return
     wanted = None if ids is None else {int(i) for i in ids}
     rows = [r for r in conn.execute(_RULE_SQL) if wanted is None or r["pid"] in wanted]
+    _evaluate(conn, rows)
+
+
+def _evaluate(conn, rows, price: bool = True) -> None:
+    """Deriva el estado deseado de cada anuncio a partir del catálogo ACTUAL y encola lo que falte."""
     if not rows:
         return
     fees = db.get_settings(conn)
@@ -996,9 +1010,16 @@ def _on_catalog_write(conn, ids) -> None:
         cfg = stores_mod.load_settings(r)
         mine = pend.get(r["lid"], {})
         queued |= _rule_visibility(conn, r, cfg, mine, bool(r["hidden_by_rule"]))
-        queued |= _rule_stock_price(conn, r, cfg, mine, fees, states)
+        queued |= _rule_stock_price(conn, r, cfg, mine, fees, states, price)
     if queued:
         _kick()
+
+
+def reevaluate(conn, listing_id: int) -> None:
+    """Tras terminar un trabajo de un anuncio: vuelve a derivar las reglas contra el catálogo actual. Cubre los
+    cambios que llegaron MIENTRAS el trabajo corría (el índice único impidió encolarlos) sin banderas que
+    arrastrar: si nada difiere de lo que ahora tiene la tienda, no se encola nada (no hay bucles)."""
+    _evaluate(conn, conn.execute(_RULE_SQL + " AND l.id = ?", (listing_id,)).fetchall(), price=False)
 
 
 def _rule_visibility(conn, r, cfg: dict, mine: dict, marked: bool) -> bool:
@@ -1021,7 +1042,7 @@ def _rule_visibility(conn, r, cfg: dict, mine: dict, marked: bool) -> bool:
     return False
 
 
-def _rule_stock_price(conn, r, cfg: dict, mine: dict, fees: dict, states: dict) -> bool:
+def _rule_stock_price(conn, r, cfg: dict, mine: dict, fees: dict, states: dict, price: bool = True) -> bool:
     uid, lid = r["user_id"], r["lid"]
     sync = mine.get("sync", [])
     pl = _payload(sync[0]) if sync else {}
@@ -1031,7 +1052,8 @@ def _rule_stock_price(conn, r, cfg: dict, mine: dict, fees: dict, states: dict) 
         want["stock"] = stock
     # --- precio: solo subir (nunca bajar) o avisar
     code = (r["currency"] or "").upper()
-    if code in SUPPORTED_CURRENCIES and r["last_price"]:
+    # (la subida de precio solo se evalúa ante un cambio real del catálogo: reevaluar tras un trabajo la encadenaría)
+    if price and code in SUPPORTED_CURRENCIES and r["last_price"]:
         if uid not in states:
             states[uid] = currency.get_state(conn, user_id=uid)
         rate = states[uid]["rates"].get(code)

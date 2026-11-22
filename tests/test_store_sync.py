@@ -625,6 +625,90 @@ class LeaseAndConstraintsTest(Base):
         self.assertFalse([t for t in rows if t and ("shpat_" in t)])
 
 
+class ChangeDuringRunningJobTest(Base):
+    """Cambios del catálogo que llegan mientras un trabajo del anuncio está `running` (el índice único impide
+    encolar otro igual): deben reflejarse al terminar el trabajo."""
+
+    def during(self, callbacks):
+        """Parchea las operaciones del conector: la 1.ª llamada ejecuta callbacks[0], la 2.ª callbacks[1]…"""
+        todo = list(callbacks)
+        orig_u, orig_a = FakeStore.update_price_stock, FakeStore.set_active
+
+        def wrap(orig):
+            def inner(self_, *a, **k):
+                if todo:
+                    todo.pop(0)()
+                return orig(self_, *a, **k)
+            return inner
+        FakeStore.update_price_stock, FakeStore.set_active = wrap(orig_u), wrap(orig_a)
+        self.addCleanup(lambda: (setattr(FakeStore, "update_price_stock", orig_u), setattr(FakeStore, "set_active", orig_a)))
+
+    def test_stock_change_during_running_sync_is_not_lost(self):
+        store, iid, lid = self.published(as_draft=False, stock=10)
+        pid = self.pid_of(iid)
+        self.catalog_change(pid, stock=8)                                      # sync pendiente (stock 8)
+        self.during([lambda: self.catalog_change(pid, stock=6)])               # llega MIENTRAS corre ese sync
+        store_sync.run_due_jobs()
+        self.assertEqual(len([j for j in self.jobs(lid) if j["action"] == "sync"]), 2)   # se encoló un sync nuevo
+        store_sync.run_due_jobs()
+        self.assertEqual((self.remote(lid)["stock"], self.listing(lid)["last_stock"]), (6, 6))
+
+    def test_stock_zero_during_running_sync_hides_the_listing(self):
+        store, iid, lid = self.published(as_draft=False, stock=10)
+        pid = self.pid_of(iid)
+        self.catalog_change(pid, stock=9)
+        self.during([lambda: self.catalog_change(pid, stock=0)])
+        store_sync.run_due_jobs()
+        store_sync.run_due_jobs()
+        l = self.listing(lid)
+        self.assertEqual((l["status"], l["hidden_by_rule"], l["last_stock"]), ("hidden", 1, 0))
+        self.assertFalse(self.remote(lid)["active"])
+
+    def test_rapid_5_0_3_during_running_job_ends_at_3_and_shown_only_if_hidden_by_rule(self):
+        # caso 1: visible, hay un sync en curso y llega 5 → 0 → 3: termina visible con stock 3
+        store, iid, lid = self.published(as_draft=False, stock=10)
+        pid = self.pid_of(iid)
+        self.catalog_change(pid, stock=9)
+        self.during([lambda: (self.catalog_change(pid, stock=5), self.catalog_change(pid, stock=0),
+                              self.catalog_change(pid, stock=3))])
+        for _ in range(3):
+            store_sync.run_due_jobs()
+        l = self.listing(lid)
+        self.assertEqual((l["status"], l["last_stock"], self.remote(lid)["stock"]), ("published", 3, 3))
+        # caso 2: oculto A MANO + sync en curso con 5 → 0 → 3: no se muestra solo
+        store_sync.listing_action(lid, "hide")
+        store_sync.run_due_jobs()
+        self.catalog_change(pid, stock=2)
+        self.during([lambda: (self.catalog_change(pid, stock=5), self.catalog_change(pid, stock=0),
+                              self.catalog_change(pid, stock=3))])
+        for _ in range(3):
+            store_sync.run_due_jobs()
+        l = self.listing(lid)
+        self.assertEqual((l["status"], l["hidden_by_rule"], l["last_stock"]), ("hidden", 0, 3))
+        # caso 3: oculto POR REGLA y un hide/sync en curso: al volver el stock se muestra
+        store_sync.listing_action(lid, "show")
+        store_sync.run_due_jobs()
+        self.catalog_change(pid, stock=0)
+        self.during([lambda: self.catalog_change(pid, stock=3)])               # vuelve el stock durante el hide
+        for _ in range(4):
+            store_sync.run_due_jobs()
+        l = self.listing(lid)
+        self.assertEqual((l["status"], l["hidden_by_rule"], l["last_stock"]), ("published", 0, 3))
+
+    def test_no_endless_requeue_when_nothing_changed(self):
+        store, iid, lid = self.published(as_draft=False, stock=10)
+        pid = self.pid_of(iid)
+        self.catalog_change(pid, stock=7)
+        self.during([lambda: self.catalog_change(pid, stock=7)])               # "cambio" sin diferencia real
+        store_sync.run_due_jobs()
+        self.assertEqual(self.jobs(lid, "pending"), [])
+        calls = len(FakeStore.calls)
+        self.assertEqual(store_sync.run_due_jobs()["processed"], 0)
+        self.assertEqual(len(FakeStore.calls), calls)
+        # y tras terminar varios trabajos seguidos el total de syncs es acotado
+        self.assertLessEqual(len([j for j in self.jobs(lid) if j["action"] == "sync"]), 2)
+
+
 class ListingActionsTest(Base):
     def test_manual_sync_pushes_current_price_and_stock(self):
         store, iid, lid = self.published(sell_price=20.0)
