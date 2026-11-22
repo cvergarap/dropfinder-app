@@ -245,6 +245,7 @@ def upsert_products(conn, products, source: str, *, run_hooks: bool = True,
     ts = now()
     s = get_settings(conn)
     count = [0]
+    keys: list = []
 
     def rows():
         for p in products:
@@ -254,6 +255,7 @@ def upsert_products(conn, products, source: str, *, run_hooks: bool = True,
             else:
                 r = p.to_row()
             r.update(source=source, updated_at=ts)
+            keys.append((r["supplier"], r["supplier_sku"]))
             r.update(metrics.compute(r, s))
             count[0] += 1
             yield r
@@ -264,7 +266,14 @@ def upsert_products(conn, products, source: str, *, run_hooks: bool = True,
     if search.fts_enabled(conn):
         search.sync(conn)
     search.invalidate(conn)
-    ids = [r[0] for r in conn.execute("SELECT id FROM products WHERE updated_at = ? AND source = ?", (ts, source))]
+    # Ids exactos de lo escrito en esta llamada (la marca de tiempo tiene precisión de segundos y
+    # podría incluir filas de otra escritura del mismo segundo, incluso ya borradas)
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS _df_upserted(supplier TEXT, sku TEXT, PRIMARY KEY (supplier, sku))")
+    conn.execute("DELETE FROM _df_upserted")
+    conn.executemany("INSERT OR IGNORE INTO _df_upserted VALUES (?, ?)", keys)
+    ids = [r[0] for r in conn.execute(
+        "SELECT p.id FROM _df_upserted u JOIN products p ON p.supplier = u.supplier AND p.supplier_sku = u.sku")]
+    conn.execute("DELETE FROM _df_upserted")
     if collect_ids is not None:
         collect_ids.extend(ids)
     if run_hooks:
