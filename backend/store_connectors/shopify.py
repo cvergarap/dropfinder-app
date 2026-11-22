@@ -60,7 +60,7 @@ import urllib.parse
 import uuid
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
-from . import http as shttp, register, scrub
+from . import http as shttp, register, scrub, tags_match
 from .base import (ListingRef, StoreAuthError, StoreConnector, StoreError, StoreInfo, StoreNotFound,
                    StoreProduct, StoreRateLimited, StoreValidationError)
 
@@ -85,7 +85,12 @@ LOCATION_TTL = 600.0
 MAX_RETRY_AFTER = 120.0
 MAX_THROTTLE_WAIT = 60.0
 CLEANUP_TRIES = 3
-CLEANUP_MAX_SLEEP = 10.0
+CLEANUP_MAX_SLEEP = 3.0                         # espera máxima entre intentos de borrado
+CLEANUP_DEADLINE = 6.0                          # tope TOTAL de la limpieza de huérfanos (un solo hilo de trabajo)
+MAX_INLINE_SLEEP = 3.0                          # suma máxima de esperas dentro de UNA llamada del conector
+TOTAL_TIMEOUT = 45.0                            # tope total por petición HTTP (cliente compartido)
+OWN_TAG = "dropfinder"                          # etiquetas de propiedad que pone el motor: dropfinder + dfi-<instalación>
+OWN_TAG_PREFIX = "dfi-"
 MAX_TOKEN_ENTRIES = 200
 MAX_STOCK = 1_000_000_000
 MAX_PRICE = Decimal("1000000000")
@@ -112,6 +117,7 @@ Q_FIND_BY_TAG = """query DropFinderFindByTag($q: String!) {
     nodes { id status tags variants(first: 1) { nodes { id inventoryItem { id } } } }
   }
 }"""
+Q_PRODUCT_TAGS = """query DropFinderProductTags($id: ID!) { product(id: $id) { id tags } }"""
 M_PRODUCT_CREATE = """mutation ProductCreate($product: ProductCreateInput!, $media: [CreateMediaInput!]) {
   productCreate(product: $product, media: $media) {
     product { id variants(first: 1) { nodes { id inventoryItem { id } } } }
@@ -162,6 +168,10 @@ def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
+def _mono() -> float:
+    return time.monotonic()
+
+
 def _api_version() -> str:
     v = os.environ.get(API_VERSION_ENV)
     if v is None or not v.strip():
@@ -205,6 +215,7 @@ def _foreign_errors(fn):
     """El conector nunca deja escapar excepciones que no sean StoreError."""
     @functools.wraps(fn)
     def wrapper(*a, **k):
+        a[0]._sleep_left = MAX_INLINE_SLEEP              # presupuesto de esperas por llamada
         try:
             return fn(*a, **k)
         except StoreError:
@@ -402,7 +413,8 @@ class ShopifyConnector(StoreConnector):
         """POST JSON con el cliente compartido (HTTPS fijo, IP fijada, sin redirecciones, tope de tamaño).
         Devuelve (estado HTTP, JSON o None, cabeceras). Los fallos de red salen como StoreError."""
         headers = {TOKEN_HEADER: token} if token else {}
-        resp = shttp.request_json("POST", url, payload, headers=headers, timeout=self.TIMEOUT, max_bytes=self.MAX_BYTES)
+        resp = shttp.request_json("POST", url, payload, headers=headers, timeout=self.TIMEOUT, max_bytes=self.MAX_BYTES,
+                                   total_timeout=TOTAL_TIMEOUT)
         return self._parse(resp)
 
     @staticmethod
@@ -465,7 +477,7 @@ class ShopifyConnector(StoreConnector):
                                        "grant_type": "client_credentials"}).encode()
         resp = shttp.request("POST", url, headers={"Content-Type": "application/x-www-form-urlencoded",
                                                    "Accept": "application/json"},
-                             body=body, timeout=self.TIMEOUT, max_bytes=self.MAX_BYTES)
+                             body=body, timeout=self.TIMEOUT, max_bytes=self.MAX_BYTES, total_timeout=TOTAL_TIMEOUT)
         status, data, hdrs = self._parse(resp)
         if status in (400, 401, 403):
             raise StoreAuthError("Shopify rechazó el Client ID / Client secret (o la app no está instalada en la tienda)")
@@ -529,7 +541,16 @@ class ShopifyConnector(StoreConnector):
         except (KeyError, TypeError, ValueError):
             return
         if rate > 0 and avail < LOW_COST_THRESHOLD:
-            _sleep(min(MAX_PACE_SLEEP, (LOW_COST_THRESHOLD - avail) / rate))
+            self._nap(min(MAX_PACE_SLEEP, (LOW_COST_THRESHOLD - avail) / rate))
+
+    def _nap(self, seconds: float) -> float:
+        """Espera dentro del presupuesto de la llamada (≤ MAX_INLINE_SLEEP en total). Devuelve lo esperado."""
+        left = getattr(self, "_sleep_left", MAX_INLINE_SLEEP)
+        t = max(0.0, min(float(seconds), left))
+        if t > 0:
+            self._sleep_left = left - t
+            _sleep(t)
+        return t
 
     def _graphql(self, query: str, variables: dict | None = None, *, partial_access: bool = False) -> dict:
         """Ejecuta una consulta. Devuelve `data`. Renueva el token una vez ante 401 en modo client credentials
@@ -701,12 +722,22 @@ class ShopifyConnector(StoreConnector):
             raise StoreError("Shopify creó el producto sin artículo de inventario", retryable=True)
         return vid, inv_id
 
-    def _find_existing(self, tag: str) -> dict | None:
-        """Producto ya creado por DropFinder con esa etiqueta (publicación idempotente)."""
+    def _find_existing(self, tag: str, expected_tags: list[str]) -> dict | None:
+        """Producto que esta instalación ya creó con esa etiqueta de SKU (publicación idempotente).
+        El SKU no prueba propiedad (DF-<id> es local a cada base de datos): también se exigen las etiquetas de
+        propiedad (`dropfinder` + `dfi-…`) de ESTA instalación. Si hay un producto con la etiqueta de SKU pero de
+        otra instalación o ajeno, es un conflicto: ni se adopta ni se crea otro."""
         data = self._graphql(Q_FIND_BY_TAG, {"q": f"tag:'{tag}'"})
+        foreign = False
         for n in ((data.get("products") or {}).get("nodes")) or []:
-            if isinstance(n, dict) and tag in (n.get("tags") or []) and _GID_PRODUCT_RE.fullmatch(str(n.get("id"))):
+            if not (isinstance(n, dict) and tag in (n.get("tags") or []) and _GID_PRODUCT_RE.fullmatch(str(n.get("id")))):
+                continue
+            if tags_match(n.get("tags"), expected_tags):
                 return n
+            foreign = True
+        if foreign:
+            raise StoreValidationError("Ya existe en la tienda un producto con ese SKU que no creó esta instalación; "
+                                       "no se toca ni se duplica (revísalo o cambia su SKU)")
         return None
 
     @_foreign_errors
@@ -734,7 +765,7 @@ class ShopifyConnector(StoreConnector):
             m["alt"] = title[:250]
 
         # 2. Adoptar un producto ya creado por un intento anterior, o crearlo
-        existing = self._find_existing(tag)
+        existing = self._find_existing(tag, tags[:-1])
         adopted = existing is not None
         if adopted:
             prod, gid = existing, existing["id"]
@@ -766,7 +797,9 @@ class ShopifyConnector(StoreConnector):
         return ListingRef(external_id=gid, variant_id=vid, inventory_item_id=inv_id, url=self._admin_url(gid))
 
     def _cleanup_orphan(self, gid: str, original: StoreError) -> None:
-        """Borra el producto a medio crear; ante límite de velocidad espera y reintenta (hasta CLEANUP_TRIES)."""
+        """Borra el producto que ESTA llamada creó (nunca otro). Ante límite de velocidad espera y reintenta, con un
+        tope total de CLEANUP_DEADLINE s y dentro del presupuesto de esperas de la llamada."""
+        start = _mono()
         for attempt in range(CLEANUP_TRIES):
             try:
                 self._mutate(M_PRODUCT_DELETE, "productDelete", {"input": {"id": gid}}, ref_op=True)
@@ -776,7 +809,10 @@ class ShopifyConnector(StoreConnector):
             except StoreError as e:
                 if not e.retryable or attempt == CLEANUP_TRIES - 1:
                     break
-                _sleep(min(float(getattr(e, "retry_after", 1.0)), CLEANUP_MAX_SLEEP))
+                wait = min(float(getattr(e, "retry_after", 1.0)), CLEANUP_MAX_SLEEP)
+                if _mono() - start + wait > CLEANUP_DEADLINE or wait > getattr(self, "_sleep_left", 0.0):
+                    break                                    # no hay tiempo: se informa el huérfano
+                self._nap(wait)
             except Exception:
                 break
         original.orphan_external_id = gid
@@ -835,6 +871,16 @@ class ShopifyConnector(StoreConnector):
     @_foreign_errors
     def delete(self, ref: ListingRef) -> None:
         self._check_ref(ref)
+        # Solo se borra lo que DropFinder creó: se consultan las etiquetas antes (el id podría haberse reutilizado
+        # o haber sido guardado mal; un borrado equivocado perdería un producto del cliente).
+        data = self._graphql(Q_PRODUCT_TAGS, {"id": ref.external_id})
+        node = data.get("product")
+        if node is None:
+            return                                           # ya no existe: idempotente
+        tags = [str(t).strip().lower() for t in ((node or {}).get("tags") or [])] if isinstance(node, dict) else []
+        if OWN_TAG not in tags or not any(t.startswith(OWN_TAG_PREFIX) and len(t) > len(OWN_TAG_PREFIX) for t in tags):
+            raise StoreValidationError("El producto de la tienda no lleva las etiquetas de DropFinder: no lo creó esta "
+                                       "aplicación y no se borra (bórralo a mano si es lo que quieres)")
         try:
             self._mutate(M_PRODUCT_DELETE, "productDelete", {"input": {"id": ref.external_id}}, ref_op=True)
         except StoreNotFound:
