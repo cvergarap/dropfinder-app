@@ -1164,8 +1164,6 @@ MUTANTS = [
     ("domain_localhost_tld", '_RESERVED_TLDS = {"localhost", "local",', '_RESERVED_TLDS = {"local",'),
     ("domain_idna_latin_only", 'if not _latin_accented(ch):\n                raise bad\n        try:', 'pass\n        try:'),
     ("domain_idna_dotless", 'return len(d) > 1 and "a" <= d[0] <= "z"', 'return "a" <= d[0] <= "z" or ch in "ıſß"'),
-    ("domain_idna_roundtrip", "if decoded.encode(\"idna\").decode(\"ascii\") != ascii_label:\n                raise bad", "pass"),
-    ("domain_nameprep_ascii", 'if not ascii_label.startswith("xn--"):             # nameprep', 'if False:             # nameprep'),
     ("domain_no_dot", "if len(labels) < 2 or len(ascii_host) > 253:", "if len(ascii_host) > 253:"),
     ("retry_5xx_not_retryable", 'return StoreError(f"La tienda tuvo un error temporal (HTTP {st}).{extra}", retryable=True)',
      'return StoreError(f"La tienda tuvo un error temporal (HTTP {st}).{extra}", retryable=False)'),

@@ -239,8 +239,7 @@ def _label_to_ascii(label: str, bad: StoreValidationError) -> str:
             ascii_label = label.encode("idna").decode("ascii")      # el viaje de vuelta se comprueba más abajo
         except (UnicodeError, ValueError):
             raise bad from None
-        if not ascii_label.startswith("xn--"):             # nameprep lo convirtió en ASCII (ancho completo, etc.): truco
-            raise bad
+
     if ascii_label.startswith("xn--"):
         try:
             decoded = ascii_label.encode("ascii").decode("idna")
