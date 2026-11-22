@@ -8,6 +8,12 @@ const DF = {
   viewLoaders: {},     // { nombreVista: f() } al abrir la pestaña data-view="nombreVista"
   onResults: [],       // f(data, params) tras renderizar resultados de búsqueda
   currencyChange: [],  // f() cuando cambia la moneda mostrada (para re-renderizar)
+  /* "Mis productos" (js/stores.js): f(fila) -> HTML ya escapado */
+  importRowLead: [],   // celda inicial de la fila (casilla de selección)
+  importRowExtras: [], // contenido extra bajo el título (insignias de tiendas)
+  importActions: [],   // botones extra en la celda de acciones
+  onImports: [],       // f(filas) tras dibujar la tabla
+  importRemoved: [],   // f(id) -> texto opcional que se agrega al aviso al quitar un producto
   /* Sesión (la maneja js/auth.js). api() espera a `ready` (sesión iniciada) antes de llamar a la API,
      envía `csrf` en las peticiones que modifican datos y llama a onUnauthorized() ante un 401. */
   auth: { user: null, csrf: null, ready: null, onUnauthorized: null },
@@ -86,6 +92,7 @@ async function api(path, opts = {}) {
   if (!res.ok) {
     const err = new Error((data && data.error) || res.statusText || `Error ${res.status}`);
     err.status = res.status;
+    if (data && data.code) err.code = data.code;   // código estable del servidor (p. ej. has_listings)
     throw err;
   }
   return data;
@@ -423,7 +430,8 @@ function renderImports(rows) {
   $("#importsBody").innerHTML = rows.map((r) => {
     const vat = vatLine(r.sell_price, "amount");
     return `<tr data-id="${r.id}">
-    <td>${imgTag(r)}${esc(r.title)}${r.alerts ? `<span class="alert-dot" title="Alertas sin leer">⚠ ${r.alerts}</span>` : ""}</td>
+    <td class="sel">${DF.importRowLead.map((f) => dfSafe(f, r) || "").join("")}</td>
+    <td>${imgTag(r)}${esc(r.title)}${r.alerts ? `<span class="alert-dot" title="Alertas sin leer">⚠ ${r.alerts}</span>` : ""}${DF.importRowExtras.map((f) => dfSafe(f, r) || "").join("")}</td>
     <td>${r.product_url ? `<a href="${esc(r.product_url)}" target="_blank" rel="noopener noreferrer">${esc(r.supplier)} ↗</a>` : esc(r.supplier)}</td>
     <td class="num">${money(r.total_cost)}</td>
     <td class="num"><input class="price" ${priceInputAttrs(moneyValue(r.sell_price))} aria-label="Precio de venta (${Currency.code()})"
@@ -432,9 +440,10 @@ function renderImports(rows) {
     <td class="num ${r.margin >= 0 ? "good" : "bad"}">${r.margin}%</td>
     <td class="num ${r.stock ? "" : "bad"}">${r.stock ? fmt(r.stock) : "0"}</td>
     <td><button class="status ${r.status}">${r.status === "active" ? "Activo" : "Draft"}</button></td>
-    <td><button class="link del">Quitar</button></td></tr>`;
+    <td class="imp-actions">${DF.importActions.map((f) => dfSafe(f, r) || "").join("")}<button class="link del">Quitar</button></td></tr>`;
   }).join("");
   $("#importsCount").textContent = rows.length;
+  DF.onImports.forEach((f) => dfSafe(f, rows));
 }
 
 $("#importsBody").addEventListener("change", async (e) => {
@@ -454,8 +463,9 @@ $("#importsBody").addEventListener("click", async (e) => {
     await api(`/api/imports/${tr.dataset.id}`, { method: "PATCH", body: { status } });
     loadImports();
   } else if (e.target.matches(".del")) {
+    const hint = DF.importRemoved.map((f) => dfSafe(f, Number(tr.dataset.id)) || "").filter(Boolean).join(" ");
     await api(`/api/imports/${tr.dataset.id}`, { method: "DELETE" });
-    toast("Producto quitado"); loadImports(); refreshCounts();
+    toast(`Producto quitado${hint ? `. ${hint}` : ""}`); loadImports(); refreshCounts();
   }
 });
 

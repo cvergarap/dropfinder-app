@@ -262,11 +262,11 @@ class DashboardTest(unittest.TestCase):
             ob = dashboard.dashboard()["onboarding"]
             keys = [i["key"] for i in ob["items"]]
             self.assertEqual(keys, ["currency", "pricing", "first_import", "saved_search", "collection", "store"])
-            self.assertEqual((ob["done"], ob["total"], ob["complete"]), (0, 5, False))
+            self.assertEqual((ob["done"], ob["total"], ob["complete"]), (0, 6, False))
             store = ob["items"][-1]
-            self.assertTrue(store["disabled"])
+            self.assertFalse(store["disabled"])
             self.assertFalse(store["done"])
-            self.assertIn("Sprint 4", store["hint"])
+            self.assertEqual(store["action"], {"view": "stores", "label": "Conectar tienda"})
             self.assertEqual(dashboard.dismiss("currency"), {"ok": True, "key": "currency"})
             cur = next(i for i in dashboard.dashboard()["onboarding"]["items"] if i["key"] == "currency")
             self.assertTrue(cur["done"] and cur["dismissed"])
@@ -300,6 +300,26 @@ class DashboardTest(unittest.TestCase):
                 conn.execute("DELETE FROM collections")
                 conn.execute("UPDATE settings SET value = '2.5' WHERE key = 'multiplier'")
                 conn.execute("UPDATE currency_settings SET value = '\"USD\"' WHERE key = 'display_currency'")
+
+    def test_onboarding_store_step(self):
+        """El paso "tienda" se completa con al menos una tienda activa del propio usuario."""
+        def insert(uid, status):
+            conn.execute("INSERT INTO store_connections(user_id, platform, name, domain, credentials_enc, status, "
+                         "created_at) VALUES (?, 'fake', 'T', ?, 'x', ?, 'x')", (uid, f"t{uid}{status}.example", status))
+        def store_item(uid):
+            with auth_context.as_user(uid):
+                return next(i for i in dashboard.dashboard()["onboarding"]["items"] if i["key"] == "store")
+        def cleanup():
+            with db.connect() as c:
+                c.execute("DELETE FROM store_connections")
+        self.addCleanup(cleanup)
+        with db.connect() as conn:
+            insert(OWNER, "error")
+        self.assertFalse(store_item(OWNER)["done"])             # con error no cuenta
+        with db.connect() as conn:
+            insert(OWNER, "active")
+        self.assertTrue(store_item(OWNER)["done"])
+        self.assertFalse(store_item(MEMBER)["done"])            # la tienda es de otro usuario
 
     # ---------------------------------------------------------------- usuarios
 
