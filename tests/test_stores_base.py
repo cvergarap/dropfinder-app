@@ -538,6 +538,11 @@ class ContractTest(unittest.TestCase):
         with self.assertRaises(sc.StoreNotFound):
             c.update_price_stock(ref, 1, 1)
 
+    def test_idempotent_publish_capability(self):
+        self.assertFalse(sc.StoreConnector.idempotent_publish)        # por defecto un conector NO se considera repetible
+        self.assertFalse(FakeStore.idempotent_publish)
+        self.assertTrue(sc.get_class("shopify").idempotent_publish)   # Shopify adopta lo que ya creó
+
     def test_unknown_platform(self):
         with self.assertRaises(sc.StoreValidationError):
             sc.get_class("inexistente")

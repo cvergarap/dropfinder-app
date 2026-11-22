@@ -354,7 +354,7 @@ def _onboarding(conn, uid: int, owner: bool, prefs: dict, n_imports: int, n_save
       · miembro: solo cuenta su propio descarte (que el propietario cambie un ajuste no completa su paso).
     - Colección: collections_mod.count_for_user (API pública): solo las colecciones del usuario, sin la
       lista automática "Favoritos".
-    - Tienda: deshabilitado ("Próximamente — Sprint 4"); no cuenta para el progreso.
+    - Tienda: hecha si el usuario tiene al menos una tienda conectada y activa (tabla store_connections).
     Un paso descartado cuenta como hecho."""
     cur = currency.get_settings(conn)
     s = db.get_settings(conn)
@@ -383,8 +383,11 @@ def _onboarding(conn, uid: int, owner: bool, prefs: dict, n_imports: int, n_save
     items.append({"key": "collection", "label": "Crea una colección",
                   "hint": "Agrupa productos candidatos para decidir después.",
                   "done": n_collections > 0, "action": {"view": "collections", "label": "Ver colecciones"}})
-    items.append({"key": "store", "label": "Conecta tu tienda", "hint": "Próximamente — Sprint 4",
-                  "done": False, "disabled": True, "action": None})
+    n_stores = conn.execute("SELECT COUNT(*) FROM store_connections WHERE user_id = ? AND status = 'active'",
+                            (uid,)).fetchone()[0]
+    items.append({"key": "store", "label": "Conecta tu tienda",
+                  "hint": "Publica tus productos y mantén precio y stock al día.",
+                  "done": n_stores > 0, "action": {"view": "stores", "label": "Conectar tienda"}})
     for it in items:
         it.setdefault("disabled", False)
         it.setdefault("dismiss_label", None if it["disabled"] else "Omitir")
