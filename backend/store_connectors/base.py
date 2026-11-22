@@ -108,6 +108,11 @@ class StoreConnector(ABC):
     # combinación en check_credentials.
     credential_fields: list[dict] = []
     setup_help: str = ""                    # pasos para crear las credenciales en la plataforma (se muestra en la UI)
+    # ¿publish() es seguro de repetir tras un resultado desconocido (respuesta perdida, error interno justo después
+    # de crear)? True solo si el conector puede reconocer el producto que ya creó y adoptarlo en vez de duplicarlo
+    # (Shopify: etiqueta df-sku:<sku>). El motor de sincronización SOLO reintenta una publicación que ya llamó a la
+    # tienda si esto es True; si es False, un resultado desconocido deja el anuncio en error para que el usuario revise.
+    idempotent_publish: bool = False
 
     def __init__(self, domain: str, credentials: dict[str, str], settings: dict | None = None):
         self.domain = domain

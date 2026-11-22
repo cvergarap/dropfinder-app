@@ -19,6 +19,7 @@ _ids = itertools.count(1000)
 class FakeStore(StoreConnector):
     platform = "fake"
     label = "Tienda falsa (pruebas)"
+    idempotent_publish = False               # como un conector que no sabe reconocer lo que ya creó
     credential_fields = [{"key": "token", "label": "Token", "secret": True, "help": "Cualquier texto"}]
     # Estado compartido entre instancias del mismo dominio (cada operación crea un conector nuevo)
     stores: dict[str, dict] = {}

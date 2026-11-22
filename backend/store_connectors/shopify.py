@@ -300,6 +300,7 @@ def _sweep_locked() -> None:
 class ShopifyConnector(StoreConnector):
     platform = "shopify"
     label = "Shopify"
+    idempotent_publish = True               # publish() adopta el producto con la etiqueta df-sku:<sku> si ya existe
     credential_fields = [
         {"key": "access_token", "label": "Token de acceso de la API Admin (shpat_…)", "secret": True, "required": False,
          "group": "token",
