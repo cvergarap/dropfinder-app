@@ -25,7 +25,7 @@ import collections_mod
 import currency
 import db
 from auth_context import current_user_id
-from errors import ApiError  # noqa: F401  (los módulos y pruebas usan server.ApiError)
+from errors import ApiError, FileResponse  # noqa: F401  (los módulos y pruebas usan server.ApiError)
 import history
 import hooks
 import saved_searches
@@ -143,7 +143,7 @@ def _best_effort(conn, fn, *args) -> None:
         conn.execute("PRAGMA busy_timeout = 5000")
 
 
-def search_products(qs: dict) -> dict:
+def search_products(qs: dict, *, log: bool = True) -> dict:
     """Búsqueda con texto completo, filtros, orden y paginación en SQL.
 
     Además de total/page/page_size/pages/items devuelve:
@@ -156,6 +156,7 @@ def search_products(qs: dict) -> dict:
       took_ms         tiempo de la consulta en el servidor (milisegundos)
 
     Con `exact=1` no se autocorrige (el usuario pidió buscar su texto tal cual).
+    log=False: no registra la consulta para el autocompletado (p. ej. al exportar resultados).
     """
     started = time.perf_counter()
     exact = qs.get("exact", ["0"])[0] == "1"
@@ -189,7 +190,7 @@ def search_products(qs: dict) -> dict:
                         total, items, corrected_from, effective = t2, i2, q, fix
                 elif _query(conn, fix_tokens, use_fts, where, args, sort, page, size, count_only=True)[0] > total:
                     suggestion = fix
-        if tokens and page == 1:      # para el autocompletado se guarda la consulta ya corregida
+        if tokens and page == 1 and log:   # para el autocompletado se guarda la consulta ya corregida
             _best_effort(conn, search.log_search, effective, total, db.now())
     return {
         "total": total, "page": page, "page_size": size, "pages": math.ceil(total / size) if total else 0,
@@ -683,6 +684,19 @@ class Handler(SimpleHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def _send_file(self, f: FileResponse, headers=None):
+        """Descarga (p. ej. CSV): bytes tal cual con su tipo y nombre de archivo."""
+        self.send_response(200)
+        self.send_header("Content-Type", f.content_type)
+        self.send_header("Content-Length", str(len(f.body)))
+        if f.filename:
+            self.send_header("Content-Disposition", f'attachment; filename="{f.filename}"')
+        for k, v in list(f.headers.items()) + list(headers or []):
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(f.body)
+
     # ------------------------------------------------------------ API
     def _api(self, method):
         url = urlparse(self.path)
@@ -701,6 +715,8 @@ class Handler(SimpleHTTPRequestHandler):
         if sess and sess.get("touched") and info.token and not info.set_cookies:
             info.set_cookies.append(auth.cookie_header(info.token, info.secure))   # caducidad deslizante
         headers += [("Set-Cookie", c) for c in info.set_cookies]
+        if isinstance(data, FileResponse):
+            return self._send_file(data, headers)
         self._send_json(status, data, headers)
 
     def _dispatch(self, method, url, info) -> tuple[int, object, dict]:
