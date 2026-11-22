@@ -117,3 +117,7 @@
   .cmp-table col, .cmp-table .cmp-col { width: 150px; }
 }
 .detail > .info { min-width: 0; }   /* la tabla de alternativas se desplaza dentro de su contenedor */
+
+/* Colores de serie como clases (la CSP no admite atributos style en línea) */
+.cmp-s1 { background: var(--cmp-s1); } .cmp-s2 { background: var(--cmp-s2); }
+.cmp-s3 { background: var(--cmp-s3); } .cmp-s4 { background: var(--cmp-s4); }

@@ -11,6 +11,7 @@ import urllib.request
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 os.environ["DROPFINDER_DB"] = os.path.join(tempfile.mkdtemp(), "test.db")
 
+import authtest  # noqa: E402,F401  (contexto y sesión del propietario)
 import db  # noqa: E402
 import server  # noqa: E402
 from metrics import DEFAULT_SETTINGS, break_even, profit_for, suggested_price  # noqa: E402
@@ -19,7 +20,7 @@ from metrics import DEFAULT_SETTINGS, break_even, profit_for, suggested_price  #
 def call(method, path, body=None):
     req = urllib.request.Request(f"{BASE}{path}", method=method,
                                  data=json.dumps(body).encode() if body is not None else None,
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json", **authtest.auth_headers()})
     try:
         with urllib.request.urlopen(req) as r:
             return r.status, json.load(r)

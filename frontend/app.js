@@ -8,8 +8,18 @@ const DF = {
   viewLoaders: {},     // { nombreVista: f() } al abrir la pestaña data-view="nombreVista"
   onResults: [],       // f(data, params) tras renderizar resultados de búsqueda
   currencyChange: [],  // f() cuando cambia la moneda mostrada (para re-renderizar)
+  /* Sesión (la maneja js/auth.js). api() espera a `ready` (sesión iniciada) antes de llamar a la API,
+     envía `csrf` en las peticiones que modifican datos y llama a onUnauthorized() ante un 401. */
+  auth: { user: null, csrf: null, ready: null, onUnauthorized: null },
+  isOwner: () => !!(DF.auth.user && DF.auth.user.role === "owner"),
 };
 window.DF = DF;
+{
+  let openGate;
+  DF.auth.ready = new Promise((r) => { openGate = r; });
+  DF.auth.open = () => openGate();                                         // sesión lista
+  DF.auth.close = () => { DF.auth.ready = new Promise((r) => { openGate = r; }); };   // bloquea hasta entrar
+}
 
 /* Ejecuta una extensión sin que su error (síncrono o promesa rechazada) rompa la app */
 function dfSafe(fn, ...args) {
@@ -58,13 +68,21 @@ document.addEventListener("error", (e) => {
 const aliexpressSearch = (title) => `https://www.aliexpress.com/wholesale?SearchText=${encodeURIComponent(title)}`;
 
 async function api(path, opts = {}) {
+  const method = (opts.method || "GET").toUpperCase();
+  const authCall = path.startsWith("/api/auth/");
+  if (!authCall) await DF.auth.ready;          // nada se pide a la API antes de iniciar sesión
+  const headers = { "Content-Type": "application/json" };
+  if (method !== "GET" && method !== "HEAD" && DF.auth.csrf) headers["X-CSRF-Token"] = DF.auth.csrf;
   const res = await fetch(path, {
     ...opts,
-    headers: { "Content-Type": "application/json" },
+    method,
+    headers,
+    credentials: "same-origin",
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   let data = {};
   try { data = await res.json(); } catch { /* respuesta sin JSON */ }
+  if (res.status === 401 && !authCall && DF.auth.onUnauthorized) dfSafe(DF.auth.onUnauthorized);
   if (!res.ok) {
     const err = new Error((data && data.error) || res.statusText || `Error ${res.status}`);
     err.status = res.status;
@@ -333,7 +351,7 @@ function renderDetail(p) {
       ? `<p class="note">Producto de <b>demostración</b>: es ficticio y no tiene ficha en ningún proveedor.
            <a href="${esc(aliexpressSearch(p.title))}" target="_blank" rel="noopener noreferrer">Buscar similares en AliExpress ↗</a></p>`
       : `<p class="note">El proveedor no incluyó el enlace del producto (columna <code>url</code> del CSV).</p>`;
-  dlg.innerHTML = `<div class="detail" style="position:relative">
+  dlg.innerHTML = `<div class="detail">
     ${imgTag(p)}
     <div class="info">
       <button class="close" aria-label="Cerrar">×</button>
@@ -474,7 +492,7 @@ async function loadSuppliers() {
     <td><span class="chip ${r.source === "mock" ? "demo-chip" : ""}">${esc(SOURCES[r.source] || r.source)}</span></td>
     <td class="num">${fmt(r.products)}</td><td class="num">${fmt(r.imported)}</td>
     <td>${new Date(r.updated_at).toLocaleString("es")}</td>
-    <td>${r.source === "csv" ? `<button class="link del-sup" data-supplier="${esc(r.supplier)}">Eliminar catálogo</button>` : ""}</td>
+    <td>${r.source === "csv" ? `<button class="link del-sup owner-only" data-supplier="${esc(r.supplier)}">Eliminar catálogo</button>` : ""}</td>
   </tr>`).join("") : `<tr><td colspan="6" class="empty">No hay catálogos cargados.</td></tr>`;
   $("#deleteDemo").classList.toggle("hidden", !rows.some((r) => r.source === "mock"));
 }
@@ -538,6 +556,7 @@ async function readCsvFile(file) {
 async function loadSettings() {
   const s = await api("/api/settings");
   for (const [k, v] of Object.entries(s)) { const i = $(`#settingsForm [name=${k}]`); if (i) i.value = v; }
+  $$("#settingsForm input").forEach((i) => { i.disabled = !DF.isOwner(); });
 }
 $("#settingsForm").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -593,6 +612,8 @@ function syncCurrencyForm() {
   if (!Currency.available) return;
   f.manual_rate.disabled = f.rate_mode.value !== "manual";
   f.vat_pct.disabled = !f.vat_enabled.checked;
+  // La tasa de cambio y la cobertura son de la instalación: solo el propietario las cambia
+  if (!DF.isOwner()) ["rate_mode", "manual_rate", "hedge_pct"].forEach((n) => { f[n].disabled = true; });
   $("#hedgeEcho").textContent = f.hedge_pct.value || 0;
 }
 
@@ -700,6 +721,12 @@ initSuggest({
   },
 });
 
-/* ---------------- Inicio ---------------- */
-Promise.allSettled([loadFacets(), Currency.load()]).then(search);
-refreshCounts();
+/* ---------------- Inicio ----------------
+   js/auth.js llama a DF.start() cuando hay una sesión iniciada (antes no se pide nada a la API). */
+let started = false;
+DF.start = () => {
+  if (started) return;
+  started = true;
+  Promise.allSettled([loadFacets(), Currency.load()]).then(search);
+  refreshCounts();
+};

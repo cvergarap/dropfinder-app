@@ -158,6 +158,7 @@ CREATE TABLE IF NOT EXISTS login_attempts (
 );
 CREATE INDEX IF NOT EXISTS ix_login_attempts ON login_attempts(email, created_at);
 CREATE INDEX IF NOT EXISTS ix_login_attempts_ip ON login_attempts(ip, created_at);
+CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at);
 """
 SCHEMA = SCHEMA.replace("ALERTS_TABLE_DEF", ALERTS_TABLE).replace("IMPORTED_TABLE_DEF", IMPORTED_TABLE)
 

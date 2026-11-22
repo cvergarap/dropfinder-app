@@ -317,7 +317,7 @@
     const head = items.map((p, i) => `<th scope="col" class="cmp-col">
         <div class="cmp-head">
           <button type="button" class="cmp-open cmp-img" data-id="${p.id}" aria-label="Ver detalle de ${esc(p.title)}">${imgTag(p)}</button>
-          <span class="cmp-key" aria-hidden="true"><i style="background:var(--cmp-s${i + 1})"></i>${i + 1}</span>
+          <span class="cmp-key" aria-hidden="true"><i class="cmp-s${i + 1}"></i>${i + 1}</span>
           <button type="button" class="link cmp-open cmp-title" data-id="${p.id}">${esc(p.title)}</button>
           <span class="chip">${esc(p.supplier)}</span>
           <span class="muted small">${FLAGS[p.warehouse] || ""} ${esc(p.warehouse)} · ${esc(p.category)}</span>
@@ -400,7 +400,7 @@
     box.hidden = false;
     $("#cmpBody").classList.add("has-chart");
     box.innerHTML = `<h3>Pedidos · últimos 30 días</h3>
-      <ul class="cmp-legend">${series.map((s) => `<li><i style="background:var(--cmp-s${s.idx + 1})"></i><b>${s.idx + 1}</b> <span></span></li>`).join("")}</ul>
+      <ul class="cmp-legend">${series.map((s) => `<li><i class="cmp-s${s.idx + 1}"></i><b>${s.idx + 1}</b> <span></span></li>`).join("")}</ul>
       <div class="cmp-plot"><div class="cmp-tip" role="status" hidden></div></div>
       <details class="cmp-data"><summary>Ver datos del gráfico</summary><div class="cmp-scroll"><table class="table"></table></div></details>`;
     // Nombres con textContent (vienen de catálogos CSV)

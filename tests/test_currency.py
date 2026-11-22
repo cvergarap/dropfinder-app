@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 os.environ.setdefault("DROPFINDER_DB", os.path.join(tempfile.mkdtemp(), "test.db"))
 
 import currency  # noqa: E402
+import authtest  # noqa: E402,F401  (contexto y sesión del propietario)
 import db  # noqa: E402
 
 
@@ -51,6 +52,7 @@ class CurrencyDBTest(unittest.TestCase):
         self.conn = db.connect()
         self.conn.execute("DROP TABLE IF EXISTS exchange_rates")
         self.conn.execute("DROP TABLE IF EXISTS currency_settings")
+        self.conn.execute("DROP TABLE IF EXISTS user_currency_settings")
         currency.ensure_schema(self.conn)
         self.conn.commit()
 
