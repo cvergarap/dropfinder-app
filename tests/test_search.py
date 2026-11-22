@@ -15,6 +15,7 @@ from urllib.parse import quote
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 os.environ.setdefault("DROPFINDER_DB", os.path.join(tempfile.mkdtemp(), "test.db"))
 
+import authtest  # noqa: E402,F401  (contexto y sesión del propietario)
 import db  # noqa: E402
 import metrics  # noqa: E402
 import search  # noqa: E402
@@ -24,7 +25,7 @@ import server  # noqa: E402
 def call(base, method, path, body=None):
     req = urllib.request.Request(f"{base}{path}", method=method,
                                  data=json.dumps(body).encode() if body is not None else None,
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json", **authtest.auth_headers()})
     try:
         with urllib.request.urlopen(req) as r:
             return r.status, json.load(r)

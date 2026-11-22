@@ -21,6 +21,13 @@ Formato en el frontend (equivalente JS):
     // Montos que NO son precio de venta (costo, envío, ganancia): usd * state.rates[code] con redondeo
     // simple a `decimals` (Math.round para COP, 2 decimales para USD); nunca redondeo comercial.
 
+Ajustes por usuario e instalación (Sprint 3, cuentas):
+- De cada usuario (cómo VE los precios): display_currency, cop_rounding, vat_enabled, vat_pct. Se guardan en
+  `user_currency_settings`; mientras un usuario no los cambie, valen los de `currency_settings` (valores de
+  la instalación, que hacen de valores por defecto para cuentas nuevas).
+- De la instalación (cuánto CUESTA el dólar para el negocio; solo el propietario): rate_mode, manual_rate,
+  hedge_pct, en `currency_settings`. El historial de la TRM (`exchange_rates`) también es de la instalación.
+
 IVA: si está activado se SUMA encima del precio de venta sólo para mostrar el "precio al consumidor con
 IVA"; no altera los cálculos de ganancia en USD. El tratamiento tributario depende del régimen de cada
 vendedor: debe validarlo con su contador.
@@ -29,10 +36,13 @@ from __future__ import annotations
 
 import json
 import math
+import sqlite3
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
+
+import auth_context
 
 # ── Configuración ───────────────────────────────────────────────────────────────────────────────────
 
@@ -49,6 +59,9 @@ CURRENCIES = {
             "rounding_modes": ["900", "1000", "100", "none"], "rounding_setting": "cop_rounding"},
 }
 SUPPORTED = list(CURRENCIES)  # ["USD", "COP"]
+
+USER_KEYS = ("display_currency", "cop_rounding", "vat_enabled", "vat_pct")   # preferencias de cada usuario
+INSTALLATION_KEYS = tuple(k for k in DEFAULTS if k not in USER_KEYS)          # solo el propietario
 
 RATE_MODES = ("trm", "manual")
 MAX_HEDGE_PCT = 50.0
@@ -77,16 +90,38 @@ def ensure_schema(conn) -> None:
         date TEXT NOT NULL, currency TEXT NOT NULL, rate REAL NOT NULL, source TEXT NOT NULL,
         fetched_at TEXT NOT NULL, PRIMARY KEY (date, currency, source))""")
     conn.execute("CREATE TABLE IF NOT EXISTS currency_settings (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS user_currency_settings (user_id INTEGER NOT NULL, key TEXT NOT NULL, "
+                 "value TEXT, PRIMARY KEY (user_id, key))")
     conn.executemany("INSERT OR IGNORE INTO currency_settings(key, value) VALUES (?, ?)",
                      [(k, json.dumps(v)) for k, v in DEFAULTS.items()])
 
 
 # ── Ajustes ─────────────────────────────────────────────────────────────────────────────────────────
 
-def get_settings(conn) -> dict:
-    """Ajustes actuales; cualquier valor ausente o corrupto vuelve a su valor por defecto."""
+def _uid(user_id: int | None) -> int | None:
+    """Usuario dueño de las preferencias: el indicado o el de la petición en curso. None fuera de una
+    petición (p. ej. el hilo de la TRM): entonces solo cuentan los valores de la instalación."""
+    if user_id is not None:
+        return int(user_id)
+    try:
+        return auth_context.current_user_id()
+    except auth_context.NoUserContext:
+        return None
+
+
+def get_settings(conn, user_id: int | None = None) -> dict:
+    """Ajustes del usuario (por defecto el de la petición en curso): los de la instalación más sus
+    preferencias. Cualquier valor ausente o corrupto vuelve al de la instalación o al valor por defecto."""
     out = dict(DEFAULTS)
-    for key, raw in conn.execute("SELECT key, value FROM currency_settings").fetchall():
+    rows = conn.execute("SELECT key, value FROM currency_settings").fetchall()
+    uid = _uid(user_id)
+    if uid is not None:
+        try:
+            rows += conn.execute("SELECT key, value FROM user_currency_settings WHERE user_id = ?",
+                                 (uid,)).fetchall()
+        except sqlite3.OperationalError:     # base sin la tabla aún (antes de ensure_schema)
+            pass
+    for key, raw in rows:                # las filas del usuario van después: pisan a las de la instalación
         if key not in DEFAULTS:
             continue
         try:
@@ -148,15 +183,23 @@ def _validate(key: str, value):
     raise ValueError(f"Opción desconocida: {key}")
 
 
-def update_settings(conn, body: dict) -> dict:
-    """Actualiza (parcialmente) los ajustes. Valida todo antes de escribir: o se guarda todo o nada."""
+def update_settings(conn, body: dict, user_id: int | None = None) -> dict:
+    """Actualiza (parcialmente) los ajustes. Valida todo antes de escribir: o se guarda todo o nada.
+    Las preferencias (USER_KEYS) se guardan para el usuario; el resto, para la instalación (quien llama
+    comprueba que solo el propietario cambie estas últimas)."""
     if not isinstance(body, dict):
         raise ValueError("Se esperaba un objeto JSON con los ajustes")
     clean = {k: _validate(k, v) for k, v in body.items()}
+    uid = _uid(user_id)
+    if uid is None and any(k in USER_KEYS for k in clean):
+        raise auth_context.NoUserContext("Las preferencias de moneda son de un usuario: falta el contexto")
     conn.executemany("INSERT INTO currency_settings(key, value) VALUES (?, ?) "
                      "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                     [(k, json.dumps(v)) for k, v in clean.items()])
-    return get_settings(conn)
+                     [(k, json.dumps(v)) for k, v in clean.items() if k not in USER_KEYS])
+    conn.executemany("INSERT INTO user_currency_settings(user_id, key, value) VALUES (?, ?, ?) "
+                     "ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value",
+                     [(uid, k, json.dumps(v)) for k, v in clean.items() if k in USER_KEYS])
+    return get_settings(conn, uid)
 
 
 # ── TRM oficial ─────────────────────────────────────────────────────────────────────────────────────
@@ -258,12 +301,13 @@ def maybe_auto_refresh(conn, opener=None, max_age_hours: float = 12) -> None:
 
 # ── Estado y conversión ─────────────────────────────────────────────────────────────────────────────
 
-def get_state(conn, error: str | None = None) -> dict:
+def get_state(conn, error: str | None = None, user_id: int | None = None) -> dict:
     """Estado completo para el frontend: ajustes, tasas efectivas y metadatos de la tasa.
 
-    `error` (opcional) permite a `refresh_trm` reportar un fallo de consulta.
+    `error` (opcional) permite a `refresh_trm` reportar un fallo de consulta. `user_id`: de quién son las
+    preferencias (por defecto, el usuario de la petición en curso).
     """
-    s = get_settings(conn)
+    s = get_settings(conn, user_id)
     hedge = s["hedge_pct"]
     errors = [error] if error else []
     base, source, day, stale = None, "none", None, False
@@ -287,6 +331,7 @@ def get_state(conn, error: str | None = None) -> dict:
         "rates": {"USD": 1.0, "COP": effective},
         "rate_info": {"base_rate": base, "effective_rate": effective, "source": source, "date": day,
                       "stale": stale, "hedge_pct": hedge, "error": " ".join(errors) or None},
+        "user_keys": list(USER_KEYS), "installation_keys": list(INSTALLATION_KEYS),
         "currencies": [{"code": c, "symbol": m["symbol"], "decimals": m["decimals"], "locale": m["locale"]}
                        for c, m in CURRENCIES.items()],
     }

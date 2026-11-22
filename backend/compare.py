@@ -35,6 +35,7 @@ import sys
 import threading
 from functools import lru_cache
 
+import auth_context
 import db
 import hooks
 import search
@@ -69,7 +70,13 @@ COMPARE_FIELDS = {
     "total_cost": False, "suggested_price": False, "profit": True, "margin": True, "shipping_days": False,
     "rating": True, "orders": True, "trend": True, "score": True, "stock": True,
 }
-_SELECT = "SELECT p.*, i.id AS imported_id FROM products p LEFT JOIN imported_products i ON i.product_id = p.id"
+
+
+def _select() -> str:
+    """SELECT de productos con imported_id del usuario de la petición (cada usuario tiene sus importados)."""
+    uid = int(auth_context.current_user_id())
+    return ("SELECT p.*, i.id AS imported_id FROM products p LEFT JOIN imported_products i "
+            f"ON i.product_id = p.id AND i.user_id = {uid}")
 
 
 # ---------------------------------------------------------------- clave de agrupación
@@ -259,7 +266,7 @@ def _parse_ids(qs: dict, max_n: int) -> list[int]:
 def _fetch(conn, ids) -> dict:
     if not ids:
         return {}
-    rows = conn.execute(f"{_SELECT} WHERE p.id IN ({','.join('?' * len(ids))})", ids).fetchall()
+    rows = conn.execute(f"{_select()} WHERE p.id IN ({','.join('?' * len(ids))})", ids).fetchall()
     item = _server()._item
     return {r["id"]: item(r) for r in rows}
 
@@ -298,7 +305,7 @@ def alternatives(pid: int) -> dict:
         total = conn.execute(f"SELECT COUNT(*) FROM products p WHERE {where}", args).fetchone()[0]
         best = {name: conn.execute(f"SELECT p.id FROM products p WHERE {where} ORDER BY {order} LIMIT 1",
                                    args).fetchone()[0] for name, order in _BEST_ORDER.items()}
-        rows = conn.execute(f"{_SELECT} WHERE {where} ORDER BY p.total_cost, p.id LIMIT ?",
+        rows = conn.execute(f"{_select()} WHERE {where} ORDER BY p.total_cost, p.id LIMIT ?",
                             (*args, MAX_ALTERNATIVES)).fetchall()
         items = {r["id"]: srv._item(r) for r in rows}
         items.update(_fetch(conn, [i for i in {pid, *best.values()} if i not in items]))

@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 os.environ.setdefault("DROPFINDER_DB", os.path.join(tempfile.mkdtemp(), "test.db"))
 
 import auth_context  # noqa: E402
+import authtest  # noqa: E402  (sesión del propietario para HTTP)
 import collections_mod  # noqa: E402
 import dashboard  # noqa: E402
 import db  # noqa: E402
@@ -318,6 +319,9 @@ class DashboardTest(unittest.TestCase):
     def test_no_user_context_is_401(self):
         """Sin contexto de usuario no hay atajos: 401, también con variables de entorno de desarrollo."""
         self.assertFalse(hasattr(dashboard, "DEV_USER_ENV"))
+        prev = (getattr(auth_context._local, "user_id", None), getattr(auth_context._local, "role", None))
+        self.addCleanup(auth_context.set_current, *prev)      # las demás pruebas usan el contexto de authtest
+        auth_context.clear()
         with unittest.mock.patch.dict(os.environ, {"DROPFINDER_DEV_USER": "1"}):
             for call in (dashboard.dashboard, lambda: dashboard.dismiss("currency")):
                 with self.assertRaises(ApiError) as cm:
@@ -333,11 +337,10 @@ class DashboardTest(unittest.TestCase):
                 urllib.request.urlopen(base + "/api/dashboard", timeout=10).close()
             self.assertEqual(cm.exception.code, 401)
             cm.exception.close()
-            # Sesión simulada (la pondrá el middleware de cuentas): el hilo del servidor ve al usuario 1
-            with unittest.mock.patch.object(auth_context, "current_user_id", return_value=OWNER), \
-                    unittest.mock.patch.object(auth_context, "is_owner", return_value=True):
-                with urllib.request.urlopen(base + "/api/dashboard", timeout=10) as r:
-                    body = json.loads(r.read())
+            # Con la sesión del propietario (usuario 1, tests/authtest.py)
+            req = urllib.request.Request(base + "/api/dashboard", headers=authtest.auth_headers())
+            with urllib.request.urlopen(req, timeout=10) as r:
+                body = json.loads(r.read())
             self.assertEqual(set(body), {"kpis", "estimate", "charts", "attention", "recommendations", "onboarding",
                                          "assumptions", "generated_at", "took_ms"})
             self.assertEqual(body["kpis"]["imported"], 4)

@@ -1,1 +1,58 @@
-/* Estilos del módulo auth (ver js/auth.js) */
+/* Estilos del módulo auth (ver js/auth.js). Usa los tokens de styles.css (claro/oscuro). */
+
+/* Sin sesión: solo la pantalla de acceso */
+body.df-locked > header, body.df-locked > main:not(.auth-screen) { display: none; }
+
+/* Interfaz según el rol */
+body:not(.df-owner) .owner-only { display: none !important; }
+body:not(.df-member) .member-only { display: none !important; }
+.member-only { margin-top: 8px; }
+
+.auth-screen { min-height: 100vh; display: grid; place-items: center; padding: 24px 16px; max-width: none; }
+.auth-card { width: 100%; max-width: 420px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 24px; display: flex; flex-direction: column; gap: 12px; }
+.auth-card h1 { font-size: 20px; margin: 0; }
+.auth-card .brand { font-size: 22px; }
+.auth-card form, .auth-form { display: flex; flex-direction: column; gap: 4px; }
+.auth-card .field input, .auth-form .field input, .auth-form .field select { width: 100%; font-size: 15px; }
+.auth-card button.primary, .auth-form button.primary { align-self: stretch; padding: 10px 16px; }
+.auth-error { color: var(--bad); margin: 0; min-height: 0; font-size: 13px; font-weight: 600; }
+.auth-error:empty { display: none; }
+.small { font-size: 12px; }
+
+/* Menú del usuario en la barra superior */
+.user-menu { position: relative; }
+.user-btn { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px 4px 4px !important; border-radius: 999px !important; }
+.user-avatar { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; font-weight: 700;
+  background: var(--primary); color: var(--primary-ink); font-size: 13px; }
+.user-name { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-list { position: absolute; right: 0; top: calc(100% + 6px); z-index: 20; min-width: 220px; max-width: calc(100vw - 32px);
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 6px;
+  box-shadow: 0 10px 30px rgb(0 0 0 / .18); display: flex; flex-direction: column; }
+.user-list[hidden] { display: none; }
+.user-head { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px 10px; border-bottom: 1px solid var(--border);
+  margin-bottom: 4px; overflow-wrap: anywhere; }
+.user-list [role=menuitem] { text-align: left; background: none; border: 0; padding: 9px 10px; border-radius: 8px; cursor: pointer; }
+.user-list [role=menuitem]:hover, .user-list [role=menuitem]:focus-visible { background: var(--chip); outline: none; }
+
+/* Diálogos de cuenta y usuarios */
+.auth-dialog { max-width: 620px; }
+.auth-dlg-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 16px 18px 0; }
+.auth-dlg-head .close { background: none; border: 0; font-size: 24px; cursor: pointer; color: var(--muted); line-height: 1; }
+.auth-dlg-body { padding: 8px 18px 18px; display: flex; flex-direction: column; gap: 16px; }
+.auth-dlg-body .auth-form { border-top: 1px solid var(--border); padding-top: 12px; }
+.row-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+.user-rows { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.user-rows li { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; display: flex; flex-wrap: wrap;
+  justify-content: space-between; gap: 8px; }
+.user-rows li.is-disabled { opacity: .7; }
+.user-rows .who { display: flex; flex-direction: column; gap: 2px; min-width: 0; overflow-wrap: anywhere; }
+.user-rows .acts { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; }
+.link.danger { color: var(--bad); }
+.chip-bad { color: var(--bad); }
+
+@media (max-width: 520px) {
+  .user-name { display: none; }
+  .user-btn { padding: 4px !important; }
+  .auth-card { padding: 18px; }
+}

@@ -21,6 +21,7 @@ os.environ.setdefault("DROPFINDER_DB", os.path.join(tempfile.mkdtemp(), "test.db
 os.environ.setdefault("DROPFINDER_SYNTH_HISTORY", "0")
 
 import auth_context  # noqa: E402
+import authtest  # noqa: E402  (sesión del propietario para HTTP)
 import collections_mod as cm  # noqa: E402
 import currency  # noqa: E402
 import db  # noqa: E402
@@ -259,6 +260,8 @@ class CollectionsTest(unittest.TestCase):
             self.assertEqual(cm.favorite_ids({"ids": [str(a)]})["total"], 1)
 
     def test_sin_usuario_401_sin_modo_desarrollo(self):
+        prev = (getattr(auth_context._local, "user_id", None), getattr(auth_context._local, "role", None))
+        self.addCleanup(auth_context.set_current, *prev)      # las demás pruebas usan el contexto de authtest
         auth_context.clear()
         e = self.err(401, self.route, "GET", "/api/collections")
         self.assertEqual(str(e), "Inicia sesión")
@@ -582,15 +585,12 @@ class GetSinEscriturasTest(unittest.TestCase):
 
 
 class CollectionsHttpTest(unittest.TestCase):
-    """Cabeceras de la descarga sobre HTTP real. Esta rama aún no tiene el middleware de sesión: la prueba
-    sustituye auth_context.current_user_id (usuario 1) mientras corre el servidor."""
+    """Cabeceras de la descarga sobre HTTP real, con la sesión del propietario (tests/authtest.py)."""
 
     @classmethod
     def setUpClass(cls):
         cls.tmp = _TempDb()
         db.init_db(seed_size=120)
-        cls.patch = mock.patch.object(auth_context, "current_user_id", lambda: 1)
-        cls.patch.start()
         cls.srv = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         cls.base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
@@ -599,13 +599,12 @@ class CollectionsHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.srv.shutdown()
         cls.srv.server_close()
-        cls.patch.stop()
         cls.tmp.close()
 
     def call(self, method, path, body=None):
         req = urllib.request.Request(self.base + path, method=method,
                                      data=json.dumps(body).encode() if body is not None else None,
-                                     headers={"Content-Type": "application/json"})
+                                     headers={"Content-Type": "application/json", **authtest.auth_headers()})
         try:
             with urllib.request.urlopen(req) as r:
                 return r.status, dict(r.headers), r.read()
@@ -631,6 +630,8 @@ class CollectionsHttpTest(unittest.TestCase):
             self.assertEqual(int(h["Content-Length"]), len(body))
             self.assertTrue(body.startswith(b"\xef\xbb\xbf"))
             self.assertTrue(body.endswith(b"\r\n"))
+            self.assertIn("default-src 'self'", h["Content-Security-Policy"])       # cabeceras de seguridad
+            self.assertEqual(h["X-Content-Type-Options"], "nosniff")
         st, h, body = self.call("GET", "/api/export/collection.csv?id=999999")
         self.assertEqual((st, json.loads(body)["error"]), (404, "Colección no encontrada"))
         st, _, _ = self.call("GET", "/api/export/otra.csv")

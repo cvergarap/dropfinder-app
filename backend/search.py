@@ -388,17 +388,18 @@ LOG_WINDOW_MINUTES = 30      # la misma búsqueda repetida dentro de la ventana 
 LOG_MAX_ROWS = 20_000        # tope del historial de búsquedas (se podan las más antiguas)
 
 
-def log_search(conn, q: str, results: int, ts: str) -> None:
-    """Registra una búsqueda para "búsquedas populares". Cambiar filtros u orden vuelve a la página 1
-    con el mismo texto: esas repeticiones no se cuentan (ventana de LOG_WINDOW_MINUTES)."""
+def log_search(conn, q: str, results: int, ts: str, user_id: int | None = None) -> None:
+    """Registra una búsqueda para "búsquedas populares" del usuario (v6: cada usuario ve solo las suyas en el
+    autocompletado). Cambiar filtros u orden vuelve a la página 1 con el mismo texto: esas repeticiones no
+    se cuentan (ventana de LOG_WINDOW_MINUTES)."""
     q_norm = " ".join(tokenize(q))[:120]
     recent = conn.execute(
-        "SELECT 1 FROM search_log WHERE q_norm = ? AND created_at >= datetime(?, ?) LIMIT 1",
-        (q_norm, ts, f"-{LOG_WINDOW_MINUTES} minutes")).fetchone()
+        "SELECT 1 FROM search_log WHERE q_norm = ? AND user_id IS ? AND created_at >= datetime(?, ?) LIMIT 1",
+        (q_norm, user_id, ts, f"-{LOG_WINDOW_MINUTES} minutes")).fetchone()
     if recent:
         return
-    cur = conn.execute("INSERT INTO search_log(q, q_norm, results, created_at) VALUES (?, ?, ?, ?)",
-                       (q[:120], q_norm, results, ts))
+    cur = conn.execute("INSERT INTO search_log(q, q_norm, results, created_at, user_id) VALUES (?, ?, ?, ?, ?)",
+                       (q[:120], q_norm, results, ts, user_id))
     if cur.lastrowid and cur.lastrowid % 500 == 0:
         conn.execute("DELETE FROM search_log WHERE id <= ?", (cur.lastrowid - LOG_MAX_ROWS,))
     with _lock:
@@ -429,9 +430,10 @@ def _matches(norm: str, stemmed: str | None, toks: list[str]) -> bool:
     return True
 
 
-def suggest(conn, prefix: str, limit: int = 8) -> list[dict]:
+def suggest(conn, prefix: str, limit: int = 8, user_id: int | None = None) -> list[dict]:
     """Autocompletado: búsquedas populares, categorías y títulos de productos que coinciden con el prefijo
-    (cada palabra escrita debe ser el comienzo de alguna palabra del texto)."""
+    (cada palabra escrita debe ser el comienzo de alguna palabra del texto). Con `user_id`, las búsquedas
+    populares son solo las de ese usuario (las de otros usuarios no se muestran: privacidad)."""
     toks = tokenize(prefix)
     norm_q = " ".join(toks)
     items, seen = [], set()
@@ -444,12 +446,13 @@ def suggest(conn, prefix: str, limit: int = 8) -> list[dict]:
 
     # 1) Búsquedas populares que empiezan igual (y que dieron resultados)
     n_pop = max(1, limit // 3) if toks else limit
-    sql = ("SELECT q_norm, MAX(q) AS q, COUNT(*) AS n FROM search_log WHERE results > 0 {w} "
+    sql = ("SELECT q_norm, MAX(q) AS q, COUNT(*) AS n FROM search_log WHERE results > 0 {u} {w} "
            "GROUP BY q_norm ORDER BY n DESC, MAX(id) DESC LIMIT ?")
+    u, uargs = ("AND user_id = ?", (user_id,)) if user_id is not None else ("", ())
     if toks:
-        rows = conn.execute(sql.format(w="AND q_norm >= ? AND q_norm < ?"), (norm_q, norm_q + "￿", n_pop))
+        rows = conn.execute(sql.format(u=u, w="AND q_norm >= ? AND q_norm < ?"), (*uargs, norm_q, norm_q + "￿", n_pop))
     else:
-        rows = conn.execute(sql.format(w=""), (n_pop,))
+        rows = conn.execute(sql.format(u=u, w=""), (*uargs, n_pop))
     for r in rows:
         add(r["q"], "busqueda")
     if not toks:

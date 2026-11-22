@@ -10,6 +10,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 os.environ.setdefault("DROPFINDER_DB", os.path.join(tempfile.mkdtemp(), "test.db"))
 
+import authtest  # noqa: E402,F401  (contexto y sesión del propietario)
 import db  # noqa: E402
 import hooks  # noqa: E402
 import search  # noqa: E402
@@ -188,6 +189,8 @@ class MigrationV5Test(unittest.TestCase):
 class AuthContextTest(unittest.TestCase):
     def test_no_context_means_no_user(self):
         import auth_context
+        prev = (getattr(auth_context._local, "user_id", None), getattr(auth_context._local, "role", None))
+        self.addCleanup(auth_context.set_current, *prev)      # las demás pruebas usan el contexto de authtest
         auth_context.clear()
         with self.assertRaises(auth_context.NoUserContext):
             auth_context.current_user_id()

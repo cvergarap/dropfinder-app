@@ -100,6 +100,8 @@
           "Aún no importaste productos.", "imports", "productos")}
       </div>`}
       ${recsCard(d.recommendations, fresh)}`;
+    // Anchos por CSSOM: la CSP (style-src 'self') bloquea los atributos style en el HTML
+    $$("[data-w]", sec).forEach((el) => { el.style.width = `${Number(el.dataset.w) || 0}%`; });
     drawCost();
   }
 
@@ -190,7 +192,7 @@
       <div class="db-card-head"><h3 id="dbObTitle">Primeros pasos</h3>
         <button type="button" class="link small" data-db-dismiss="checklist" aria-label="Ocultar la lista de primeros pasos">Ocultar lista</button></div>
       <div class="db-progress-row"><div class="db-meter" role="progressbar" aria-valuemin="0" aria-valuemax="${ob.total}"
-          aria-valuenow="${ob.done}" aria-label="Primeros pasos completados"><span style="width:${pct}%"></span></div>
+          aria-valuenow="${ob.done}" aria-label="Primeros pasos completados"><span data-w="${pct}"></span></div>
         <span class="small">${fmt(ob.done)} de ${fmt(ob.total)}</span></div>
       ${ob.complete ? `<p class="db-ok"><span aria-hidden="true">✓</span> ¡Completaste los primeros pasos!</p>` : ""}
       <ul class="db-steps">${items}</ul>
@@ -205,7 +207,7 @@
     const bars = rows.map((r) => `
       <div class="db-bar-row" title="${esc(r.label)}: ${fmt(r.value)} ${unit}">
         <span class="db-bar-label">${esc(r.label)}</span>
-        <span class="db-bar-track"><span class="db-bar" style="width:${Math.max(2, (r.value / max) * 100)}%"></span></span>
+        <span class="db-bar-track"><span class="db-bar" data-w="${Math.max(2, (r.value / max) * 100)}"></span></span>
         <span class="db-bar-value">${fmt(r.value)}</span></div>`).join("");
     return `<figure class="db-card db-chart-card">
       <figcaption><div class="db-card-head"><h3>${esc(title)}</h3>
