@@ -17,6 +17,8 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import compare
+import dashboard
+import collections_mod
 import currency
 import db
 from errors import ApiError  # noqa: F401  (los módulos y pruebas usan server.ApiError)
@@ -502,7 +504,7 @@ ROUTES = [
 ]
 
 # Rutas de los módulos de funcionalidades (cada uno define su propia lista ROUTES)
-for _module in (history, compare, saved_searches):
+for _module in (history, compare, saved_searches, dashboard, collections_mod):
     ROUTES.extend(_module.ROUTES)
 
 

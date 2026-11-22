@@ -8,17 +8,22 @@
 <link rel="stylesheet" href="css/history.css">
 <link rel="stylesheet" href="css/compare.css">
 <link rel="stylesheet" href="css/saved.css">
+<link rel="stylesheet" href="css/dashboard.css">
+<link rel="stylesheet" href="css/collections.css">
+<link rel="stylesheet" href="css/auth.css">
 </head>
 <body>
 <header class="topbar">
   <div class="brand">Drop<span>Finder</span></div>
   <nav>
+    <button class="tab" data-view="dashboard">Panel</button>
     <button class="tab active" data-view="search">Buscar productos</button>
     <button class="tab" data-view="imports">Mis productos <span id="importsCount" class="pill">0</span></button>
     <button class="tab" data-view="alerts">Alertas <span id="alertsCount" class="pill warn">0</span></button>
     <button class="tab" data-view="trends">Tendencias</button>
     <button class="tab" data-view="compare">Comparar <span id="compareCount" class="pill">0</span></button>
     <button class="tab" data-view="saved">Búsquedas guardadas</button>
+    <button class="tab" data-view="collections">Colecciones <span id="favCount" class="pill">0</span></button>
     <button class="tab" data-view="suppliers">Proveedores</button>
     <button class="tab" data-view="settings">Reglas de precio</button>
   </nav>
@@ -112,6 +117,8 @@
   <section id="view-trends" class="view"></section>    <!-- js/history.js -->
   <section id="view-compare" class="view"></section>   <!-- js/compare.js -->
   <section id="view-saved" class="view"></section>     <!-- js/saved.js -->
+  <section id="view-dashboard" class="view"></section> <!-- js/dashboard.js -->
+  <section id="view-collections" class="view"></section> <!-- js/collections.js -->
 
   <!-- ======= PROVEEDORES ======= -->
   <section id="view-suppliers" class="view">
@@ -196,5 +203,8 @@
 <script src="js/history.js"></script>
 <script src="js/compare.js"></script>
 <script src="js/saved.js"></script>
+<script src="js/dashboard.js"></script>
+<script src="js/collections.js"></script>
+<script src="js/auth.js"></script>
 </body>
 </html>
