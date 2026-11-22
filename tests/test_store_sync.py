@@ -365,7 +365,8 @@ class WorkerTest(Base):
         old = (utc() - timedelta(minutes=30)).isoformat(timespec="seconds")
         with db.connect() as conn:
             for i, jid in enumerate(j["id"] for j in self.jobs()):
-                conn.execute("UPDATE store_jobs SET status = 'running', attempts = 1, updated_at = ? WHERE id = ?", (old, jid))
+                conn.execute("UPDATE store_jobs SET status = 'running', attempts = 1, updated_at = ?, locked_until = ? "
+                             "WHERE id = ?", (old, old, jid))
             # el tercero ya había llamado a la tienda: no se reintenta solo
             jid3 = self.jobs(ids[2])[0]["id"]
             conn.execute("UPDATE store_jobs SET payload = json_set(payload, '$._remote_started', ?) WHERE id = ?", (old, jid3))
@@ -376,10 +377,10 @@ class WorkerTest(Base):
         self.assertIn("Revisa tu tienda", l["last_error"])
         store_sync.run_due_jobs()
         self.assertEqual(self.listing(ids[0])["status"], "hidden")
-        # un trabajo en curso reciente NO se toca
+        # un trabajo con la concesión vigente NO se toca
         with db.connect() as conn:
-            conn.execute("UPDATE store_jobs SET status = 'running', updated_at = ? WHERE id = ?",
-                         (db.now(), self.jobs(ids[1])[0]["id"]))
+            conn.execute("UPDATE store_jobs SET status = 'running', locked_until = ? WHERE id = ?",
+                         ((utc() + timedelta(minutes=5)).isoformat(timespec="seconds"), self.jobs(ids[1])[0]["id"]))
         self.assertEqual(store_sync.recover_stuck(), 0)
 
     def test_concurrent_workers_run_each_job_once(self):
@@ -446,7 +447,7 @@ class WorkerTest(Base):
                              "VALUES (1, ?, ?, 'sync', 1, ?, 'x')", [(store["id"], lid, f"m{i}") for i in range(600)])
             conn.executemany("INSERT INTO store_sync_log(user_id, action, ok, message, created_at) VALUES (2, 'sync', 1, 'otro', 'x')",
                              [()] * 3)
-            conn.execute("INSERT INTO meta(key, value) VALUES ('ss:hbr:99999', 'x'), ('ss:base:99999', '{}')")
+            conn.execute("INSERT INTO meta(key, value) VALUES ('ss:base:99999', '{}')")
         r = store_sync.prune()
         self.assertEqual(r["jobs"], 1)
         with db.connect() as conn:
@@ -455,6 +456,173 @@ class WorkerTest(Base):
             self.assertEqual(conn.execute("SELECT message FROM store_sync_log WHERE user_id = 1 ORDER BY id LIMIT 1").fetchone()[0], "m100")
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM meta WHERE key LIKE 'ss:%:99999'").fetchone()[0], 0)
             self.assertIsNotNone(conn.execute("SELECT 1 FROM meta WHERE key = ?", (f"ss:base:{lid}",)).fetchone())
+
+
+class LeaseAndConstraintsTest(Base):
+    def test_claim_sets_lease_and_expired_or_missing_lease_recovers(self):
+        store = self.connect()
+        r = store_sync.publish(store["id"], {"imported_ids": [self.imp(), self.imp()]})
+        a, b = [q["listing_id"] for q in r["queued"]]
+        job = store_sync._claim(None, utc())
+        self.assertIsNotNone(job["locked_until"])
+        self.assertGreater(job["locked_until"], db.now())
+        self.assertEqual(store_sync.recover_stuck(), 0)                       # concesión vigente
+        self.assertEqual(store_sync.recover_stuck(utc() + timedelta(minutes=11)), 1)   # vencida
+        j = self.jobs(a)[0]
+        self.assertEqual((j["status"], j["locked_until"]), ("pending", None))
+        with db.connect() as conn:                                            # sin concesión = también se recupera
+            conn.execute("UPDATE store_jobs SET status = 'running', locked_until = NULL WHERE listing_id = ?", (b,))
+        self.assertEqual(store_sync.recover_stuck(), 1)
+        self.assertEqual(store_sync.run_due_jobs(now=utc() + timedelta(minutes=12))["processed"], 2)
+        self.assertEqual({j["locked_until"] for j in self.jobs()}, {None})
+
+    def test_double_publish_creates_one_listing_and_one_job(self):
+        store = self.connect()
+        iid = self.imp()
+        results, errs = [], []
+
+        def go():
+            try:
+                with auth_context.as_user(1, "owner"):
+                    results.append(store_sync.publish(store["id"], {"imported_ids": [iid]}))
+            except Exception as e:  # noqa: BLE001
+                errs.append(e)
+        ts = [threading.Thread(target=go) for _ in range(4)]
+        [t.start() for t in ts]
+        [t.join(20) for t in ts]
+        self.assertEqual(errs, [])
+        self.assertEqual(sum(len(r["queued"]) for r in results), 1)
+        self.assertEqual(len(self.jobs()), 1)
+        store_sync.run_due_jobs()
+        self.assertEqual(len(FakeStore.stores[self.domain]["products"]), 1)
+
+    def test_enqueue_is_idempotent_for_every_action(self):
+        store, iid, lid = self.published(as_draft=False)
+        with db.connect() as conn:
+            first = store_sync._enqueue(conn, 1, lid, "hide", {})
+            again = store_sync._enqueue(conn, 1, lid, "hide", {})
+        self.assertTrue(first)
+        self.assertEqual(again, 0)
+        store_sync.listing_action(lid, "sync")
+        store_sync.listing_action(lid, "sync")
+        self.assertEqual(sorted(j["action"] for j in self.jobs(lid, "pending")), ["hide", "sync"])
+
+    def test_sync_enqueued_while_sync_running_does_not_crash(self):
+        store, iid, lid = self.published(as_draft=False)
+        store_sync.listing_action(lid, "sync")
+        with db.connect() as conn:
+            conn.execute("UPDATE store_jobs SET status = 'running' WHERE status = 'pending'")
+        self.catalog_change(self.pid_of(iid), stock=2)                        # el hook no revienta con el índice único
+        store_sync.listing_action(lid, "sync")
+
+    def test_rate_limit_has_stable_code(self):
+        store2, iid, lid = self.published(self.connect("x.fake.test"))
+        with self.assertRaises(ApiError) as cm:
+            store_sync.listing_action(lid, "retry")
+        self.assertEqual(cm.exception.code, "no_retry_needed")
+        store = self.connect()
+        ids = [self.imp(source="mock") for _ in range(51)]
+        store_sync.publish(store["id"], {"imported_ids": ids[:49], "allow_demo": True})
+        with self.assertRaises(ApiError) as cm:
+            store_sync.publish(store["id"], {"imported_ids": ids[49:], "allow_demo": True})
+        self.assertEqual((cm.exception.status, cm.exception.code), (429, "publish_rate_limited"))
+
+    def test_hidden_by_rule_column_matrix(self):
+        store, iid, lid = self.published(as_draft=False)
+        pid = self.pid_of(iid)
+        self.assertEqual(self.listing(lid)["hidden_by_rule"], 0)
+        self.catalog_change(pid, stock=0)
+        store_sync.run_due_jobs()
+        self.assertEqual((self.listing(lid)["status"], self.listing(lid)["hidden_by_rule"]), ("hidden", 1))
+        store_sync.listing_action(lid, "hide")                                # el usuario lo oculta a mano encima
+        store_sync.run_due_jobs()
+        self.assertEqual(self.listing(lid)["hidden_by_rule"], 0)
+        self.catalog_change(pid, stock=5)
+        self.assertNotIn("show", [j["action"] for j in self.jobs(lid, "pending")])   # nunca se muestra solo
+        store_sync.run_due_jobs()
+        self.assertEqual(self.listing(lid)["status"], "hidden")
+        store_sync.listing_action(lid, "show")
+        store_sync.run_due_jobs()
+        self.assertEqual((self.listing(lid)["status"], self.listing(lid)["hidden_by_rule"]), ("published", 0))
+        self.catalog_change(pid, stock=0)
+        store_sync.run_due_jobs()
+        self.assertEqual(self.listing(lid)["hidden_by_rule"], 1)
+        self.catalog_change(pid, stock=3)
+        store_sync.run_due_jobs()
+        self.assertEqual((self.listing(lid)["status"], self.listing(lid)["hidden_by_rule"]), ("published", 0))
+
+    def test_demo_marker_survives_import_deletion_and_blocks_sync(self):
+        store = self.connect()
+        iid = self.imp(source="mock")
+        pid = self.pid_of(iid)
+        r = store_sync.publish(store["id"], {"imported_ids": [iid], "allow_demo": True, "as_draft": False})
+        lid = r["queued"][0]["listing_id"]
+        store_sync.run_due_jobs()
+        l = self.listing(lid)
+        self.assertEqual((l["is_demo"], l["product_id"]), (1, pid))
+        # aunque el producto "dejara" de ser demo, la marca del anuncio manda
+        with db.connect() as conn:
+            conn.execute("UPDATE products SET source = 'csv' WHERE id = ?", (pid,))
+        self.catalog_change(pid, stock=0)
+        self.assertEqual(self.jobs(lid, "pending"), [])
+        server.delete_import(iid)
+        l = self.listing(lid)
+        self.assertEqual((l["imported_id"], l["is_demo"]), (None, 1))
+        v = store_sync.store_listings(store["id"], {})["items"][0]
+        self.assertEqual((v["imported_id"], v["is_demo"]), (None, True))
+        self.catalog_change(pid, stock=0)
+        self.assertEqual(self.jobs(lid, "pending"), [])
+
+    def test_unreadable_credentials_mark_connection_error_and_stop_jobs(self):
+        store = self.connect()
+        r = store_sync.publish(store["id"], {"imported_ids": [self.imp(), self.imp()]})
+        with db.connect() as conn:
+            conn.execute("UPDATE store_connections SET credentials_enc = 'basura$x$y$z'")
+        self.assertEqual(store_sync.run_due_jobs()["failed"], 1)
+        got = stores_mod.get_store(store["id"])
+        self.assertEqual(got["status"], "error")
+        self.assertIn("credenciales", got["last_error"])
+        self.assertEqual(store_sync.run_due_jobs()["processed"], 0)
+        self.assertEqual({j["status"] for j in self.jobs()}, {"pending"})
+        self.assertEqual(FakeStore.stores[self.domain]["products"], {})
+
+    def test_disabled_connections_are_skipped_entirely(self):
+        store = self.connect()
+        r = store_sync.publish(store["id"], {"imported_ids": [self.imp()]})
+        with db.connect() as conn:
+            conn.execute("UPDATE store_connections SET status = 'disabled'")
+        self.assertEqual(store_sync.run_due_jobs()["processed"], 0)
+        with db.connect() as conn:
+            stores_mod.mark_ok(conn, store["id"])                             # no la reactiva
+        self.assertEqual(store_sync.run_due_jobs()["processed"], 0)
+        self.assertEqual(store_sync.publish(store["id"], {"imported_ids": [self.imp()]})["skipped"][0]["reason"],
+                         "store_error")
+        with db.connect() as conn:
+            conn.execute("UPDATE store_connections SET status = 'active'")
+        self.assertEqual(store_sync.run_due_jobs()["processed"], 1)
+
+    def test_logs_survive_disconnect_and_pending_delete_blocks_it(self):
+        store, iid, lid = self.published()
+        store_sync.delete_listing(lid, {"remove_remote": ["1"]})
+        with self.assertRaises(ApiError) as cm:
+            stores_mod.disconnect_store(store["id"], {"confirm": ["1"]})
+        self.assertEqual((cm.exception.status, cm.exception.code), (409, "pending_deletes"))
+        store_sync.run_due_jobs()
+        stores_mod.disconnect_store(store["id"], {"confirm": ["1"]})
+        with db.connect() as conn:
+            n = conn.execute("SELECT COUNT(*) FROM store_sync_log WHERE user_id = 1 AND connection_id IS NULL").fetchone()[0]
+        self.assertGreater(n, 0)
+
+    def test_scrub_applied_to_stored_messages(self):
+        store = self.connect()
+        r = store_sync.publish(store["id"], {"imported_ids": [self.imp()]})
+        FakeStore.fail_next.append(sc.StoreValidationError("falló con shpat_abcdef0123456789 y shpat_secreto_1234"))
+        store_sync.run_due_jobs()
+        with db.connect() as conn:
+            rows = [x[0] for x in conn.execute("SELECT message FROM store_sync_log")] + \
+                   [x[0] for x in conn.execute("SELECT last_error FROM store_listings")] + \
+                   [x[0] for x in conn.execute("SELECT last_error FROM store_jobs")]
+        self.assertFalse([t for t in rows if t and ("shpat_" in t)])
 
 
 class ListingActionsTest(Base):

@@ -22,16 +22,16 @@ Anuncio (`store_listings.status`):
     error --reintentar--> (tras éxito) vuelve a su estado previo (`_prev` del trabajo; por defecto hidden)
     removed/error sin id externo --reintentar--> pending (nuevo publish)
 Trabajo (`store_jobs.status`): pending -> running -> done | failed; running -> pending (reintento con espera
-creciente, error de límite de velocidad o conexión en error). Un trabajo `running` más de STUCK_AFTER_S se recupera.
+creciente, error de límite de velocidad o conexión en error). Un trabajo `running` más de LEASE_S se recupera.
 
 Espera entre reintentos (solo errores `retryable`): 1 min, 5 min, 30 min, 2 h; el 5.º fallo deja el trabajo en
 `failed`. Límite de velocidad: usa `retry_after` y no gasta intentos (tope de 20 esperas). Credenciales rechazadas:
 la conexión pasa a `error` y sus trabajos NO se reclaman (no se martilla un token revocado) hasta revalidarla.
 
-Anuncio oculto POR REGLA: solo se vuelve a mostrar solo si lo ocultó la regla de stock. Se marca con la clave
-`meta.ss:hbr:<listing_id>` (se escribe cuando el trabajo `hide` con `by_rule` tiene éxito; cualquier hide/show manual
-la borra). Se prefirió `meta` a la bitácora porque la bitácora se poda (500 por usuario) y perder el rastro
-podría mostrar algo que el usuario ocultó a propósito; si la marca falta, el anuncio se trata como oculto a mano.
+Anuncio oculto POR REGLA: solo se vuelve a mostrar solo si lo ocultó la regla de stock. Se marca con la columna
+`store_listings.hidden_by_rule` (=1 cuando el trabajo `hide` con `by_rule` tiene éxito; cualquier hide/show manual
+la pone en 0).
+Un borrador (`hidden` con hidden_by_rule=0) nunca se muestra solo.
 `meta.ss:base:<listing_id>` guarda precio y costo al publicar (tope de 2x y "el costo subió").
 
 Riesgo residual (caída justo después de crear en la tienda)
@@ -71,7 +71,7 @@ BACKGROUND = True                    # las pruebas lo apagan y llaman run_due_jo
 BACKOFF_S = (60, 300, 1800, 7200)    # espera tras el 1.º, 2.º, 3.º y 4.º fallo; el 5.º deja el trabajo en failed
 MAX_ATTEMPTS = len(BACKOFF_S) + 1
 MAX_RATE_WAITS = 20                  # esperas por límite de velocidad antes de rendirse
-STUCK_AFTER_S = 600                  # un trabajo `running` más tiempo que esto se da por caído
+LEASE_S = 600                       # concesión de un trabajo `running` (locked_until); vencida = proceso caído
 JOB_RETENTION_DAYS = 7
 LOG_KEEP_PER_USER = 500
 PUBLISH_MAX_IDS = 50
@@ -120,7 +120,7 @@ def clean_message(text, secrets=(), limit: int = 300) -> str:
             msg = msg.replace(s, "***")
     for rx, rep in _SECRET_RES:
         msg = rx.sub(rep, msg)
-    return msg[:limit]
+    return sc.scrub(msg, secrets, limit)
 
 
 def _uid() -> int:
@@ -193,11 +193,13 @@ def _margin_pct(price: float, cost_usd: float, rate: float, s: dict) -> float:
 
 def _enqueue(conn, user_id: int, listing_id: int, action: str, payload: dict | None = None,
              run_after: str | None = None) -> int:
+    """Encola de forma idempotente: el índice único (listing_id, action) para pending/running hace que un doble clic
+    no cree dos trabajos (INSERT OR IGNORE). Devuelve el id nuevo o 0 si ya había uno activo."""
     ts = _ts()
-    cur = conn.execute("INSERT INTO store_jobs(user_id, listing_id, action, status, attempts, run_after, payload, "
-                       "created_at, updated_at) VALUES (?, ?, ?, 'pending', 0, ?, ?, ?, ?)",
+    cur = conn.execute("INSERT OR IGNORE INTO store_jobs(user_id, listing_id, action, status, attempts, run_after, "
+                       "payload, created_at, updated_at) VALUES (?, ?, ?, 'pending', 0, ?, ?, ?, ?)",
                        (user_id, listing_id, action, run_after or ts, json.dumps(payload or {}), ts, ts))
-    return cur.lastrowid
+    return cur.lastrowid if cur.rowcount else 0
 
 
 def _pending(conn, listing_id: int, action: str | None = None):
@@ -227,8 +229,9 @@ def _enqueue_sync(conn, user_id: int, listing_id: int, new: dict) -> bool:
         if conn.execute("UPDATE store_jobs SET payload = ?, updated_at = ? WHERE id = ? AND status = 'pending'",
                         (json.dumps(merged), _ts(), old["id"])).rowcount:
             return True
-    _enqueue(conn, user_id, listing_id, "sync", new)
-    return True
+    # Si hay un sync EN CURSO (el índice único impide un segundo), este cambio se recogerá en el siguiente cambio
+    # del catálogo o con una sincronización manual.
+    return bool(_enqueue(conn, user_id, listing_id, "sync", new))
 
 
 def _enqueue_visibility(conn, user_id: int, listing_id: int, action: str, by_rule: bool) -> None:
@@ -350,7 +353,7 @@ def publish(cid: int, body: dict) -> dict:
                 todo.append((iid, imp, payload))
     if todo and recent + len(todo) > PUBLISH_PER_MINUTE:
         raise ApiError(429, f"Demasiadas publicaciones seguidas (máximo {PUBLISH_PER_MINUTE} por minuto). "
-                            "Espera un momento.")
+                            "Espera un momento.", "publish_rate_limited")
     queued = []
     if todo:
         with db.connect() as conn:
@@ -358,8 +361,9 @@ def publish(cid: int, body: dict) -> dict:
             for iid, imp, payload in todo:
                 try:
                     cur = conn.execute(
-                        "INSERT INTO store_listings(user_id, imported_id, connection_id, title, status, created_at) "
-                        "VALUES (?, ?, ?, ?, 'pending', ?)", (uid, iid, cid, imp["title"][:200], _ts()))
+                        "INSERT INTO store_listings(user_id, imported_id, product_id, is_demo, connection_id, title, status, "
+                        "created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+                        (uid, iid, imp["pid"], 1 if imp["source"] == "mock" else 0, cid, imp["title"][:200], _ts()))
                 except sqlite3.IntegrityError:        # carrera: otra petición lo publicó entre la lectura y aquí
                     skipped.append({"imported_id": iid, "reason": "already_published",
                                     "message": "Ya está publicado en esta tienda"})
@@ -375,11 +379,10 @@ def publish(cid: int, body: dict) -> dict:
 # ---------------------------------------------------------------- vistas
 
 _LISTING_SQL = (
-    "SELECT l.*, c.name AS store_name, c.platform AS platform, c.currency AS currency, p.source AS source, "
+    "SELECT l.*, c.name AS store_name, c.platform AS platform, c.currency AS currency, "
     "(SELECT j.action FROM store_jobs j WHERE j.listing_id = l.id AND j.status IN ('pending', 'running') "
     " ORDER BY j.id LIMIT 1) AS pending_action "
-    "FROM store_listings l JOIN store_connections c ON c.id = l.connection_id "
-    "LEFT JOIN imported_products i ON i.id = l.imported_id LEFT JOIN products p ON p.id = i.product_id")
+    "FROM store_listings l JOIN store_connections c ON c.id = l.connection_id")
 
 
 def _view(r) -> dict:
@@ -387,7 +390,7 @@ def _view(r) -> dict:
             "store_name": r["store_name"], "platform": r["platform"], "title": r["title"], "status": r["status"],
             "external_url": r["external_url"], "last_price": r["last_price"], "last_stock": r["last_stock"],
             "last_synced_at": r["last_synced_at"], "last_error": r["last_error"],
-            "pending_action": r["pending_action"], "is_demo": r["source"] == "mock",
+            "pending_action": r["pending_action"], "is_demo": bool(r["is_demo"]),
             "currency": r["currency"], "created_at": r["created_at"]}
 
 
@@ -466,7 +469,7 @@ def queue_state() -> dict:
 
 def _need_remote(r, what: str) -> None:
     if not r["external_id"] or r["status"] not in ("published", "hidden"):
-        raise ApiError(409, f"El anuncio todavía no está publicado en la tienda: no se puede {what}")
+        raise ApiError(409, f"El anuncio todavía no está publicado en la tienda: no se puede {what}", "not_published")
 
 
 def listing_action(lid: int, action: str) -> dict:
@@ -478,9 +481,11 @@ def listing_action(lid: int, action: str) -> dict:
             _retry(conn, r, uid)
         elif action == "sync":
             if not r["external_id"] or r["status"] not in ("published", "hidden", "error"):
-                raise ApiError(409, "El anuncio todavía no está publicado en la tienda: no se puede sincronizar")
+                raise ApiError(409, "El anuncio todavía no está publicado en la tienda: no se puede sincronizar",
+                               "not_published")
             if r["imported_id"] is None:
-                raise ApiError(409, "El producto ya no está en Mis productos: no hay datos para sincronizar")
+                raise ApiError(409, "El producto ya no está en Mis productos: no hay datos para sincronizar",
+                               "no_product")
             _enqueue_sync(conn, uid, lid, {"manual": True, "reason": "manual"})
             _log(conn, uid, r["connection_id"], lid, "sync", True, "Sincronización pedida por el usuario")
         else:
@@ -497,18 +502,18 @@ def _retry(conn, r, uid: int) -> None:
     lid = r["id"]
     if conn.execute("SELECT 1 FROM store_jobs WHERE listing_id = ? AND status IN ('pending', 'running')",
                     (lid,)).fetchone():
-        raise ApiError(409, "Ya hay una acción en curso para este anuncio")
+        raise ApiError(409, "Ya hay una acción en curso para este anuncio", "action_in_progress")
     failed = conn.execute("SELECT * FROM store_jobs WHERE listing_id = ? AND status = 'failed' "
                           "ORDER BY id DESC LIMIT 1", (lid,)).fetchone()
     need_publish = r["status"] == "removed" or (r["status"] == "error" and not r["external_id"]) \
         or (failed is not None and failed["action"] == "publish" and not r["external_id"])
     if need_publish:
         if r["imported_id"] is None:
-            raise ApiError(409, "El producto ya no está en Mis productos: no se puede volver a publicar")
+            raise ApiError(409, "El producto ya no está en Mis productos: no se puede volver a publicar", "no_product")
         crow = stores_mod.get_connection(conn, uid, r["connection_id"])
         imp = conn.execute(_IMP_SQL + " WHERE i.id = ? AND i.user_id = ?", (r["imported_id"], uid)).fetchone()
         if not crow or not imp:
-            raise ApiError(409, "El producto ya no está en Mis productos: no se puede volver a publicar")
+            raise ApiError(409, "El producto ya no está en Mis productos: no se puede volver a publicar", "no_product")
         old = _payload(failed) if failed is not None and failed["action"] == "publish" else {}
         as_draft = not old.get("product", {}).get("active", not stores_mod.load_settings(crow)["publish_as_draft"])
         payload, reason, msg = _snapshot(crow, imp, currency.get_state(conn, user_id=uid), as_draft)
@@ -527,7 +532,7 @@ def _retry(conn, r, uid: int) -> None:
         _enqueue_sync(conn, uid, lid, {"manual": True, "reason": "reintento"})
         _log(conn, uid, r["connection_id"], lid, "sync", True, "Reintento pedido por el usuario")
     else:
-        raise ApiError(409, "Este anuncio no necesita reintento")
+        raise ApiError(409, "Este anuncio no necesita reintento", "no_retry_needed")
 
 
 def delete_listing(lid: int, qs: dict) -> dict:
@@ -537,7 +542,8 @@ def delete_listing(lid: int, qs: dict) -> dict:
         conn.execute("BEGIN IMMEDIATE")
         r = _own_listing(conn, lid, uid)
         if conn.execute("SELECT 1 FROM store_jobs WHERE listing_id = ? AND status = 'running'", (lid,)).fetchone():
-            raise ApiError(409, "Hay una acción en curso para este anuncio; inténtalo en unos segundos")
+            raise ApiError(409, "Hay una acción en curso para este anuncio; inténtalo en unos segundos",
+                           "action_in_progress")
         if remove_remote and r["external_id"] and r["status"] != "removed":
             conn.execute("DELETE FROM store_jobs WHERE listing_id = ? AND status = 'pending' AND action != 'delete'",
                          (lid,))
@@ -546,10 +552,10 @@ def delete_listing(lid: int, qs: dict) -> dict:
             _log(conn, uid, r["connection_id"], lid, "delete", True, "Se pidió eliminar el producto de la tienda")
             queued = True
         else:
-            _drop_listing(conn, lid)
-            _log(conn, uid, r["connection_id"], lid, "delete", True,
+            _log(conn, uid, r["connection_id"], lid, "delete", True,       # antes de borrar: el log queda con listing NULL
                  f"Anuncio «{r['title'][:80]}» quitado de DropFinder (el producto sigue en la tienda)"
                  if r["external_id"] and r["status"] != "removed" else f"Anuncio «{r['title'][:80]}» quitado")
+            _drop_listing(conn, lid)
             queued = False
     if queued:
         _kick()
@@ -558,7 +564,7 @@ def delete_listing(lid: int, qs: dict) -> dict:
 
 def _drop_listing(conn, lid: int) -> None:
     conn.execute("DELETE FROM store_listings WHERE id = ?", (lid,))      # los trabajos caen en cascada
-    conn.execute("DELETE FROM meta WHERE key IN (?, ?)", (f"ss:hbr:{lid}", f"ss:base:{lid}"))
+    conn.execute("DELETE FROM meta WHERE key = ?", (f"ss:base:{lid}",))
 
 
 def sync_now() -> dict:
@@ -585,21 +591,22 @@ def _claim(user_id: int | None, now: datetime):
         r = conn.execute(sql + " ORDER BY j.run_after, j.id LIMIT 1", args).fetchone()
         if not r:
             return None
-        n = conn.execute("UPDATE store_jobs SET status = 'running', attempts = attempts + 1, updated_at = ? "
-                         "WHERE id = ? AND status = 'pending'", (_ts(now), r["id"])).rowcount
+        n = conn.execute("UPDATE store_jobs SET status = 'running', attempts = attempts + 1, updated_at = ?, "
+                         "locked_until = ? WHERE id = ? AND status = 'pending'",
+                         (_ts(now), _ts(now + timedelta(seconds=LEASE_S)), r["id"])).rowcount
         return conn.execute("SELECT * FROM store_jobs WHERE id = ?", (r["id"],)).fetchone() if n else None
 
 
 def recover_stuck(now: datetime | None = None) -> int:
-    """Trabajos `running` desde hace más de STUCK_AFTER_S (el proceso murió): vuelven a la cola, salvo un publish
+    """Trabajos `running` con la concesión (`locked_until`) vencida (el proceso murió): vuelven a la cola, salvo un publish
     que ya había empezado a llamar a la tienda (puede existir el producto): ese pasa a `error` para que el usuario
     revise antes de reintentar. Los que ya gastaron todos los intentos quedan `failed`."""
     now = now or datetime.now(timezone.utc)
-    cutoff = _ts(now - timedelta(seconds=STUCK_AFTER_S))
+    cutoff = _ts(now)
     n = 0
     with db.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        for j in conn.execute("SELECT * FROM store_jobs WHERE status = 'running' AND updated_at < ?",
+        for j in conn.execute("SELECT * FROM store_jobs WHERE status = 'running' AND (locked_until IS NULL OR locked_until < ?)",
                               (cutoff,)).fetchall():
             n += 1
             pl = _payload(j)
@@ -609,16 +616,16 @@ def recover_stuck(now: datetime | None = None) -> int:
             if risky:
                 msg = ("Se interrumpió mientras se publicaba y no se sabe si el producto llegó a crearse. Revisa tu "
                        f"tienda (SKU DF-{pl.get('product', {}).get('sku', '')[3:] or '?'}) y, si no está, usa Reintentar.")
-                conn.execute("UPDATE store_jobs SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?",
+                conn.execute("UPDATE store_jobs SET locked_until = NULL, status = 'failed', last_error = ?, updated_at = ? WHERE id = ?",
                              (msg, _ts(now), j["id"]))
                 conn.execute("UPDATE store_listings SET status = 'error', last_error = ? WHERE id = ?",
                              (msg, j["listing_id"]))
                 _log(conn, j["user_id"], lst["connection_id"], j["listing_id"], "publish", False, msg)
             elif j["attempts"] >= MAX_ATTEMPTS:
-                conn.execute("UPDATE store_jobs SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?",
+                conn.execute("UPDATE store_jobs SET locked_until = NULL, status = 'failed', last_error = ?, updated_at = ? WHERE id = ?",
                              ("Se interrumpió varias veces", _ts(now), j["id"]))
             else:
-                conn.execute("UPDATE store_jobs SET status = 'pending', run_after = ?, updated_at = ?, "
+                conn.execute("UPDATE store_jobs SET locked_until = NULL, status = 'pending', run_after = ?, updated_at = ?, "
                              "last_error = 'Se interrumpió; se reintenta' WHERE id = ?",
                              (_ts(now), _ts(now), j["id"]))
                 if lst is not None:
@@ -658,7 +665,7 @@ def run_due_jobs(user_id: int | None = None, limit: int = 20, now: datetime | No
 def _safe_requeue(job, now) -> None:
     try:
         with db.connect() as conn:
-            conn.execute("UPDATE store_jobs SET status = 'pending', run_after = ?, updated_at = ?, "
+            conn.execute("UPDATE store_jobs SET locked_until = NULL, status = 'pending', run_after = ?, updated_at = ?, "
                          "last_error = 'Error interno' WHERE id = ? AND status = 'running'",
                          (_ts(now + timedelta(seconds=BACKOFF_S[0])), _ts(now), job["id"]))
     except Exception:  # noqa: BLE001
@@ -709,7 +716,7 @@ def _run_job(job, now: datetime) -> bool:
             handler(job, lst, crow, connector, payload, now)
             return True
         except _Skip as e:
-            _write(lambda c: (c.execute("UPDATE store_jobs SET status = 'done', last_error = ?, updated_at = ? "
+            _write(lambda c: (c.execute("UPDATE store_jobs SET locked_until = NULL, status = 'done', last_error = ?, updated_at = ? "
                                         "WHERE id = ?", (str(e), _ts(now), job["id"])),
                               _log(c, uid, crow["id"], lst["id"], job["action"], True, str(e))))
             return True
@@ -730,7 +737,7 @@ def _done(conn, job, lst, action: str, message: str, updates: dict | None = None
     if updates:
         cols = ", ".join(f"{k} = ?" for k in updates)
         conn.execute(f"UPDATE store_listings SET {cols} WHERE id = ?", [*updates.values(), lst["id"]])
-    conn.execute("UPDATE store_jobs SET status = 'done', last_error = NULL, updated_at = ? WHERE id = ?",
+    conn.execute("UPDATE store_jobs SET locked_until = NULL, status = 'done', last_error = NULL, updated_at = ? WHERE id = ?",
                  (_ts(now), job["id"]))
     _log(conn, job["user_id"], lst["connection_id"], lst["id"], action, True, message)
 
@@ -785,7 +792,7 @@ def _do_publish(job, lst, crow, connector, payload, now) -> None:
         except sc.StoreError as e:
             msg = ("El anuncio se quitó durante la publicación y no se pudo eliminar el producto creado "
                    f"(id {ref.external_id}): {clean_message(e, list(connector.credentials.values()))}")
-        _write(lambda c: _log(c, uid, crow["id"], lst["id"], "publish", False, msg))
+        _write(lambda c: _log(c, uid, crow["id"], None, "publish", False, msg))   # el anuncio ya no existe
 
 
 def _stock_price_now(conn, lst, uid: int, crow) -> tuple[float, int]:
@@ -837,22 +844,17 @@ def _do_visibility(job, lst, crow, connector, payload, now) -> None:
     if lst["status"] == "removed":
         raise _Skip("El producto ya no existe en la tienda")
     if by_rule:                                  # la regla pudo quedar obsoleta mientras esperaba
-        with db.connect() as conn:
-            marked = conn.execute("SELECT 1 FROM meta WHERE key = ?", (f"ss:hbr:{lst['id']}",)).fetchone()
-        if (show and (lst["status"] != "hidden" or not marked)) or (not show and lst["status"] != "published"):
+        if (show and (lst["status"] != "hidden" or not lst["hidden_by_rule"])) or \
+                (not show and lst["status"] != "published"):
             raise _Skip("La regla de stock ya no aplica; no se cambió la visibilidad")
     connector.set_active(_ref(lst), show)
-    key = f"ss:hbr:{lst['id']}"
 
     def save(c):
         _done(c, job, lst, job["action"],
               ("Producto mostrado en la tienda" + (" (volvió el stock)" if by_rule else "")) if show else
               ("Producto ocultado en la tienda" + (" (sin stock en el proveedor)" if by_rule else "")),
-              {"status": "published" if show else "hidden", "last_error": None}, now)
-        if not show and by_rule:
-            c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, _ts(now)))
-        else:
-            c.execute("DELETE FROM meta WHERE key = ?", (key,))
+              {"status": "published" if show else "hidden", "last_error": None,
+               "hidden_by_rule": 1 if (not show and by_rule) else 0}, now)
     _write(save)
 
 
@@ -878,7 +880,7 @@ def _on_error(job, lst, crow, exc: sc.StoreError, secrets: list, now: datetime) 
 
     def requeue(c, delay: float, attempts_back: int, note: str, extra=None):
         pl.update(extra or {})
-        c.execute("UPDATE store_jobs SET status = 'pending', run_after = ?, attempts = ?, last_error = ?, "
+        c.execute("UPDATE store_jobs SET locked_until = NULL, status = 'pending', run_after = ?, attempts = ?, last_error = ?, "
                   "payload = ?, updated_at = ? WHERE id = ?",
                   (_ts(now + timedelta(seconds=delay)), max(0, attempts - attempts_back), msg, json.dumps(pl),
                    _ts(now), job["id"]))
@@ -886,7 +888,7 @@ def _on_error(job, lst, crow, exc: sc.StoreError, secrets: list, now: datetime) 
         _log(c, uid, cid, lid, action, False, note)
 
     def fail(c, listing_status: str | None, note: str):
-        c.execute("UPDATE store_jobs SET status = 'failed', last_error = ?, payload = ?, updated_at = ? WHERE id = ?",
+        c.execute("UPDATE store_jobs SET locked_until = NULL, status = 'failed', last_error = ?, payload = ?, updated_at = ? WHERE id = ?",
                   (msg, json.dumps(pl), _ts(now), job["id"]))
         if listing_status:
             c.execute("UPDATE store_listings SET status = ?, last_error = ? WHERE id = ?",
@@ -918,10 +920,10 @@ def _on_error(job, lst, crow, exc: sc.StoreError, secrets: list, now: datetime) 
         note = "El producto ya no existe en la tienda (se borró a mano). Puedes volver a publicarlo con Reintentar."
 
         def removed(c):
-            c.execute("UPDATE store_jobs SET status = 'done', last_error = ?, updated_at = ? WHERE id = ?",
+            c.execute("UPDATE store_jobs SET locked_until = NULL, status = 'done', last_error = ?, updated_at = ? WHERE id = ?",
                       (note, _ts(now), job["id"]))
-            c.execute("UPDATE store_listings SET status = 'removed', last_error = ? WHERE id = ?", (note, lid))
-            c.execute("DELETE FROM meta WHERE key = ?", (f"ss:hbr:{lid}",))
+            c.execute("UPDATE store_listings SET status = 'removed', hidden_by_rule = 0, last_error = ? WHERE id = ?",
+                      (note, lid))
             c.execute("DELETE FROM store_jobs WHERE listing_id = ? AND status = 'pending'", (lid,))
             _log(c, uid, cid, lid, action, False, note)
         _write(removed)
@@ -953,7 +955,7 @@ def prune(now: datetime | None = None) -> dict:
                 logs += conn.execute("DELETE FROM store_sync_log WHERE user_id = ? AND id <= ?",
                                      (u, edge[0])).rowcount
         marks = 0
-        for prefix in ("ss:hbr:", "ss:base:"):
+        for prefix in ("ss:base:",):
             marks += conn.execute(
                 "DELETE FROM meta WHERE key GLOB ? AND CAST(substr(key, ?) AS INTEGER) NOT IN "
                 "(SELECT id FROM store_listings)", (prefix + "*", len(prefix) + 1)).rowcount
@@ -964,10 +966,11 @@ def prune(now: datetime | None = None) -> dict:
 
 _RULE_SQL = (
     "SELECT l.id AS lid, l.user_id, l.connection_id, l.status, l.last_price, l.last_stock, l.title AS ltitle, "
-    "i.id AS imp_id, p.id AS pid, p.cost, p.shipping_cost, p.stock, c.settings AS settings, c.currency AS currency, "
-    "c.name AS store_name FROM store_listings l JOIN imported_products i ON i.id = l.imported_id "
-    "JOIN products p ON p.id = i.product_id JOIN store_connections c ON c.id = l.connection_id "
-    "WHERE l.status IN ('published', 'hidden') AND p.source != 'mock'")
+    "l.hidden_by_rule, i.id AS imp_id, p.id AS pid, p.cost, p.shipping_cost, p.stock, c.settings AS settings, "
+    "c.currency AS currency, c.name AS store_name FROM store_listings l "
+    "JOIN imported_products i ON i.id = l.imported_id JOIN products p ON p.id = i.product_id "
+    "JOIN store_connections c ON c.id = l.connection_id "
+    "WHERE l.status IN ('published', 'hidden') AND l.is_demo = 0 AND p.source != 'mock'")
 
 
 def _on_catalog_write(conn, ids) -> None:
@@ -987,13 +990,12 @@ def _on_catalog_write(conn, ids) -> None:
     pend: dict[int, dict[str, list]] = {}
     for j in conn.execute("SELECT * FROM store_jobs WHERE status = 'pending' AND action IN ('sync', 'hide', 'show')"):
         pend.setdefault(j["listing_id"], {}).setdefault(j["action"], []).append(j)
-    marks = {r[0] for r in conn.execute("SELECT key FROM meta WHERE key GLOB 'ss:hbr:*'")}
     states: dict[int, dict] = {}
     queued = False
     for r in rows:
         cfg = stores_mod.load_settings(r)
         mine = pend.get(r["lid"], {})
-        queued |= _rule_visibility(conn, r, cfg, mine, f"ss:hbr:{r['lid']}" in marks)
+        queued |= _rule_visibility(conn, r, cfg, mine, bool(r["hidden_by_rule"]))
         queued |= _rule_stock_price(conn, r, cfg, mine, fees, states)
     if queued:
         _kick()
