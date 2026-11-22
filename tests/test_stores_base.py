@@ -94,7 +94,104 @@ class SecretsStoreTest(unittest.TestCase):
 
     def test_mask(self):
         self.assertEqual(secrets_store.mask("shpat_abcdef1234"), "••••••••1234")
-        self.assertEqual(secrets_store.mask("ab"), "••")
+        self.assertEqual(secrets_store.mask("ab"), "••••••••")            # un secreto corto no revela nada
+        self.assertEqual(secrets_store.mask("abcde"), "••••••••")
+
+
+class SecretsReviewTest(unittest.TestCase):
+    """Hallazgos de la revisión del PR #10 sobre el almacén de secretos."""
+
+    def setUp(self):
+        self.tmp = _TempDb()
+
+    def tearDown(self):
+        self.tmp.close()
+
+    def test_mac_framing_cannot_be_shifted(self):
+        import base64
+        t = secrets_store.encrypt("secreto-largo-1234567890", "a|b")
+        v, n, c, tag = t.split("$")
+        nonce, ct = secrets_store._unb64(n), secrets_store._unb64(c)
+        for k in (1, 5, 15):                                       # mover bytes entre nonce y texto cifrado
+            moved = f"{v}${secrets_store._b64(nonce[:-k])}${secrets_store._b64(nonce[-k:] + ct)}${tag}"
+            with self.assertRaises(secrets_store.SecretError):
+                secrets_store.decrypt(moved, "a|b")
+        # El enmarcado no es ambiguo: con el mismo total de bytes, mover el límite entre aad, nonce y texto cifrado
+        # (sin prefijos de longitud estas dos entradas serían idénticas) debe dar otra etiqueta
+        self.assertNotEqual(secrets_store._mac(b"a|b", nonce, ct),
+                            secrets_store._mac(b"a", b"b|" + nonce[:14], nonce[14:] + ct))
+        self.assertNotEqual(secrets_store._mac(b"x", nonce, b"yz"), secrets_store._mac(b"x", nonce, b"y"))
+        self.assertNotEqual(secrets_store._mac(b"ab", nonce, ct), secrets_store._mac(b"a", nonce, b"b" + ct))
+        # nonce de otro tamaño y texto que no es UTF-8 → SecretError, nunca otra excepción
+        with self.assertRaises(secrets_store.SecretError):
+            secrets_store.decrypt(f"{v}${secrets_store._b64(nonce[:8])}${c}${tag}", "a|b")
+        for bad in ("v1$AA$AA$AA", "v1$$$", "v1$a b$c$d", "v1$%%%$@@@$###"):
+            with self.assertRaises(secrets_store.SecretError):
+                secrets_store.decrypt(bad, "x")
+
+    def test_lost_key_is_not_silently_regenerated_when_credentials_exist(self):
+        db.init_db(seed_size=5)
+        auth_context.set_current(1, "owner")
+        stores_mod.connect_store({"platform": "fake", "domain": "a.fake.test", "credentials": dict(CREDS)})
+        os.remove(secrets_store.key_path())
+        secrets_store.forget_cache()
+        with self.assertRaises(secrets_store.SecretError) as cm:
+            secrets_store.encrypt("x")
+        self.assertIn("vuelve a conectar", str(cm.exception).lower())
+        self.assertFalse(os.path.exists(secrets_store.key_path()))          # no se creó una clave nueva
+
+    def test_lost_key_surfaces_as_clear_state_not_500(self):
+        db.init_db(seed_size=5)
+        auth_context.set_current(1, "owner")
+        s = stores_mod.connect_store({"platform": "fake", "domain": "a.fake.test", "credentials": dict(CREDS)})
+        os.remove(secrets_store.key_path())
+        secrets_store.forget_cache()
+        self.assertEqual(stores_mod.get_store(s["id"])["credentials"], {})   # no revienta
+        with self.assertRaises(server.ApiError) as cm:
+            stores_mod.validate_store(s["id"])
+        self.assertEqual((cm.exception.status, cm.exception.code), (409, "credentials_unreadable"))
+        self.assertEqual(stores_mod.get_store(s["id"])["status"], "error")
+        with db.connect() as conn:
+            row = conn.execute("SELECT * FROM store_connections").fetchone()
+        with self.assertRaises(sc.StoreAuthError):                          # el motor lo trata como auth
+            stores_mod.connector_for(row)
+
+    def test_corrupt_key_file_is_a_secret_error(self):
+        with open(secrets_store.key_path(), "wb") as f:
+            f.write(b"esto no es base64 !!!")
+        secrets_store.forget_cache()
+        with self.assertRaises(secrets_store.SecretError):
+            secrets_store.encrypt("x")
+
+    def test_concurrent_first_use_creates_one_key(self):
+        keys, errs = [], []
+
+        def go():
+            try:
+                secrets_store.forget_cache()
+                secrets_store.encrypt("x")
+                with open(secrets_store.key_path(), "rb") as f:
+                    keys.append(f.read())
+            except Exception as e:  # noqa: BLE001
+                errs.append(e)
+        os.environ["DROPFINDER_KEY_FILE"] = os.path.join(self.tmp.dir, "race.key")
+        ts = [threading.Thread(target=go) for _ in range(12)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(errs, [])
+        self.assertEqual(len(set(keys)), 1)
+
+    def test_default_key_location_is_outside_repo_and_db_dir(self):
+        saved = os.environ.pop("DROPFINDER_KEY_FILE")
+        try:
+            p = os.path.abspath(secrets_store.key_path())
+        finally:
+            os.environ["DROPFINDER_KEY_FILE"] = saved
+        repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        self.assertFalse(p.startswith(repo + os.sep))
+        self.assertNotEqual(os.path.dirname(p), os.path.dirname(os.path.abspath(db.DB_PATH)))
+        with open(os.path.join(repo, ".gitignore")) as f:
+            self.assertIn("*.key", f.read().split())
 
 
 class StoresApiTest(unittest.TestCase):
@@ -169,6 +266,122 @@ class StoresApiTest(unittest.TestCase):
         u = stores_mod.update_store(s["id"], {"credentials": {"token": "shpat_nuevo_9999"}})
         self.assertEqual(u["credentials"]["token"], "••••••••9999")
 
+    def test_connection_cap_holds_under_concurrency(self):
+        results = []
+
+        def go(i):
+            with auth_context.as_user(1, "owner"):      # el contexto es por hilo
+                try:
+                    self.connect(f"c{i}.fake.test")
+                    results.append("ok")
+                except server.ApiError as e:
+                    results.append(e.code)
+        ts = [threading.Thread(target=go, args=(i,)) for i in range(stores_mod.MAX_CONNECTIONS + 8)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        with db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM store_connections").fetchone()[0],
+                             stores_mod.MAX_CONNECTIONS)
+        self.assertEqual(results.count("ok"), stores_mod.MAX_CONNECTIONS)
+
+    def test_stable_error_codes_for_409(self):
+        self.connect()
+        with self.assertRaises(server.ApiError) as cm:
+            self.connect()
+        self.assertEqual(cm.exception.code, "duplicate_store")
+        s = stores_mod.list_stores()["items"][0]
+        with db.connect() as conn:
+            conn.execute("INSERT INTO store_listings(user_id, connection_id, title, created_at) VALUES (1, ?, 't', 'x')",
+                         (s["id"],))
+        with self.assertRaises(server.ApiError) as cm:
+            stores_mod.disconnect_store(s["id"], {})
+        self.assertEqual(cm.exception.code, "has_listings")
+
+    def test_disconnect_refused_while_remote_deletes_are_pending(self):
+        s = self.connect()
+        with db.connect() as conn:
+            lid = conn.execute("INSERT INTO store_listings(user_id, connection_id, title, created_at, external_id) "
+                               "VALUES (1, ?, 't', 'x', '77')", (s["id"],)).lastrowid
+            conn.execute("INSERT INTO store_jobs(user_id, listing_id, action, run_after, created_at, updated_at) "
+                         "VALUES (1, ?, 'delete', 'x', 'x', 'x')", (lid,))
+        with self.assertRaises(server.ApiError) as cm:
+            stores_mod.disconnect_store(s["id"], {"confirm": ["1"]})
+        self.assertEqual(cm.exception.code, "pending_deletes")
+
+    def test_store_errors_are_scrubbed_everywhere(self):
+        FakeStore.fail_next.append(sc.StoreAuthError("token shpat_abcdef0123456789abcdef inválido"))
+        with self.assertRaises(server.ApiError) as cm:
+            self.connect()
+        self.assertNotIn("shpat_abcdef", str(cm.exception))
+        FakeStore.fail_next.append(sc.StoreError("falló con shpat_abcdef0123456789abcdef y secreto " + CREDS["token"]))
+        with self.assertRaises(server.ApiError) as cm:
+            self.connect()
+        self.assertNotIn(CREDS["token"], str(cm.exception))
+        s = self.connect()
+        FakeStore.fail_next.append(sc.StoreAuthError("revocado " + CREDS["token"]))
+        with self.assertRaises(server.ApiError):
+            stores_mod.validate_store(s["id"])
+        self.assertNotIn(CREDS["token"], stores_mod.get_store(s["id"])["last_error"])
+
+    def test_unmapped_exceptions_become_502_not_500(self):
+        for exc in (OSError("red"), ValueError("json"), UnicodeDecodeError("utf-8", b"", 0, 1, "x")):
+            FakeStore.fail_next.append(exc)
+            with self.assertRaises(server.ApiError) as cm:
+                self.connect()
+            self.assertEqual(cm.exception.status, 502)
+
+    def test_transient_validate_failure_keeps_status_and_disabled_is_respected(self):
+        s = self.connect()
+        FakeStore.fail_next.append(sc.StoreRateLimited("lento", 2))
+        with self.assertRaises(server.ApiError):
+            stores_mod.validate_store(s["id"])
+        self.assertEqual(stores_mod.get_store(s["id"])["status"], "active")     # un 429 pasajero no la estropea
+        with db.connect() as conn:
+            conn.execute("UPDATE store_connections SET status = 'disabled'")
+        stores_mod.validate_store(s["id"])
+        self.assertEqual(stores_mod.get_store(s["id"])["status"], "disabled")   # validar no la reactiva
+
+    def test_hostile_store_info_is_sanitized(self):
+        orig = FakeStore.validate
+        FakeStore.validate = lambda self: sc.StoreInfo(name="<img onerror=x>" + "A" * 5000, domain=self.domain,
+                                                       currency="USD")
+        try:
+            s = self.connect("info.fake.test", name="")
+            self.assertLessEqual(len(s["name"]), 80)
+            FakeStore.validate = lambda self: sc.StoreInfo(name="x", domain=self.domain, currency="usd<script>")
+            with self.assertRaises(server.ApiError):
+                self.connect("info2.fake.test")
+        finally:
+            FakeStore.validate = orig
+
+    def test_strict_settings_and_credentials_and_body(self):
+        s = self.connect()
+        for bad in ({"min_margin_pct": True}, {"min_margin_pct": "20"}, {"min_margin_pct": float("nan")},
+                    {"min_margin_pct": float("inf")}, {"publish_as_draft": 1}, {"nuevo": 1}):
+            with self.assertRaises(server.ApiError):
+                stores_mod.update_store(s["id"], {"settings": bad})
+        for creds in ({"token": "abc\r\nX: y"}, {"token": "a\x00b"}):
+            with self.assertRaises(server.ApiError):
+                stores_mod.connect_store({"platform": "fake", "domain": "z.fake.test", "credentials": creds})
+        for body in ([], "x", None, 5):
+            with self.assertRaises(server.ApiError) as cm:
+                stores_mod.connect_store(body)
+            self.assertEqual(cm.exception.status, 400)
+
+    def test_concurrent_setting_updates_do_not_clobber(self):
+        s = self.connect()
+        def upd(k, v):
+            with auth_context.as_user(1, "owner"):
+                stores_mod.update_store(s["id"], {"settings": {k: v}})
+        ts = [threading.Thread(target=upd, args=(k, v))
+              for k, v in (("auto_raise_price", True), ("min_margin_pct", 33.0), ("max_price_increase_pct", 12.0),
+                           ("sync_stock", False))]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        st = stores_mod.get_store(s["id"])["settings"]
+        self.assertEqual((st["auto_raise_price"], st["min_margin_pct"], st["max_price_increase_pct"], st["sync_stock"]),
+                         (True, 33.0, 12.0, False))
+
     def test_publish_as_draft_is_default(self):
         self.assertTrue(self.connect()["settings"]["publish_as_draft"])
 
@@ -221,7 +434,7 @@ class StoresApiTest(unittest.TestCase):
             self.assertEqual(stores_mod.connector_for(row).credentials, CREDS)
             conn.execute("UPDATE store_connections SET domain = 'otra.fake.test' WHERE id = ?", (s["id"],))
             moved = conn.execute("SELECT * FROM store_connections WHERE id = ?", (s["id"],)).fetchone()
-        with self.assertRaises(secrets_store.SecretError):
+        with self.assertRaises(sc.StoreAuthError):
             stores_mod.connector_for(moved)                         # credenciales atadas a su usuario+dominio
 
     def test_user_deletion_removes_store_data(self):
@@ -239,6 +452,73 @@ class StoresApiTest(unittest.TestCase):
         with db.connect() as conn:
             for t in ("store_connections", "store_listings", "store_jobs", "store_sync_log"):
                 self.assertIn("user_id", {r[1] for r in conn.execute(f"PRAGMA table_info({t})")}, t)
+
+
+class SchemaV7Test(unittest.TestCase):
+    def setUp(self):
+        self.tmp = _TempDb()
+        db.init_db(seed_size=10)
+        auth_context.set_current(1, "owner")
+        self.cid = stores_mod.connect_store({"platform": "fake", "domain": "a.fake.test",
+                                             "credentials": dict(CREDS)})["id"]
+
+    def tearDown(self):
+        self.tmp.close()
+
+    def insert_listing(self, conn, ext="900", imported=None, user=1):
+        return conn.execute("INSERT INTO store_listings(user_id, connection_id, imported_id, title, external_id, "
+                            "created_at) VALUES (?, ?, ?, 't', ?, 'x')", (user, self.cid, imported, ext)).lastrowid
+
+    def test_same_external_product_cannot_be_registered_twice(self):
+        import sqlite3
+        with db.connect() as conn:
+            self.insert_listing(conn)
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.insert_listing(conn)                           # imported_id NULL no deduplica: lo hace este índice
+            self.insert_listing(conn, ext=None)                     # varios 'pending' sin id externo: permitido
+            self.insert_listing(conn, ext=None)
+
+    def test_listing_must_belong_to_same_user_as_connection(self):
+        import sqlite3
+        with db.connect() as conn:
+            with self.assertRaises(sqlite3.DatabaseError):
+                self.insert_listing(conn, ext="5", user=2)
+
+    def test_one_active_job_per_listing_and_action(self):
+        import sqlite3
+        with db.connect() as conn:
+            lid = self.insert_listing(conn)
+            ins = ("INSERT INTO store_jobs(user_id, listing_id, action, run_after, created_at, updated_at) "
+                   "VALUES (1, ?, 'publish', 'x', 'x', 'x')")
+            conn.execute(ins, (lid,))
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(ins, (lid,))                           # doble clic: no encola dos 'publish'
+            conn.execute("UPDATE store_jobs SET status = 'done'")
+            conn.execute(ins, (lid,))                               # terminado el anterior, se puede volver a encolar
+
+    def test_status_checks_and_demo_marker_survive_import_removal(self):
+        import sqlite3
+        with db.connect() as conn:
+            pid = conn.execute("SELECT id FROM products LIMIT 1").fetchone()[0]
+            conn.execute("INSERT INTO imported_products(user_id, product_id, title, sell_price, last_cost, last_stock, "
+                         "created_at) VALUES (1, ?, 't', 9, 1, 1, 'x')", (pid,))
+            iid = conn.execute("SELECT id FROM imported_products").fetchone()[0]
+            lid = conn.execute("INSERT INTO store_listings(user_id, connection_id, imported_id, product_id, is_demo, "
+                               "title, external_id, created_at) VALUES (1, ?, ?, ?, 1, 't', '1', 'x')",
+                               (self.cid, iid, pid)).lastrowid
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("UPDATE store_listings SET status = 'inventado'")
+            conn.execute("DELETE FROM imported_products WHERE id = ?", (iid,))
+            row = conn.execute("SELECT imported_id, product_id, is_demo FROM store_listings WHERE id = ?", (lid,)).fetchone()
+        self.assertEqual((row[0], row[1], row[2]), (None, pid, 1))      # el anuncio sigue sabiendo que es de demostración
+
+    def test_log_survives_disconnect(self):
+        with db.connect() as conn:
+            conn.execute("INSERT INTO store_sync_log(user_id, connection_id, action, ok, message, created_at) "
+                         "VALUES (1, ?, 'publish', 1, 'ok', 'x')", (self.cid,))
+        stores_mod.disconnect_store(self.cid, {})
+        with db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*), MAX(connection_id) FROM store_sync_log").fetchone()[:], (1, None))
 
 
 class ContractTest(unittest.TestCase):

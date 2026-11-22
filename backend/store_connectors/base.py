@@ -5,8 +5,25 @@ conoce esta interfaz y los errores de abajo, nunca detalles de una plataforma.
 """
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+
+# Formas conocidas de credenciales (Shopify shpat_/shpca_/shppa_/shpss_, WooCommerce ck_/cs_, JWT, hex/base64 largos)
+_TOKEN_RE = re.compile(r"(?i)\b(?:shp(?:at|ca|pa|ss)_[a-z0-9]{8,}|c[ks]_[a-f0-9]{16,}|eyJ[\w-]{10,}\.[\w-]{10,}\.[\w-]*"
+                       r"|(?:bearer|token|secret|key|password)\s*[:=]?\s*[\w.+/=-]{8,}|[a-f0-9]{32,}|[A-Za-z0-9_+/=-]{40,})")
+
+
+def scrub(text, secrets=(), limit: int = 300) -> str:
+    """Quita de un mensaje de error todo lo que parezca una credencial (y los valores secretos conocidos) y lo
+    acorta. Se aplica a CUALQUIER texto que venga de una tienda antes de guardarlo, registrarlo o mostrarlo."""
+    s = str(text or "")
+    for v in secrets:
+        if v and len(v) >= 6:
+            s = s.replace(v, "••••")
+    s = _TOKEN_RE.sub("••••", s)
+    s = "".join(c if c >= " " or c in "\n\t" else " " for c in s)       # sin caracteres de control
+    return s[:limit]
 
 
 # ---------------------------------------------------------------- errores
