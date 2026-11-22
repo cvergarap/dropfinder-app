@@ -27,7 +27,25 @@ from store_connectors.fake import FakeStore  # noqa: E402
 from test_stores_base import _TempDb  # noqa: E402
 
 sc.register(FakeStore)
+
+
+class FakeIdem(FakeStore):
+    """Como Shopify: publish() adopta el producto que ya existe con ese SKU (idempotent_publish)."""
+    platform = "fakeidem"
+    idempotent_publish = True
+
+    def publish(self, product):
+        st = self._state()
+        for pid, p in st["products"].items():
+            if p["sku"] == product.sku:
+                return sc.ListingRef(external_id=pid, variant_id=f"v{pid}", inventory_item_id=f"i{pid}",
+                                     url=f"https://{self.domain}/admin/products/{pid}")
+        return super().publish(product)
+
+
+sc.register(FakeIdem)
 store_sync.BACKGROUND = False
+store_sync._sleep = lambda s: None
 CREDS = {"token": "shpat_secreto_1234"}
 ApiError = server.ApiError
 
@@ -53,10 +71,10 @@ class Base(unittest.TestCase):
         auth_context.set_current(1, "owner")
 
     # ---- ayudas
-    def connect(self, domain=None, currency="USD", **settings):
+    def connect(self, domain=None, currency="USD", platform="fake", **settings):
         domain = domain or self.domain
         FakeStore.stores.setdefault(domain, {"products": {}, "currency": currency, "revoked": False})["currency"] = currency
-        return stores_mod.connect_store({"platform": "fake", "domain": domain, "credentials": dict(CREDS),
+        return stores_mod.connect_store({"platform": platform, "domain": domain, "credentials": dict(CREDS),
                                          "settings": settings})
 
     def product(self, cost=10.0, shipping=0.0, stock=10, image="https://img.example/p.jpg", source="csv") -> int:
@@ -707,6 +725,126 @@ class ChangeDuringRunningJobTest(Base):
         self.assertEqual(len(FakeStore.calls), calls)
         # y tras terminar varios trabajos seguidos el total de syncs es acotado
         self.assertLessEqual(len([j for j in self.jobs(lid) if j["action"] == "sync"]), 2)
+
+
+class PublishSaveFailureTest(Base):
+    """Review PR #12, hallazgo 1: nunca un segundo producto remoto si falla el guardado local tras crear."""
+
+    def break_writes_after_publish(self, fails):
+        """Tras la llamada a publish() de la tienda, las próximas `fails` escrituras lanzan OperationalError."""
+        state = {"armed": False, "left": fails}
+        orig_pub, orig_w = FakeStore.publish, store_sync._write_once
+
+        def pub(self_, product):
+            ref = orig_pub(self_, product)
+            state["armed"] = True
+            return ref
+
+        def w(fn):
+            if state["armed"] and state["left"] > 0:
+                state["left"] -= 1
+                raise __import__("sqlite3").OperationalError("database is locked")
+            return orig_w(fn)
+        FakeStore.publish, store_sync._write_once = pub, w
+        self.addCleanup(lambda: (setattr(FakeStore, "publish", orig_pub), setattr(store_sync, "_write_once", orig_w)))
+        return state
+
+    def test_save_is_retried_and_never_republishes(self):
+        store = self.connect()
+        r = store_sync.publish(store["id"], {"imported_ids": [self.imp()]})
+        lid = r["queued"][0]["listing_id"]
+        self.break_writes_after_publish(3)                      # falla 3 veces y luego se puede
+        store_sync.run_due_jobs()
+        l = self.listing(lid)
+        self.assertEqual((l["status"], bool(l["external_id"])), ("hidden", True))
+        self.assertEqual(len(FakeStore.stores[self.domain]["products"]), 1)
+        self.assertEqual(self.jobs(lid)[0]["status"], "done")
+
+    def test_save_keeps_failing_ends_in_error_with_one_remote_product(self):
+        store = self.connect()
+        r = store_sync.publish(store["id"], {"imported_ids": [self.imp()]})
+        lid = r["queued"][0]["listing_id"]
+        st = self.break_writes_after_publish(store_sync.SAVE_TRIES)      # agota los reintentos del guardado
+        for _ in range(4):
+            store_sync.run_due_jobs(now=utc() + timedelta(hours=3))
+        self.assertEqual(len(FakeStore.stores[self.domain]["products"]), 1)
+        l = self.listing(lid)
+        self.assertEqual(l["status"], "error")
+        self.assertIn("Se creó el producto en la tienda pero no se pudo guardar", l["last_error"])
+        self.assertIn(f"DF-", l["last_error"])
+        self.assertEqual(self.jobs(lid)[0]["status"], "failed")
+
+    def test_even_the_marker_write_fails_recovery_never_republishes(self):
+        store = self.connect()
+        r = store_sync.publish(store["id"], {"imported_ids": [self.imp()]})
+        lid = r["queued"][0]["listing_id"]
+        st = self.break_writes_after_publish(1000)
+        store_sync.run_due_jobs()
+        self.assertEqual(self.jobs(lid)[0]["status"], "running")          # no se pudo ni dejar constancia
+        st["left"] = 0                                                    # la base vuelve a responder
+        for _ in range(3):
+            store_sync.run_due_jobs(now=utc() + timedelta(hours=1))       # concesión vencida → recuperación
+        self.assertEqual(len(FakeStore.stores[self.domain]["products"]), 1)
+        self.assertEqual(self.listing(lid)["status"], "error")
+
+    def test_internal_error_after_remote_create_is_not_republished_on_non_idempotent(self):
+        store = self.connect()
+        r = store_sync.publish(store["id"], {"imported_ids": [self.imp()]})
+        lid = r["queued"][0]["listing_id"]
+        orig = FakeStore.publish
+
+        def boom(self_, product):
+            orig(self_, product)
+            raise RuntimeError("bug propio tras crear")
+        FakeStore.publish = boom
+        self.addCleanup(lambda: setattr(FakeStore, "publish", orig))
+        store_sync.run_due_jobs()
+        j = self.jobs(lid)[0]
+        self.assertEqual(j["status"], "pending")
+        self.assertIn("_remote_started", j["payload"])                     # requeue conserva la marca
+        FakeStore.publish = orig
+        for _ in range(3):
+            store_sync.run_due_jobs(now=utc() + timedelta(hours=3))
+        self.assertEqual(len(FakeStore.stores[self.domain]["products"]), 1)
+        self.assertEqual(self.listing(lid)["status"], "error")
+        self.assertIn("Revisa tu tienda", self.listing(lid)["last_error"])
+
+    def test_idempotent_connector_may_retry_and_adopts(self):
+        store = self.connect(platform="fakeidem")
+        r = store_sync.publish(store["id"], {"imported_ids": [self.imp()]})
+        lid = r["queued"][0]["listing_id"]
+        orig = FakeStore.publish
+
+        def boom(self_, product):
+            orig(self_, product)
+            raise RuntimeError("bug propio tras crear")
+        FakeStore.publish = boom
+        self.addCleanup(lambda: setattr(FakeStore, "publish", orig))
+        store_sync.run_due_jobs()
+        FakeStore.publish = orig
+        store_sync.run_due_jobs(now=utc() + timedelta(hours=3))
+        self.assertEqual(len(FakeStore.stores[self.domain]["products"]), 1)
+        self.assertEqual((self.listing(lid)["status"], self.jobs(lid)[0]["status"]), ("hidden", "done"))
+
+    def test_recovery_of_interrupted_publish_depends_on_idempotent_publish(self):
+        for platform, expect_error in (("fake", True), ("fakeidem", False)):
+            FakeStore.reset()
+            domain = f"{platform}.fake.test"
+            store = self.connect(domain, platform=platform)
+            r = store_sync.publish(store["id"], {"imported_ids": [self.imp()]})
+            lid = r["queued"][0]["listing_id"]
+            old = (utc() - timedelta(hours=1)).isoformat(timespec="seconds")
+            with db.connect() as conn:
+                conn.execute("UPDATE store_jobs SET status = 'running', locked_until = ?, "
+                             "payload = json_set(payload, '$._remote_started', ?) WHERE listing_id = ?", (old, old, lid))
+            store_sync.run_due_jobs()
+            l = self.listing(lid)
+            if expect_error:
+                self.assertEqual(l["status"], "error", platform)
+                self.assertEqual(FakeStore.stores[domain]["products"], {})
+            else:
+                self.assertEqual(l["status"], "hidden", platform)
+                self.assertEqual(len(FakeStore.stores[domain]["products"]), 1)
 
 
 class ListingActionsTest(Base):

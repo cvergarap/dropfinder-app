@@ -123,6 +123,11 @@ def clean_message(text, secrets=(), limit: int = 300) -> str:
     return sc.scrub(msg, secrets, limit)
 
 
+def _log_exc(what: str, exc: BaseException, secrets=()) -> None:
+    """Registra un fallo SIN traza ni mensaje crudo (pueden traer texto de la tienda con credenciales)."""
+    log.error("%s: %s: %s", what, type(exc).__name__, clean_message(exc, secrets))
+
+
 def _uid() -> int:
     try:
         return auth_context.current_user_id()
@@ -611,8 +616,10 @@ def recover_stuck(now: datetime | None = None) -> int:
             n += 1
             pl = _payload(j)
             lst = conn.execute("SELECT * FROM store_listings WHERE id = ?", (j["listing_id"],)).fetchone()
+            plat = conn.execute("SELECT platform FROM store_connections WHERE id = ?",
+                                (lst["connection_id"],)).fetchone() if lst is not None else None
             risky = j["action"] == "publish" and pl.get("_remote_started") and lst is not None \
-                and not lst["external_id"]
+                and not lst["external_id"] and not (plat and _idempotent(plat[0]))
             if risky:
                 msg = ("Se interrumpió mientras se publicaba y no se sabe si el producto llegó a crearse. Revisa tu "
                        f"tienda (SKU DF-{pl.get('product', {}).get('sku', '')[3:] or '?'}) y, si no está, usa Reintentar.")
@@ -644,8 +651,8 @@ def run_due_jobs(user_id: int | None = None, limit: int = 20, now: datetime | No
         if _last_prune is None or time.monotonic() - _last_prune > PRUNE_EVERY_S:
             _last_prune = time.monotonic()
             prune(now)
-    except Exception:  # noqa: BLE001
-        log.exception("Error al recuperar/podar trabajos de tiendas")
+    except Exception as e:  # noqa: BLE001
+        _log_exc("Error al recuperar/podar trabajos de tiendas", e)
     processed = failed = 0
     while processed < limit:
         job = _claim(user_id, now)
@@ -655,8 +662,8 @@ def run_due_jobs(user_id: int | None = None, limit: int = 20, now: datetime | No
         try:
             if not _run_job(job, now):
                 failed += 1
-        except Exception:  # noqa: BLE001 — un trabajo nunca debe tumbar el hilo
-            log.exception("Error inesperado en el trabajo %s", job["id"])
+        except Exception as e:  # noqa: BLE001 — un trabajo nunca debe tumbar el hilo
+            _log_exc(f"Error inesperado en el trabajo {job['id']}", e)
             failed += 1
             _safe_requeue(job, now)
     return {"processed": processed, "failed": failed}
@@ -668,21 +675,69 @@ def _safe_requeue(job, now) -> None:
             conn.execute("UPDATE store_jobs SET locked_until = NULL, status = 'pending', run_after = ?, updated_at = ?, "
                          "last_error = 'Error interno' WHERE id = ? AND status = 'running'",
                          (_ts(now + timedelta(seconds=BACKOFF_S[0])), _ts(now), job["id"]))
-    except Exception:  # noqa: BLE001
-        log.exception("No se pudo reencolar el trabajo %s", job["id"])
+    except Exception as e:  # noqa: BLE001
+        _log_exc(f"No se pudo reencolar el trabajo {job['id']}", e)
+
+
+_sleep = time.sleep
+
+
+def _write_once(fn):
+    with db.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        return fn(conn)
 
 
 def _write(fn, tries: int = 4):
-    """Escritura corta y reintentada (la base puede estar ocupada un instante). Nunca durante una llamada a la tienda."""
+    """Escritura corta y reintentada con espera creciente (0,2 → 2 s): la base puede estar ocupada un instante.
+    Nunca durante una llamada a la tienda."""
     for i in range(tries):
         try:
-            with db.connect() as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                return fn(conn)
+            return _write_once(fn)
         except sqlite3.OperationalError:
             if i == tries - 1:
                 raise
-            time.sleep(0.2 * (i + 1))
+            _sleep(min(2.0, 0.2 * 2 ** i))
+
+
+class _Blocked(Exception):
+    """Un publish que no se puede reintentar sin riesgo de duplicar el producto: el anuncio pasa a `error`."""
+
+
+class _Unsaved(Exception):
+    """No se pudo ni dejar constancia en la base: el trabajo queda `running` y la recuperación lo marcará."""
+
+
+SAVE_TRIES = 6                       # intentos de guardar el resultado de un publish ya creado en la tienda
+
+
+def _sku_of(payload: dict) -> str:
+    return str((payload.get("product") or {}).get("sku") or "DF-?")
+
+
+def _idempotent(platform: str) -> bool:
+    try:
+        return bool(getattr(sc.get_class(platform), "idempotent_publish", False))
+    except sc.StoreError:
+        return False
+
+
+def _mark_unsafe(c, job, lst, msg: str, now) -> None:
+    """Terminal sin reintento automático: trabajo `failed` y anuncio `error` con el aviso."""
+    c.execute("UPDATE store_jobs SET locked_until = NULL, status = 'failed', last_error = ?, updated_at = ? WHERE id = ?",
+              (clean_message(msg), _ts(now), job["id"]))
+    if c.execute("UPDATE store_listings SET status = 'error', last_error = ? WHERE id = ? AND external_id IS NULL",
+                 (clean_message(msg), lst["id"])).rowcount:
+        _log(c, job["user_id"], lst["connection_id"], lst["id"], "publish", False, msg)
+
+
+def _fresh_payload(job_id: int, fallback: dict) -> dict:
+    try:
+        with db.connect() as conn:
+            r = conn.execute("SELECT payload FROM store_jobs WHERE id = ?", (job_id,)).fetchone()
+        return _payload(r) if r else fallback
+    except sqlite3.Error:
+        return fallback
 
 
 class _Skip(Exception):
@@ -716,6 +771,11 @@ def _run_job(job, now: datetime) -> bool:
             handler(job, lst, crow, connector, payload, now)
             _reeval(lst["id"])
             return True
+        except _Unsaved:
+            return False
+        except _Blocked as e:
+            _write(lambda c: _mark_unsafe(c, job, lst, str(e), now))
+            return False
         except _Skip as e:
             _write(lambda c: (c.execute("UPDATE store_jobs SET locked_until = NULL, status = 'done', last_error = ?, updated_at = ? "
                                         "WHERE id = ?", (str(e), _ts(now), job["id"])),
@@ -728,17 +788,18 @@ def _run_job(job, now: datetime) -> bool:
         except sc.StoreError as e:
             _on_error(job, lst, crow, e, secrets, now)
         except Exception as e:  # noqa: BLE001 — error nuestro o transitorio: se reintenta con espera
-            log.exception("Fallo inesperado en el trabajo %s", job["id"])
-            _on_error(job, lst, crow, sc.StoreError("Error interno al procesar el trabajo", retryable=True),
-                      secrets, now)
+            _log_exc(f"Fallo inesperado en el trabajo {job['id']}", e, secrets)
+            internal = sc.StoreError("Error interno al procesar el trabajo", retryable=True)
+            internal.internal = True             # conserva `_remote_started`: no se sabe si la tienda creó algo
+            _on_error(job, lst, crow, internal, secrets, now)
         return False
 
 
 def _reeval(listing_id: int) -> None:
     try:
         _write(lambda c: reevaluate(c, listing_id))
-    except Exception:  # noqa: BLE001 — la próxima pasada del hook lo corregirá; no se pierde el resultado del trabajo
-        log.exception("No se pudieron reevaluar las reglas del anuncio %s", listing_id)
+    except Exception as e:  # noqa: BLE001 — la próxima pasada del hook lo corregirá; no se pierde el resultado del trabajo
+        _log_exc(f"No se pudieron reevaluar las reglas del anuncio {listing_id}", e)
 
 
 def _done(conn, job, lst, action: str, message: str, updates: dict | None = None, now=None) -> None:
@@ -772,6 +833,12 @@ def _do_publish(job, lst, crow, connector, payload, now) -> None:
     allowed = ("title", "price", "sku", "stock", "description", "image_urls", "vendor", "product_type", "tags",
                "active")
     sp = sc.StoreProduct(**{k: prod[k] for k in allowed if k in prod})
+    sku = _sku_of(payload)
+    if payload.get("_remote_started") and not getattr(connector, "idempotent_publish", False):
+        # Ya se llamó a la tienda antes (caída o error interno): puede existir el producto. Solo un conector que
+        # reconoce lo que creó (idempotent_publish) puede repetir la llamada sin duplicar.
+        raise _Blocked(f"Se interrumpió mientras se publicaba y no se sabe si el producto llegó a crearse. Revisa tu "
+                       f"tienda (SKU {sku}) y, si no está, usa Reintentar.")
     # Marca de intención ANTES de llamar a la tienda (ver riesgo residual en el docstring del módulo)
     marked = _write(lambda c: c.execute(
         "UPDATE store_jobs SET payload = ? WHERE id = ? AND status = 'running'",
@@ -779,6 +846,8 @@ def _do_publish(job, lst, crow, connector, payload, now) -> None:
     if not marked:
         return                                   # lo recuperó otro trabajador
     ref = connector.publish(sp)                  # ← llamada a la tienda: sin transacción abierta
+    # El resultado se guarda con reintentos acotados (el producto YA existe en la tienda y el id está en memoria):
+    # jamás se vuelve a llamar a publish() por un fallo local.
 
     def save(c):
         n = c.execute(
@@ -794,7 +863,18 @@ def _do_publish(job, lst, crow, connector, payload, now) -> None:
         _done(c, job, lst, "publish", f"Publicado «{sp.title[:80]}» a {sp.price:g} {crow['currency']}"
               + ("" if sp.active else " (borrador)"), None, now)
         return True
-    if not _write(save):
+    try:
+        saved = _write(save, tries=SAVE_TRIES)
+    except sqlite3.Error as e:
+        msg = (f"Se creó el producto en la tienda pero no se pudo guardar: revisa tu tienda (SKU {sku}, "
+               f"id remoto {ref.external_id}).")
+        _log_exc(f"No se pudo guardar el publish del trabajo {job['id']} (id remoto {ref.external_id})", e)
+        try:
+            _write(lambda c: _mark_unsafe(c, job, lst, msg, now), tries=3)
+        except sqlite3.Error:
+            raise _Unsaved() from None
+        return
+    if not saved:
         try:                                     # compensación: no dejar un producto huérfano en la tienda
             connector.delete(ref)
             msg = "El anuncio se quitó durante la publicación; se eliminó el producto recién creado en la tienda"
@@ -883,7 +963,9 @@ def _on_error(job, lst, crow, exc: sc.StoreError, secrets: list, now: datetime) 
     uid, lid, cid = job["user_id"], lst["id"], crow["id"]
     msg = clean_message(exc, secrets)
     attempts, action = job["attempts"], job["action"]
-    pl = _payload(job)
+    pl = _fresh_payload(job["id"], _payload(job))
+    if isinstance(exc, sc.StoreError) and not getattr(exc, "internal", False):
+        pl.pop("_remote_started", None)          # publish() informó su propio fallo: el conector sabe que no creó nada
     if lst["status"] not in ("error", "pending") and "_prev" not in pl:
         pl["_prev"] = lst["status"]
 
@@ -1162,14 +1244,14 @@ def monitor_tick(now: datetime | None = None) -> list:
                          f"Monitor programado: {res.get('checked', 0)} revisados, {len(res.get('alerts', []))} alertas"
                          if isinstance(res, dict) else "Monitor programado ejecutado")
             except Exception as e:  # noqa: BLE001
-                log.exception("Falló el monitor programado del usuario %s", uid)
+                _log_exc(f"Falló el monitor programado del usuario {uid}", e)
                 try:
                     with db.connect() as conn:
                         _log(conn, uid, None, None, "monitor", False, f"Falló el monitor programado: {e}")
                 except Exception:  # noqa: BLE001
                     pass
-    except Exception:  # noqa: BLE001
-        log.exception("Error en el monitor programado")
+    except Exception as e:  # noqa: BLE001
+        _log_exc("Error en el monitor programado", e)
     return done
 
 
@@ -1207,8 +1289,8 @@ def _loop() -> None:
                 if not run_due_jobs(limit=10)["processed"]:
                     break
             monitor_tick()
-        except Exception:  # noqa: BLE001 — el hilo nunca debe morir ni tumbar el servidor
-            log.exception("Error en el hilo de sincronización de tiendas")
+        except Exception as e:  # noqa: BLE001 — el hilo nunca debe morir ni tumbar el servidor
+            _log_exc("Error en el hilo de sincronización de tiendas", e)
             time.sleep(5.0)
 
 
