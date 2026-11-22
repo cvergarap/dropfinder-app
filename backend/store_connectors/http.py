@@ -55,7 +55,7 @@ def resolve_public(host: str, port: int) -> str:
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError:
-        raise StoreError("No se pudo resolver el dominio de la tienda", retryable=True) from None
+        raise StoreError("No se pudo resolver el dominio de la tienda", retryable=True, not_sent=True) from None
     ips = []
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
@@ -63,7 +63,7 @@ def resolve_public(host: str, port: int) -> str:
             raise StoreError("El dominio de la tienda apunta a una dirección no permitida")
         ips.append(info[4][0])
     if not ips:
-        raise StoreError("No se pudo resolver el dominio de la tienda", retryable=True)
+        raise StoreError("No se pudo resolver el dominio de la tienda", retryable=True, not_sent=True)
     return ips[0]
 
 
@@ -99,6 +99,14 @@ def request(method: str, url: str, *, headers: dict | None = None, body: bytes |
         else:
             c = _PinnedHTTPS(host, resolve_public(host, port), port, timeout)
         try:
+            try:
+                c.connect()                  # conectar (y TLS) por separado: un fallo aquí significa "no se envió nada"
+            except (socket.timeout, TimeoutError):
+                raise StoreError("No se pudo conectar con la tienda a tiempo", retryable=True, not_sent=True) from None
+            except ssl.SSLError:
+                raise StoreError("No se pudo verificar el certificado de la tienda") from None
+            except OSError:
+                raise StoreError("No se pudo conectar con la tienda", retryable=True, not_sent=True) from None
             c.request(method, path, body=body, headers=hdrs)
             r = c.getresponse()
             data = r.read(max_bytes + 1)
