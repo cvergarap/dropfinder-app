@@ -31,11 +31,18 @@ def scrub(text, secrets=(), limit: int = 300) -> str:
 class StoreError(Exception):
     """Fallo al hablar con la tienda. `retryable`: tiene sentido reintentar más tarde."""
     retryable = False
+    # True solo si se sabe que la petición NO llegó a la tienda (falló al resolver el nombre o al conectar). Un
+    # tiempo agotado o una conexión cortada DESPUÉS de enviar es ambiguo: la tienda pudo haber hecho el cambio.
+    # El motor solo repite una publicación en un conector sin idempotent_publish si not_sent es True (o si la
+    # tienda respondió explícitamente que no la procesó: StoreRateLimited).
+    not_sent = False
 
-    def __init__(self, message: str, *, retryable: bool | None = None):
+    def __init__(self, message: str, *, retryable: bool | None = None, not_sent: bool | None = None):
         super().__init__(message)
         if retryable is not None:
             self.retryable = retryable
+        if not_sent is not None:
+            self.not_sent = not_sent
 
 
 class StoreAuthError(StoreError):

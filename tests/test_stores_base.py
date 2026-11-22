@@ -548,6 +548,66 @@ class ContractTest(unittest.TestCase):
             sc.get_class("inexistente")
 
 
+class NotSentSignalTest(unittest.TestCase):
+    """not_sent distingue lo que seguro no llegó a la tienda de lo ambiguo (el motor decide si repite una publicación)."""
+
+    def setUp(self):
+        from store_connectors import http as shttp
+        self.shttp = shttp
+        self.old = shttp.ALLOW_LOOPBACK
+        shttp.ALLOW_LOOPBACK = True
+
+    def tearDown(self):
+        self.shttp.ALLOW_LOOPBACK = self.old
+
+    def test_default_is_ambiguous(self):
+        self.assertFalse(sc.StoreError("x", retryable=True).not_sent)
+        self.assertTrue(sc.StoreError("x", retryable=True, not_sent=True).not_sent)
+        self.assertFalse(sc.StoreRateLimited("x").not_sent)
+
+    def test_dns_failure_and_refused_connection_are_not_sent(self):
+        import socket
+        from unittest import mock
+        with mock.patch("socket.getaddrinfo", side_effect=socket.gaierror("sin dns")):
+            with self.assertRaises(sc.StoreError) as cm:
+                self.shttp.request("GET", "https://tienda-que-no-existe.example/")
+        self.assertTrue(cm.exception.not_sent)
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()                                              # nadie escucha: conexión rechazada
+        with self.assertRaises(sc.StoreError) as cm:
+            self.shttp.request("GET", f"http://127.0.0.1:{port}/", timeout=2)
+        self.assertTrue(cm.exception.retryable)
+        self.assertTrue(cm.exception.not_sent)
+
+    def test_timeout_after_the_request_was_sent_is_ambiguous(self):
+        import socket
+        import threading
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        got = []
+
+        def serve():
+            conn, _ = srv.accept()
+            got.append(conn.recv(4096))                        # recibe la petición y NO responde nunca
+            threading.Event().wait(1.5)
+            conn.close()
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        try:
+            with self.assertRaises(sc.StoreError) as cm:
+                self.shttp.request("POST", f"http://127.0.0.1:{port}/x", body=b"{}", timeout=0.5)
+        finally:
+            t.join(3)
+            srv.close()
+        self.assertTrue(got and got[0].startswith(b"POST"))      # la tienda SÍ recibió la petición
+        self.assertTrue(cm.exception.retryable)
+        self.assertFalse(cm.exception.not_sent)                  # → no se puede repetir una publicación a ciegas
+
+
 class RouteClassificationTest(unittest.TestCase):
     def test_store_routes_are_user_routes(self):
         for method, pattern, _fn in stores_mod.ROUTES:
