@@ -248,9 +248,9 @@ def _enqueue_visibility(conn, user_id: int, listing_id: int, action: str, by_rul
     if same:
         if not by_rule:
             conn.execute("UPDATE store_jobs SET payload = ? WHERE id = ? AND status = 'pending'",
-                         (json.dumps({"by_rule": False}), same[0]["id"]))
+                         (json.dumps({"by_rule": False, "manual": True}), same[0]["id"]))
         return
-    _enqueue(conn, user_id, listing_id, action, {"by_rule": by_rule})
+    _enqueue(conn, user_id, listing_id, action, {"by_rule": by_rule, "manual": not by_rule})
 
 
 def _kick() -> None:
@@ -290,7 +290,7 @@ def _snapshot(crow, imp, state: dict, as_draft: bool) -> tuple[dict | None, str,
             "description": _description(imp["title"], imp["category"]), "image_urls": [image] if image else [],
             "vendor": (crow["name"] or "")[:80], "product_type": (imp["category"] or "")[:100],
             "tags": ["dropfinder"], "active": not as_draft}
-    return {"product": prod, "cost_usd": round(imp["cost"] + imp["shipping_cost"], 4)}, "", ""
+    return {"product": prod, "cost_usd": round(imp["cost"] + imp["shipping_cost"], 4), "currency": code}, "", ""
 
 
 _IMP_SQL = ("SELECT i.id, i.title, i.sell_price, p.id AS pid, p.category, p.stock, p.image, p.source, p.cost, "
@@ -384,7 +384,7 @@ def publish(cid: int, body: dict) -> dict:
 # ---------------------------------------------------------------- vistas
 
 _LISTING_SQL = (
-    "SELECT l.*, c.name AS store_name, c.platform AS platform, c.currency AS currency, "
+    "SELECT l.*, c.name AS store_name, c.platform AS platform, COALESCE(l.currency, c.currency) AS view_currency, "
     "(SELECT j.action FROM store_jobs j WHERE j.listing_id = l.id AND j.status IN ('pending', 'running') "
     " ORDER BY j.id LIMIT 1) AS pending_action "
     "FROM store_listings l JOIN store_connections c ON c.id = l.connection_id")
@@ -396,7 +396,7 @@ def _view(r) -> dict:
             "external_url": r["external_url"], "last_price": r["last_price"], "last_stock": r["last_stock"],
             "last_synced_at": r["last_synced_at"], "last_error": r["last_error"],
             "pending_action": r["pending_action"], "is_demo": bool(r["is_demo"]),
-            "currency": r["currency"], "created_at": r["created_at"]}
+            "currency": r["view_currency"], "hidden_by_rule": bool(r["hidden_by_rule"]), "created_at": r["created_at"]}
 
 
 def _own_listing(conn, lid: int, uid: int):
@@ -492,10 +492,12 @@ def listing_action(lid: int, action: str) -> dict:
                 raise ApiError(409, "El producto ya no está en Mis productos: no hay datos para sincronizar",
                                "no_product")
             _enqueue_sync(conn, uid, lid, {"manual": True, "reason": "manual"})
+            _need_queued(conn, lid, "sync")
             _log(conn, uid, r["connection_id"], lid, "sync", True, "Sincronización pedida por el usuario")
         else:
             _need_remote(r, "ocultar" if action == "hide" else "mostrar")
             _enqueue_visibility(conn, uid, lid, action, by_rule=False)
+            _need_queued(conn, lid, action)
             _log(conn, uid, r["connection_id"], lid, action, True,
                  "Se pidió ocultar el producto" if action == "hide" else "Se pidió mostrar el producto")
         view = _view(_own_listing(conn, lid, uid))
@@ -503,13 +505,22 @@ def listing_action(lid: int, action: str) -> dict:
     return {"listing": view}
 
 
+def _need_queued(conn, lid: int, action: str) -> None:
+    """Una acción manual jamás se pierde en silencio: si ya hay una igual EN CURSO (el índice único impide otra),
+    se responde 409 en vez de fingir éxito."""
+    if not _pending(conn, lid, action):
+        raise ApiError(409, "Ya hay una acción igual en curso para este anuncio; espera a que termine e inténtalo "
+                            "de nuevo.", "action_in_progress")
+
+
 def _retry(conn, r, uid: int) -> None:
     lid = r["id"]
-    if conn.execute("SELECT 1 FROM store_jobs WHERE listing_id = ? AND status IN ('pending', 'running')",
-                    (lid,)).fetchone():
-        raise ApiError(409, "Ya hay una acción en curso para este anuncio", "action_in_progress")
+    active = {x[0] for x in conn.execute("SELECT action FROM store_jobs WHERE listing_id = ? AND status IN "
+                                         "('pending', 'running')", (lid,))}
     failed = conn.execute("SELECT * FROM store_jobs WHERE listing_id = ? AND status = 'failed' "
                           "ORDER BY id DESC LIMIT 1", (lid,)).fetchone()
+    if (failed is not None and failed["action"] in active) or (failed is None and active):
+        raise ApiError(409, "Ya hay una acción en curso para este anuncio", "action_in_progress")
     need_publish = r["status"] == "removed" or (r["status"] == "error" and not r["external_id"]) \
         or (failed is not None and failed["action"] == "publish" and not r["external_id"])
     if need_publish:
@@ -531,6 +542,8 @@ def _retry(conn, r, uid: int) -> None:
     elif failed is not None:
         payload = _payload(failed)
         payload.pop("_remote_started", None)
+        if failed["action"] in ("hide", "show"):
+            payload["force"] = True              # el usuario reintenta a propósito: no se omite por "regla obsoleta"
         _enqueue(conn, uid, lid, failed["action"], payload)
         _log(conn, uid, r["connection_id"], lid, failed["action"], True, "Reintento pedido por el usuario")
     elif r["status"] == "error" and r["external_id"] and r["imported_id"] is not None:
@@ -569,7 +582,7 @@ def delete_listing(lid: int, qs: dict) -> dict:
 
 def _drop_listing(conn, lid: int) -> None:
     conn.execute("DELETE FROM store_listings WHERE id = ?", (lid,))      # los trabajos caen en cascada
-    conn.execute("DELETE FROM meta WHERE key = ?", (f"ss:base:{lid}",))
+    conn.execute("DELETE FROM meta WHERE key IN (?, ?)", (f"ss:base:{lid}", f"ss:prev:{lid}"))
 
 
 def sync_now() -> dict:
@@ -731,6 +744,27 @@ def _mark_unsafe(c, job, lst, msg: str, now) -> None:
         _log(c, job["user_id"], lst["connection_id"], lst["id"], "publish", False, msg)
 
 
+def _set_prev(c, lst) -> None:
+    """Guarda (de forma durable) la visibilidad que tenía el anuncio antes de pasar a `error`."""
+    if lst["status"] in ("published", "hidden"):
+        c.execute("INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)", (f"ss:prev:{lst['id']}", lst["status"]))
+
+
+def _prev_status(lst, payload: dict) -> str | None:
+    """Visibilidad previa a un `error` (meta; si falta, la anotada en el trabajo). None si no se conoce."""
+    with db.connect() as conn:
+        r = conn.execute("SELECT value FROM meta WHERE key = ?", (f"ss:prev:{lst['id']}",)).fetchone()
+    for v in (r[0] if r else None, payload.get("_prev")):
+        if v in ("published", "hidden"):
+            return v
+    return None
+
+
+def _alert(c, lst, typ: str, msg: str) -> None:
+    c.execute("INSERT INTO alerts(imported_id, product_id, user_id, type, message, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+              (lst["imported_id"], lst["product_id"], lst["user_id"], typ, msg, db.now()))
+
+
 def _fresh_payload(job_id: int, fallback: dict) -> dict:
     try:
         with db.connect() as conn:
@@ -812,13 +846,6 @@ def _done(conn, job, lst, action: str, message: str, updates: dict | None = None
     _log(conn, job["user_id"], lst["connection_id"], lst["id"], action, True, message)
 
 
-def _restored(lst, payload: dict) -> str | None:
-    """Si el anuncio estaba en `error` y esto funcionó, vuelve a su estado previo (o hidden, lo seguro)."""
-    if lst["status"] == "error":
-        return payload.get("_prev") if payload.get("_prev") in ("published", "hidden") else "hidden"
-    return None
-
-
 def _do_publish(job, lst, crow, connector, payload, now) -> None:
     uid = job["user_id"]
     prod = payload.get("product")
@@ -852,10 +879,10 @@ def _do_publish(job, lst, crow, connector, payload, now) -> None:
     def save(c):
         n = c.execute(
             "UPDATE store_listings SET external_id = ?, external_variant_id = ?, external_inventory_id = ?, "
-            "external_url = ?, status = ?, last_price = ?, last_stock = ?, last_synced_at = ?, last_error = NULL "
-            "WHERE id = ? AND user_id = ?",
+            "external_url = ?, status = ?, last_price = ?, last_stock = ?, last_synced_at = ?, last_error = NULL, "
+            "currency = ? WHERE id = ? AND user_id = ?",
             (ref.external_id, ref.variant_id, ref.inventory_item_id, ref.url, "published" if sp.active else "hidden",
-             sp.price, sp.stock, _ts(now), lst["id"], uid)).rowcount
+             sp.price, sp.stock, _ts(now), payload.get("currency") or crow["currency"], lst["id"], uid)).rowcount
         if not n:
             return False                         # el usuario quitó el anuncio durante la llamada
         c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
@@ -903,10 +930,14 @@ def _do_sync(job, lst, crow, connector, payload, now) -> None:
         raise sc.StoreValidationError("El anuncio todavía no está publicado en la tienda")
     if lst["status"] == "removed":
         raise _Skip("El producto ya no existe en la tienda; no se sincroniza")
+    ccur = (crow["currency"] or "").upper()
     if payload.get("manual"):
         with db.connect() as conn:
             price, stock = _stock_price_now(conn, lst, uid, crow)
     else:
+        lcur = (lst["currency"] or "").upper()
+        if lcur and lcur != ccur:
+            raise sc.StoreValidationError(_currency_msg(lcur, ccur))
         price = payload.get("price")
         price = lst["last_price"] if price is None else (
             max(price, lst["last_price"]) if lst["last_price"] is not None else price)    # las reglas nunca bajan
@@ -916,13 +947,43 @@ def _do_sync(job, lst, crow, connector, payload, now) -> None:
             raise sc.StoreValidationError("Faltan datos de precio o stock para sincronizar")
     connector.update_price_stock(_ref(lst), price, stock)
     why = payload.get("reason") or "automática"
-    updates = {"last_price": price, "last_stock": stock, "last_synced_at": _ts(now), "last_error": None}
-    if (st := _restored(lst, payload)):
-        updates["status"] = st
+    updates = {"last_price": price, "last_stock": stock, "last_synced_at": _ts(now), "last_error": None,
+               "currency": ccur or None}
+    restore = lst["status"] == "error"
+    prev = _prev_status(lst, payload) if restore else None
+    if restore:
+        if prev:
+            updates["status"] = prev
+        else:                                    # nunca se inventa una visibilidad que no se conoce
+            updates["last_error"] = ("Sincronizado, pero no se conoce si el producto está visible en la tienda: "
+                                     "usa Mostrar u Ocultar.")
+    raised = (not payload.get("manual") and lst["last_price"] is not None and price > lst["last_price"]
+              and lst["imported_id"] is not None)
     msg = f"Sincronizado ({why}): precio {price:g} {crow['currency']}, stock {stock}"
     if lst["last_price"] is not None and price > lst["last_price"]:
         msg += f" (subió de {lst['last_price']:g})"
-    _write(lambda c: _done(c, job, lst, "sync", msg, updates, now))
+
+    def save(c):
+        _done(c, job, lst, "sync", msg, updates, now)
+        if restore and prev:
+            c.execute("DELETE FROM meta WHERE key = ?", (f"ss:prev:{lst['id']}",))
+        if raised:
+            # DropFinder debe mostrar el precio real de la tienda (y un sync/reintento manual no lo revierte)
+            rate = currency.get_state(c, user_id=uid)["rates"].get(ccur)
+            if rate:
+                c.execute("UPDATE imported_products SET sell_price = ? WHERE id = ? AND user_id = ?",
+                          (price / rate, lst["imported_id"], uid))
+            _log(c, uid, lst["connection_id"], lst["id"], "sync", True,
+                 f"Precio subido automáticamente a {price:g} {crow['currency']} y actualizado en Mis productos")
+            _alert(c, lst, "store_price_raised",
+                   f"Subimos el precio de «{lst['title'][:60]}» a {price:g} {crow['currency']} en «{crow['name']}» "
+                   "porque subió el costo del proveedor.")
+    _write(save)
+
+
+def _currency_msg(old: str, new: str) -> str:
+    return (f"La moneda de la tienda cambió ({old}→{new}): revisa los precios y vuelve a publicar o sincronizar "
+            "manualmente.")
 
 
 def _do_visibility(job, lst, crow, connector, payload, now) -> None:
@@ -932,7 +993,7 @@ def _do_visibility(job, lst, crow, connector, payload, now) -> None:
         raise sc.StoreValidationError("El anuncio todavía no está publicado en la tienda")
     if lst["status"] == "removed":
         raise _Skip("El producto ya no existe en la tienda")
-    if by_rule:                                  # la regla pudo quedar obsoleta mientras esperaba
+    if by_rule and not payload.get("force"):     # la regla pudo quedar obsoleta mientras esperaba
         if (show and (lst["status"] != "hidden" or not lst["hidden_by_rule"])) or \
                 (not show and lst["status"] != "published"):
             raise _Skip("La regla de stock ya no aplica; no se cambió la visibilidad")
@@ -943,7 +1004,8 @@ def _do_visibility(job, lst, crow, connector, payload, now) -> None:
               ("Producto mostrado en la tienda" + (" (volvió el stock)" if by_rule else "")) if show else
               ("Producto ocultado en la tienda" + (" (sin stock en el proveedor)" if by_rule else "")),
               {"status": "published" if show else "hidden", "last_error": None,
-               "hidden_by_rule": 1 if (not show and by_rule) else 0}, now)
+               "hidden_by_rule": 1 if (not show and by_rule and not payload.get("manual")) else 0}, now)
+        c.execute("DELETE FROM meta WHERE key = ?", (f"ss:prev:{lst['id']}",))
     _write(save)
 
 
@@ -981,7 +1043,15 @@ def _on_error(job, lst, crow, exc: sc.StoreError, secrets: list, now: datetime) 
     def fail(c, listing_status: str | None, note: str):
         c.execute("UPDATE store_jobs SET locked_until = NULL, status = 'failed', last_error = ?, payload = ?, updated_at = ? WHERE id = ?",
                   (msg, json.dumps(pl), _ts(now), job["id"]))
+        if action in ("hide", "show"):
+            listing_status = None                # nunca se afirma una visibilidad que la tienda no confirmó
+            title = lst["title"][:60]
+            _alert(c, lst, "store_visibility_failed",
+                   (f"No pudimos ocultar «{title}»" + (" (sin stock)" if pl.get("by_rule") else "")
+                    + ": sigue visible en tu tienda. Reintenta desde Mis productos.") if action == "hide" else
+                   f"No pudimos mostrar «{title}»: sigue oculto en tu tienda. Reintenta desde Mis productos.")
         if listing_status:
+            _set_prev(c, lst)
             c.execute("UPDATE store_listings SET status = ?, last_error = ? WHERE id = ?",
                       (listing_status, clean_message(note), lid))
         else:
@@ -1046,7 +1116,7 @@ def prune(now: datetime | None = None) -> dict:
                 logs += conn.execute("DELETE FROM store_sync_log WHERE user_id = ? AND id <= ?",
                                      (u, edge[0])).rowcount
         marks = 0
-        for prefix in ("ss:base:",):
+        for prefix in ("ss:base:", "ss:prev:"):
             marks += conn.execute(
                 "DELETE FROM meta WHERE key GLOB ? AND CAST(substr(key, ?) AS INTEGER) NOT IN "
                 "(SELECT id FROM store_listings)", (prefix + "*", len(prefix) + 1)).rowcount
@@ -1057,7 +1127,7 @@ def prune(now: datetime | None = None) -> dict:
 
 _RULE_SQL = (
     "SELECT l.id AS lid, l.user_id, l.connection_id, l.status, l.last_price, l.last_stock, l.title AS ltitle, "
-    "l.hidden_by_rule, i.id AS imp_id, p.id AS pid, p.cost, p.shipping_cost, p.stock, c.settings AS settings, "
+    "l.hidden_by_rule, l.currency AS lcur, i.id AS imp_id, p.id AS pid, p.cost, p.shipping_cost, p.stock, c.settings AS settings, "
     "c.currency AS currency, c.name AS store_name FROM store_listings l "
     "JOIN imported_products i ON i.id = l.imported_id JOIN products p ON p.id = i.product_id "
     "JOIN store_connections c ON c.id = l.connection_id "
@@ -1089,6 +1159,14 @@ def _evaluate(conn, rows, price: bool = True) -> None:
     states: dict[int, dict] = {}
     queued = False
     for r in rows:
+        lcur, ccur = (r["lcur"] or "").upper(), (r["currency"] or "").upper()
+        if lcur and lcur != ccur:                # la tienda cambió de moneda tras publicar: no se empuja nada
+            msg = _currency_msg(lcur, ccur)
+            if conn.execute("UPDATE store_listings SET status = 'error', last_error = ? WHERE id = ? "
+                            "AND status IN ('published', 'hidden')", (msg, r["lid"])).rowcount:
+                conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)", (f"ss:prev:{r['lid']}", r["status"]))
+                _log(conn, r["user_id"], r["connection_id"], r["lid"], "sync", False, msg)
+            continue
         cfg = stores_mod.load_settings(r)
         mine = pend.get(r["lid"], {})
         queued |= _rule_visibility(conn, r, cfg, mine, bool(r["hidden_by_rule"]))
@@ -1107,7 +1185,9 @@ def reevaluate(conn, listing_id: int) -> None:
 def _rule_visibility(conn, r, cfg: dict, mine: dict, marked: bool) -> bool:
     stock = _cap_stock(r["stock"])
     ph, ps = mine.get("hide", []), mine.get("show", [])
-    by_rule = lambda jobs: bool(jobs) and all(_payload(j).get("by_rule") for j in jobs)    # noqa: E731
+    # Un pendiente de regla puede cancelarse; uno que pidió el usuario (manual / reintento) no
+    by_rule = lambda jobs: bool(jobs) and all(                                           # noqa: E731
+        _payload(j).get("by_rule") and not _payload(j).get("force") and not _payload(j).get("manual") for j in jobs)
     if stock == 0 and cfg["hide_when_out_of_stock"]:
         if ps and by_rule(ps):
             conn.execute("DELETE FROM store_jobs WHERE id IN (%s)" % ",".join(str(j["id"]) for j in ps))
@@ -1160,8 +1240,15 @@ def _price_rule(conn, r, cfg, fees, state, code, rate, cost, pl, want) -> None:
         except (ValueError, TypeError):
             base = {}
     base_cost = base.get("cost")
-    if base_cost is not None and cost <= base_cost + 0.005:
-        return                                   # el costo no subió desde que se publicó: nada que corregir
+
+    def remember(c_now):                         # último costo EVALUADO: solo un costo mayor a este reacciona
+        base["cost"] = c_now
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (f"ss:base:{lid}", json.dumps(base)))
+    if base_cost is None or cost <= base_cost + 0.005:
+        if base_cost is None or cost < base_cost - 0.005:
+            remember(cost)
+        return                                   # el costo no subió desde la última evaluación: nada que corregir
+    remember(cost)
     cur = max(r["last_price"], pl.get("price") or 0)
     margin = _margin_pct(cur, cost, rate, fees)
     minimum = cfg["min_margin_pct"]

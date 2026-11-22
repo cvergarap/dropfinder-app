@@ -531,7 +531,9 @@ class LeaseAndConstraintsTest(Base):
         with db.connect() as conn:
             conn.execute("UPDATE store_jobs SET status = 'running' WHERE status = 'pending'")
         self.catalog_change(self.pid_of(iid), stock=2)                        # el hook no revienta con el índice único
-        store_sync.listing_action(lid, "sync")
+        with self.assertRaises(ApiError) as cm:                               # la acción manual no se pierde en silencio
+            store_sync.listing_action(lid, "sync")
+        self.assertEqual((cm.exception.status, cm.exception.code), (409, "action_in_progress"))
 
     def test_rate_limit_has_stable_code(self):
         store2, iid, lid = self.published(self.connect("x.fake.test"))
@@ -847,6 +849,145 @@ class PublishSaveFailureTest(Base):
                 self.assertEqual(len(FakeStore.stores[domain]["products"]), 1)
 
 
+class ReviewVisibilityAndPriceTest(ChangeDuringRunningJobTest):
+    """Review PR #12, hallazgos 2 a 5 y 6."""
+
+    # ---- 2: un hide que falla no cambia la visibilidad que afirma DropFinder
+    def test_failed_hide_keeps_visible_status_alerts_and_retry_reruns(self):
+        store, iid, lid = self.published(as_draft=False, stock=10)
+        store_sync.listing_action(lid, "hide")
+        FakeStore.fail_next.append(sc.StoreValidationError("rechazado"))
+        store_sync.run_due_jobs()
+        l = self.listing(lid)
+        self.assertEqual(l["status"], "published")                          # la tienda sigue visible
+        self.assertTrue(self.remote(lid)["active"])
+        self.assertIn("rechazado", l["last_error"])
+        al = self.alerts("store_visibility_failed")
+        self.assertEqual(len(al), 1)
+        self.assertIn("sigue visible en tu tienda", al[0]["message"])
+        store_sync.listing_action(lid, "retry")
+        store_sync.run_due_jobs()
+        self.assertEqual((self.listing(lid)["status"], self.remote(lid)["active"]), ("hidden", False))
+
+    def test_failed_rule_hide_then_retry_even_if_rule_no_longer_applies(self):
+        store, iid, lid = self.published(as_draft=False, stock=10)
+        pid = self.pid_of(iid)
+        self.catalog_change(pid, stock=0)
+        FakeStore.fail_next.append(sc.StoreValidationError("no se pudo"))
+        store_sync.run_due_jobs(limit=1)                                    # el hide por regla (va primero) falla
+        self.assertEqual((self.listing(lid)["status"], self.remote(lid)["active"]), ("published", True))
+        self.catalog_change(pid, stock=5)                                   # ya no aplica la regla…
+        store_sync.listing_action(lid, "retry")                             # …pero el usuario reintenta: se ejecuta
+        store_sync.run_due_jobs(limit=2)
+        self.assertEqual(len([c for c in FakeStore.calls if c[0] == "set_active" and c[-1] is False]), 2)
+
+    def test_restore_never_invents_hidden_when_previous_state_unknown(self):
+        store, iid, lid = self.published(as_draft=False, stock=10)
+        FakeStore.fail_next.append(sc.StoreValidationError("stock inválido"))
+        store_sync.listing_action(lid, "sync")
+        store_sync.run_due_jobs()
+        self.assertEqual(self.listing(lid)["status"], "error")
+        with db.connect() as conn:                                          # se perdió todo rastro del estado previo
+            conn.execute("DELETE FROM meta WHERE key LIKE 'ss:prev:%'")
+            conn.execute("DELETE FROM store_jobs")
+        store_sync.listing_action(lid, "sync")
+        store_sync.run_due_jobs()
+        l = self.listing(lid)
+        self.assertEqual(l["status"], "error")                              # no se afirma "hidden" ni "published"
+        self.assertIn("Mostrar u Ocultar", l["last_error"])
+
+    # ---- 3: la subida automática no se encadena
+    def test_price_raise_reacts_once_per_cost_rise(self):
+        store = self.connect(auto_raise_price=True, min_margin_pct=60.0, max_price_increase_pct=10.0)
+        _, iid, lid = self.published(store, sell_price=20.0, cost=10.0, as_draft=False)
+        pid = self.pid_of(iid)
+        self.catalog_change(pid, cost=15.0)
+        store_sync.run_due_jobs()
+        self.assertEqual(self.remote(lid)["price"], 22.0)                  # +10% y nada más
+        for stock in (9, 8, 7):
+            self.catalog_change(pid, stock=stock)                           # escrituras sin cambio de costo
+            store_sync.run_due_jobs()
+        self.catalog_change(pid)                                            # recarga idéntica del CSV / monitor
+        store_sync.run_due_jobs()
+        self.assertEqual(self.remote(lid)["price"], 22.0)
+        self.catalog_change(pid, cost=18.0)                                 # un nuevo aumento: una subida más
+        store_sync.run_due_jobs()
+        self.assertEqual(self.remote(lid)["price"], 24.2)
+        self.catalog_change(pid, stock=1)
+        store_sync.run_due_jobs()
+        self.assertEqual(self.remote(lid)["price"], 24.2)
+
+    # ---- 4: el precio subido por el motor es el de Mis productos
+    def test_auto_raise_updates_sell_price_and_manual_sync_keeps_it(self):
+        store = self.connect(auto_raise_price=True, min_margin_pct=30.0)
+        _, iid, lid = self.published(store, sell_price=20.0, cost=10.0, as_draft=False)
+        self.catalog_change(self.pid_of(iid), cost=16.0)
+        store_sync.run_due_jobs()
+        raised = self.remote(lid)["price"]
+        self.assertGreater(raised, 20.0)
+        with db.connect() as conn:
+            self.assertAlmostEqual(conn.execute("SELECT sell_price FROM imported_products WHERE id = ?", (iid,)).fetchone()[0],
+                                   raised, places=6)
+        self.assertEqual(len(self.alerts("store_price_raised")), 1)
+        store_sync.listing_action(lid, "sync")
+        store_sync.run_due_jobs()
+        self.assertEqual((self.remote(lid)["price"], self.listing(lid)["last_price"]), (raised, raised))
+        # y si el USUARIO baja el precio a propósito, el sync manual sí lo baja (acción explícita)
+        server.update_import(iid, {"sell_price": 21.0})
+        store_sync.listing_action(lid, "sync")
+        store_sync.run_due_jobs()
+        self.assertEqual(self.remote(lid)["price"], 21.0)
+
+    # ---- 5: una acción manual no se pierde
+    def test_manual_hide_while_rule_hide_running_is_409(self):
+        store, iid, lid = self.published(as_draft=False, stock=10)
+        pid = self.pid_of(iid)
+        self.catalog_change(pid, stock=0)
+        seen = []
+
+        def user_clicks_hide():
+            try:
+                store_sync.listing_action(lid, "hide")
+            except ApiError as e:
+                seen.append((e.status, e.code))
+        self.during([user_clicks_hide])
+        store_sync.run_due_jobs()
+        self.assertEqual(seen, [(409, "action_in_progress")])
+
+    def test_manual_hide_converts_pending_rule_hide_and_is_never_auto_shown(self):
+        store, iid, lid = self.published(as_draft=False, stock=10)
+        pid = self.pid_of(iid)
+        self.catalog_change(pid, stock=0)                                   # hide por regla pendiente
+        store_sync.listing_action(lid, "hide")                              # el usuario también lo pide
+        hides = [json.loads(j["payload"]) for j in self.jobs(lid, "pending") if j["action"] == "hide"]
+        self.assertEqual(len(hides), 1)
+        self.assertEqual((hides[0]["by_rule"], hides[0]["manual"]), (False, True))
+        store_sync.run_due_jobs()
+        self.assertEqual((self.listing(lid)["status"], self.listing(lid)["hidden_by_rule"]), ("hidden", 0))
+        self.catalog_change(pid, stock=5)
+        store_sync.run_due_jobs()
+        self.assertEqual(self.listing(lid)["status"], "hidden")             # nunca se muestra solo
+
+    # ---- 6: cambio de moneda
+    def test_currency_change_after_publish_blocks_pushes_until_manual_sync(self):
+        store, iid, lid = self.published(as_draft=False, stock=10, cost=10.0)
+        self.assertEqual(self.listing(lid)["currency"], "USD")
+        FakeStore.stores[self.domain]["currency"] = "COP"
+        stores_mod.validate_store(store["id"])
+        calls = len(FakeStore.calls)
+        self.catalog_change(self.pid_of(iid), stock=3, cost=14.0)
+        l = self.listing(lid)
+        self.assertEqual(l["status"], "error")
+        self.assertIn("USD→COP", l["last_error"])
+        self.assertEqual(self.jobs(lid, "pending"), [])
+        store_sync.run_due_jobs()
+        self.assertEqual(len(FakeStore.calls), calls)                       # no se empujó nada
+        store_sync.listing_action(lid, "sync")                              # el usuario lo arregla a propósito
+        store_sync.run_due_jobs()
+        l = self.listing(lid)
+        self.assertEqual((l["status"], l["currency"], self.remote(lid)["price"]), ("published", "COP", 80900.0))
+
+
 class ListingActionsTest(Base):
     def test_manual_sync_pushes_current_price_and_stock(self):
         store, iid, lid = self.published(sell_price=20.0)
@@ -917,7 +1058,7 @@ class ListingActionsTest(Base):
         self.assertEqual({i["imported_id"] for i in got}, {ids[0], ids[1]})
         self.assertEqual(set(got[0]), {"id", "imported_id", "connection_id", "store_name", "platform", "title", "status",
                                        "external_url", "last_price", "last_stock", "last_synced_at", "last_error",
-                                       "pending_action", "is_demo", "currency", "created_at"})
+                                       "pending_action", "is_demo", "currency", "hidden_by_rule", "created_at"})
         with self.assertRaises(ApiError):
             store_sync.listings_for_imports({"imported_ids": [",".join(map(str, range(201)))]})
 
@@ -1021,7 +1162,7 @@ class RulesTest(Base):
         store, iid, lid = self.setup_listing()
         self.catalog_change(self.pid_of(iid), stock=0)
         store_sync.listing_action(lid, "hide")                      # lo manual reemplaza al de la regla
-        self.assertEqual([p for a, p in self.run_actions(lid) if a == "hide"], [{"by_rule": False}])
+        self.assertEqual([p for a, p in self.run_actions(lid) if a == "hide"], [{"by_rule": False, "manual": True}])
 
     # ---- precio
     def raise_setup(self, **settings):
