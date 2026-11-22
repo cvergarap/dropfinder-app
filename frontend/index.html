@@ -11,6 +11,7 @@
 <link rel="stylesheet" href="css/saved.css">
 <link rel="stylesheet" href="css/dashboard.css">
 <link rel="stylesheet" href="css/collections.css">
+<link rel="stylesheet" href="css/stores.css">
 <link rel="stylesheet" href="css/auth.css">
 </head>
 <body>
@@ -25,6 +26,7 @@
     <button class="tab" data-view="compare">Comparar <span id="compareCount" class="pill">0</span></button>
     <button class="tab" data-view="saved">Búsquedas guardadas</button>
     <button class="tab" data-view="collections">Colecciones <span id="favCount" class="pill">0</span></button>
+    <button class="tab" data-view="stores">Tiendas <span id="storesBadge" class="pill warn hidden">0</span></button>
     <button class="tab" data-view="suppliers">Proveedores</button>
     <button class="tab" data-view="settings">Reglas de precio</button>
   </nav>
@@ -120,6 +122,7 @@
   <section id="view-saved" class="view"></section>     <!-- js/saved.js -->
   <section id="view-dashboard" class="view active"></section> <!-- js/dashboard.js -->
   <section id="view-collections" class="view"></section> <!-- js/collections.js -->
+  <section id="view-stores" class="view"></section>      <!-- js/stores.js -->
 
   <!-- ======= PROVEEDORES ======= -->
   <section id="view-suppliers" class="view">
@@ -209,6 +212,7 @@
 <script src="js/saved.js"></script>
 <script src="js/dashboard.js"></script>
 <script src="js/collections.js"></script>
+<script src="js/stores.js"></script>
 <script src="js/auth.js"></script>
 </body>
 </html>

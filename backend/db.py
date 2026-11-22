@@ -15,7 +15,7 @@ from search import unaccent  # noqa: F401  (se mantiene db.unaccent por compatib
 
 DB_PATH = os.environ.get("DROPFINDER_DB", os.path.join(os.path.dirname(__file__), "dropfinder.db"))
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 PRODUCTS_TABLE = """
 CREATE TABLE IF NOT EXISTS products (
@@ -71,6 +71,13 @@ CREATE INDEX IF NOT EXISTS ix_imported_user ON imported_products(user_id);
 CREATE INDEX IF NOT EXISTS ix_alerts_user ON alerts(user_id, read);
 CREATE INDEX IF NOT EXISTS ix_saved_user ON saved_searches(user_id);
 CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS ix_store_conn_user ON store_connections(user_id);
+CREATE INDEX IF NOT EXISTS ix_store_list_user ON store_listings(user_id);
+CREATE INDEX IF NOT EXISTS ix_store_list_conn ON store_listings(connection_id);
+CREATE INDEX IF NOT EXISTS ix_store_list_imported ON store_listings(imported_id);
+CREATE INDEX IF NOT EXISTS ix_store_jobs_due ON store_jobs(status, run_after);
+CREATE INDEX IF NOT EXISTS ix_store_jobs_listing ON store_jobs(listing_id);
+CREATE INDEX IF NOT EXISTS ix_store_log_user ON store_sync_log(user_id, id);
 CREATE INDEX IF NOT EXISTS ix_search_log_user ON search_log(user_id, q_norm);
 """
 
@@ -164,6 +171,40 @@ CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at);
 -- v6: última vez que el monitor actualizó cada producto (enfriamiento entre ejecuciones)
 CREATE TABLE IF NOT EXISTS monitor_checks (
   product_id INTEGER PRIMARY KEY REFERENCES products(id) ON DELETE CASCADE, checked_at TEXT NOT NULL
+);
+"""
+# v7: integración con tiendas (ver docs/adr/0002-integracion-tiendas.md). Todo por usuario.
+SCHEMA += """
+-- credentials_enc: JSON de credenciales cifrado con secrets_store (nunca en claro, nunca al navegador)
+CREATE TABLE IF NOT EXISTS store_connections (
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,
+  platform TEXT NOT NULL, name TEXT NOT NULL, domain TEXT NOT NULL, credentials_enc TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',        -- active | error | disabled
+  last_error TEXT, settings TEXT NOT NULL DEFAULT '{}', currency TEXT NOT NULL DEFAULT 'USD',
+  location_id TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, last_validated_at TEXT,
+  UNIQUE (user_id, platform, domain)
+);
+-- imported_id opcional: si el usuario quita el producto de "Mis productos", el anuncio sigue localizable
+CREATE TABLE IF NOT EXISTS store_listings (
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,
+  imported_id INTEGER REFERENCES imported_products(id) ON DELETE SET NULL,
+  connection_id INTEGER NOT NULL REFERENCES store_connections(id) ON DELETE CASCADE,
+  title TEXT NOT NULL, external_id TEXT, external_variant_id TEXT, external_inventory_id TEXT, external_url TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',       -- pending | published | hidden | error | removed
+  last_price REAL, last_stock INTEGER, last_synced_at TEXT, last_error TEXT, created_at TEXT NOT NULL,
+  UNIQUE (imported_id, connection_id)
+);
+CREATE TABLE IF NOT EXISTS store_jobs (
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,
+  listing_id INTEGER NOT NULL REFERENCES store_listings(id) ON DELETE CASCADE,
+  action TEXT NOT NULL,                         -- publish | sync | hide | show | delete
+  status TEXT NOT NULL DEFAULT 'pending',       -- pending | running | done | failed
+  attempts INTEGER NOT NULL DEFAULT 0, run_after TEXT NOT NULL, last_error TEXT, payload TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS store_sync_log (
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, connection_id INTEGER, listing_id INTEGER,
+  action TEXT NOT NULL, ok INTEGER NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL
 );
 """
 SCHEMA = SCHEMA.replace("ALERTS_TABLE_DEF", ALERTS_TABLE).replace("IMPORTED_TABLE_DEF", IMPORTED_TABLE)

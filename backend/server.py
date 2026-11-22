@@ -30,6 +30,7 @@ from errors import ApiError, FileResponse  # noqa: F401  (los módulos y pruebas
 import history
 import hooks
 import saved_searches
+import stores_mod
 import search
 from connectors import CsvSupplierConnector, MockSupplierConnector
 from connectors.base import PriceStock
@@ -569,7 +570,7 @@ ROUTES = [
 ]
 
 # Rutas de los módulos de funcionalidades (cada uno define su propia lista ROUTES)
-for _module in (auth, history, compare, saved_searches, dashboard, collections_mod):
+for _module in (auth, history, compare, saved_searches, dashboard, collections_mod, stores_mod):
     ROUTES.extend(_module.ROUTES)
 
 # ---------------------------------------------------------------- acceso por ruta
@@ -617,6 +618,10 @@ USER_ROUTES = {
     ("PATCH", r"/api/collections/(\d+)/items/(\d+)"), ("POST", r"/api/favorites/(\d+)"),
     ("GET", r"/api/favorites/ids"), ("GET", r"/api/product-collections/(\d+)"),
     ("GET", r"/api/export/(search|collection|imports)\.csv"),
+    # tiendas conectadas (propias; las credenciales nunca salen del servidor)
+    ("GET", r"/api/stores/platforms"), ("GET", r"/api/stores"), ("POST", r"/api/stores"),
+    ("GET", r"/api/stores/(\d+)"), ("PATCH", r"/api/stores/(\d+)"), ("POST", r"/api/stores/(\d+)/validate"),
+    ("DELETE", r"/api/stores/(\d+)"),
 }
 
 
