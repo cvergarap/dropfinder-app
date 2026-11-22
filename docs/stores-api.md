@@ -39,3 +39,15 @@ rechazadas = 400, tienda caída = 502, límite de velocidad = 429.
 - Publicar crea el producto como **borrador** salvo que la tienda o la petición digan otra cosa.
 - Nunca se baja un precio automáticamente; subir precio solo con `auto_raise_price` y respetando `max_price_increase_pct`.
 - Toda acción sobre la tienda queda en `store_sync_log`.
+
+## Notas del motor de sincronización (aditivas; no rompen lo anterior)
+- `skipped[]` puede traer además `message` (texto en español para mostrar). `listing` trae además `currency` (moneda de la tienda).
+- Un producto publicado **como borrador** queda con `status: "hidden"` (no visible en la tienda); "Mostrar" lo activa. Las reglas
+  automáticas nunca lo hacen visible: solo vuelven a mostrar lo que ellas mismas ocultaron por falta de stock.
+- `already_published` aplica a cualquier anuncio existente (también `error`/`removed`): para volver a publicarlo, `POST /api/store-listings/{id}/retry`.
+- `retry`: `removed` o `error` sin id externo → nueva publicación; si el último trabajo falló → se repite; `error` con id externo → sincroniza. 409 si ya hay una acción en curso.
+- Anuncios huérfanos (el usuario quitó el producto de "Mis productos"): `imported_id: null`; no se sincronizan solos; se pueden ocultar/mostrar/retirar,
+  no `sync` (409).
+- Rutas nuevas: `GET /api/stores/monitor-schedule` → `{minutes, allowed, last_run}` y `PUT /api/stores/monitor-schedule {minutes: 0|15|30|60|180|360|720|1440}` (solo propietario; 0 = apagado).
+- `publish` responde 429 si el usuario encola más de 50 publicaciones en un minuto. `store_error` también se usa si la tienda está en estado `error`.
+- Alerta nueva: `type: "store_margin_low"` (margen por debajo del mínimo tras subir el costo).
