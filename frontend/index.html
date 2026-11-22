@@ -16,8 +16,8 @@
 <header class="topbar">
   <div class="brand">Drop<span>Finder</span></div>
   <nav>
-    <button class="tab" data-view="dashboard">Panel</button>
-    <button class="tab active" data-view="search">Buscar productos</button>
+    <button class="tab active" data-view="dashboard">Panel</button>
+    <button class="tab" data-view="search">Buscar productos</button>
     <button class="tab" data-view="imports">Mis productos <span id="importsCount" class="pill">0</span></button>
     <button class="tab" data-view="alerts">Alertas <span id="alertsCount" class="pill warn">0</span></button>
     <button class="tab" data-view="trends">Tendencias</button>
@@ -39,7 +39,7 @@
 
 <main>
   <!-- ======= BUSCAR ======= -->
-  <section id="view-search" class="view active">
+  <section id="view-search" class="view">
     <form id="searchForm" class="searchbar">
       <div class="ac-wrap">
         <input id="q" name="q" type="search" placeholder="Buscar: cargador magnético, cama para perro, LED…" autocomplete="off" aria-label="Buscar productos">
@@ -117,7 +117,7 @@
   <section id="view-trends" class="view"></section>    <!-- js/history.js -->
   <section id="view-compare" class="view"></section>   <!-- js/compare.js -->
   <section id="view-saved" class="view"></section>     <!-- js/saved.js -->
-  <section id="view-dashboard" class="view"></section> <!-- js/dashboard.js -->
+  <section id="view-dashboard" class="view active"></section> <!-- js/dashboard.js -->
   <section id="view-collections" class="view"></section> <!-- js/collections.js -->
 
   <!-- ======= PROVEEDORES ======= -->

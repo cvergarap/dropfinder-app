@@ -5,14 +5,13 @@
 (() => {
   const SVGNS = "http://www.w3.org/2000/svg";
   const root = () => $("#view-dashboard");
-  const FRESH_MS = 3000;             // la precarga del arranque se reutiliza una vez si es reciente
   let data = null;                   // última respuesta (para re-renderizar al cambiar de moneda)
-  let prefetchedAt = 0;              // > 0 solo mientras la precarga del arranque no se haya usado
   let loading = null;
   let lastWidth = 0;
 
   const pctFmt = (v, digits = 1) => `${Number(v).toLocaleString("es", { maximumFractionDigits: digits })} %`;
   const signed = (v) => `${v > 0 ? "+" : v < 0 ? "−" : ""}${pctFmt(Math.abs(v))}`;
+  const txt = (v) => (v === null || v === undefined || v === "" ? "—" : esc(v));   // sin dato → "—"
   const dayLabel = (s) => new Date(`${s}T12:00:00`).toLocaleDateString("es", { day: "numeric", month: "short" });
 
   function greeting() {
@@ -38,10 +37,9 @@
     if (!data) sec.innerHTML = `<p class="muted db-loading">Cargando tu panel…</p>`;
     else sec.classList.add("db-stale");                 // se mantiene lo anterior mientras recarga
     try {
-      const reuse = data && prefetchedAt && Date.now() - prefetchedAt < FRESH_MS;
-      prefetchedAt = 0;
-      if (!reuse) await fetchData();
+      await fetchData();
       render();
+      schedulePendingReload();
     } catch (e) {
       if (e.status === 401) { sec.innerHTML = ""; data = null; return; }   // el módulo de cuentas muestra el inicio de sesión
       if (!data) sec.innerHTML = `<p class="empty">No se pudo cargar el panel: ${esc(e.message)}
@@ -50,6 +48,18 @@
     } finally {
       sec.classList.remove("db-stale");
     }
+  }
+
+  /* Mientras el servidor calcula los rankings en segundo plano ("pending"), "Para ti" muestra los de mejor
+     score y se vuelve a pedir el panel unas veces (solo si la pestaña sigue abierta). */
+  let pendingTries = 0;
+  let pendingTimer = null;
+  function schedulePendingReload() {
+    clearTimeout(pendingTimer);
+    if (!data || !data.recommendations.pending) { pendingTries = 0; return; }
+    if (pendingTries >= 3) return;
+    pendingTries += 1;
+    pendingTimer = setTimeout(() => { if (root().classList.contains("active")) load(); }, 1500 * pendingTries);
   }
 
   /* ================= Render ================= */
@@ -86,7 +96,7 @@
           d.charts.alerts_by_type.items.map((x) => ({ label: x.label, value: x.count })),
           "Sin alertas en los últimos 30 días.", "alerts", "alertas")}
         ${barCard("Mis productos por categoría", "Productos importados",
-          d.charts.imports_by_category.items.map((x) => ({ label: x.category, value: x.count })),
+          d.charts.imports_by_category.items.map((x) => ({ label: x.label ?? "—", value: x.count })),
           "Aún no importaste productos.", "imports", "productos")}
       </div>`}
       ${recsCard(d.recommendations, fresh)}`;
@@ -118,7 +128,7 @@
     return [
       tile("imports", "Productos importados", fmt(k.imported), `${fmt(k.active)} activos · ${fmt(k.drafts)} borradores`),
       tile("imports", "Margen promedio", k.avg_margin === null ? "—" : pctFmt(k.avg_margin),
-        k.imported ? "con tu precio de venta" : "importa productos para verlo", k.avg_margin === null ? "" : neg(k.avg_margin)),
+        k.imported ? "todos tus productos (activos y borradores)" : "importa productos para verlo", k.avg_margin === null ? "" : neg(k.avg_margin)),
       tile("imports", "Ganancia por venta", money(k.potential_profit_per_sale),
         k.active ? `1 venta de cada producto activo (${fmt(k.active)})` : "activa productos para verla", neg(k.potential_profit_per_sale)),
       tile("imports", "Ganancia estimada del mes", money(k.estimated_monthly_profit),
@@ -141,7 +151,7 @@
       const [icon, label, cls] = REASONS[a.reason] || ["•", a.reason, ""];
       const detail = a.reason === "negative_margin"
         ? `Ganancia ${money(a.profit)} por venta (${pctFmt(a.margin)})`
-        : a.reason === "cost_up" ? `Costo total ${money(a.total_cost)} (${signed(a.change_pct)})` : esc(a.category);
+        : a.reason === "cost_up" ? `Costo total ${money(a.total_cost)} (${signed(a.change_pct)})` : txt(a.category);
       return `<li class="db-att">
         ${imgTag(a, "db-thumb")}
         <div class="db-att-main">
@@ -178,7 +188,7 @@
         </div></li>`).join("");
     return `<section class="db-card db-onboarding" aria-labelledby="dbObTitle">
       <div class="db-card-head"><h3 id="dbObTitle">Primeros pasos</h3>
-        <button type="button" class="link small" data-db-dismiss="checklist">Ocultar</button></div>
+        <button type="button" class="link small" data-db-dismiss="checklist" aria-label="Ocultar la lista de primeros pasos">Ocultar lista</button></div>
       <div class="db-progress-row"><div class="db-meter" role="progressbar" aria-valuemin="0" aria-valuemax="${ob.total}"
           aria-valuenow="${ob.done}" aria-label="Primeros pasos completados"><span style="width:${pct}%"></span></div>
         <span class="small">${fmt(ob.done)} de ${fmt(ob.total)}</span></div>
@@ -218,7 +228,7 @@
   }
 
   function recsCard(recs, fresh) {
-    const cats = recs.categories.length ? `En tendencia en ${recs.categories.map(esc).join(", ")}` : "Lo que más crece en el catálogo";
+    const cats = recs.categories.length ? `En tendencia en ${recs.categories.map(txt).join(", ")}` : "Lo que más crece en el catálogo";
     const cards = recs.items.map((p) => {
       const ch = p.change_pct;
       const delta = ch === null || ch === undefined ? ""
@@ -228,7 +238,7 @@
         ${imgTag(p, "db-rec-img")}
         <div class="db-rec-body">
           <b class="db-rec-title">${esc(p.title)}</b>
-          <span class="meta"><span class="chip">${esc(p.category)}</span><span class="chip">${esc(p.supplier)}</span>
+          <span class="meta"><span class="chip">${txt(p.category)}</span><span class="chip">${txt(p.supplier)}</span>
             ${p.source === "mock" ? `<span class="chip" title="Producto ficticio de demostración">Demo</span>` : ""}</span>
           <span class="db-rec-nums"><span>${money(p.total_cost)} → <b>${money(p.suggested_price, { kind: "price" })}</b></span>
             <span>Margen <b>${pctFmt(p.margin)}</b></span><span>★ ${fmt(p.score)}</span></span>
@@ -303,6 +313,8 @@
     svg.appendChild(hdot);
     const tip = document.createElement("div");
     tip.className = "db-tip";
+    tip.setAttribute("role", "status");          // se anuncia al recorrer los días con las flechas
+    tip.setAttribute("aria-live", "polite");
     tip.hidden = true;
     box.replaceChildren(svg, tip);
 
@@ -394,14 +406,7 @@
   DF.dashboard = { reload: load, home: () => show("dashboard") };
 
   bind();
-  /* Vista inicial: si el usuario aún no cambió de pestaña, se abre el Panel. Con 401 (sin sesión) no se
-     hace nada: el módulo de cuentas muestra el inicio de sesión y el panel se carga al abrir la pestaña. */
-  const startView = () => ($(".tab.active") || {}).dataset;
-  const initial = startView() && startView().view;
-  fetchData().then(() => {
-    prefetchedAt = Date.now();
-    const cur = startView() && startView().view;
-    if (cur === initial && cur !== "dashboard") show("dashboard");
-    else if (cur === "dashboard") render();
-  }).catch(() => { /* 401 u otro error: se reintenta al abrir la pestaña */ });
+  /* El Panel es la vista inicial (index.html): se carga al arrancar sin cambiar de pestaña. Con 401 (sin
+     sesión) no se muestra nada; tras iniciar sesión, el módulo de cuentas llama DF.dashboard.home(). */
+  if (root() && root().classList.contains("active")) load();
 })();

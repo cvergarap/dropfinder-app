@@ -18,9 +18,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 os.environ.setdefault("DROPFINDER_DB", os.path.join(tempfile.mkdtemp(), "test.db"))
 
 import auth_context  # noqa: E402
+import collections_mod  # noqa: E402
 import dashboard  # noqa: E402
 import db  # noqa: E402
 import history  # noqa: E402
+import saved_searches  # noqa: E402
 import search  # noqa: E402
 import server  # noqa: E402
 from connectors.base import NormalizedProduct  # noqa: E402
@@ -117,7 +119,7 @@ class DashboardTest(unittest.TestCase):
             cls.i2 = add_import(conn, OWNER, p["C5"], 20.0, "draft")
             cls.i3 = add_import(conn, OWNER, p["M2"], 15.0, "active")
             cls.i4 = add_import(conn, OWNER, p["M3"], 100.0, "active")
-            now = datetime.now(timezone.utc)
+            now = datetime(D0.year, D0.month, D0.day, 12, tzinfo=timezone.utc)   # mismo reloj que el panel
             old = (now - timedelta(days=40)).isoformat(timespec="seconds")
             recent = now.isoformat(timespec="seconds")
             for t, created, read, uid in [("price_up", recent, 0, OWNER), ("price_up", recent, 1, OWNER),
@@ -181,7 +183,7 @@ class DashboardTest(unittest.TestCase):
     def test_estimate_cap(self):
         self.assertEqual(dashboard.estimated_profit(300_000, 2.0), (30, 60.0))
         self.assertEqual(dashboard.estimated_profit(100, 2.0), (1.0, 2.0))
-        o30, src = dashboard.orders_30d({"orders_7d": 14}, [], None, D0 - timedelta(days=29))
+        o30, src = dashboard.orders_30d({"orders_7d": 14}, 0, None, (D0 - timedelta(days=29)).isoformat())
         self.assertEqual((o30, src), (60.0, "estimado_7d"))
 
     # ---------------------------------------------------------------- gráficos
@@ -216,8 +218,8 @@ class DashboardTest(unittest.TestCase):
         with auth_context.as_user(7):
             items = dashboard.dashboard()["charts"]["imports_by_category"]["items"]
         self.assertEqual(len(items), 7)
-        self.assertEqual(items[0], {"category": "Cat0", "count": 2})
-        self.assertEqual(items[-1], {"category": "Otras", "count": 2})
+        self.assertEqual(items[0], {"category": "Cat0", "label": "Cat0", "count": 2, "other": False})
+        self.assertEqual(items[-1], {"category": None, "label": dashboard.OTHER_LABEL, "count": 2, "other": True})
 
     # ---------------------------------------------------------------- atención
 
@@ -258,8 +260,8 @@ class DashboardTest(unittest.TestCase):
         with auth_context.as_user(uid):
             ob = dashboard.dashboard()["onboarding"]
             keys = [i["key"] for i in ob["items"]]
-            self.assertEqual(keys, ["currency", "pricing", "first_import", "saved_search", "store"])  # sin colecciones
-            self.assertEqual((ob["done"], ob["total"], ob["complete"]), (0, 4, False))
+            self.assertEqual(keys, ["currency", "pricing", "first_import", "saved_search", "collection", "store"])
+            self.assertEqual((ob["done"], ob["total"], ob["complete"]), (0, 5, False))
             store = ob["items"][-1]
             self.assertTrue(store["disabled"])
             self.assertFalse(store["done"])
@@ -279,8 +281,9 @@ class DashboardTest(unittest.TestCase):
 
     def test_onboarding_real_state(self):
         with db.connect() as conn:
-            conn.execute("CREATE TABLE IF NOT EXISTS collections (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT)")
-            conn.execute("INSERT INTO collections(user_id, name) VALUES (?, 'Ideas')", (OWNER,))
+            collections_mod.ensure_schema(conn)
+            conn.execute("INSERT INTO collections(user_id, name, created_at, updated_at) VALUES (?, 'Ideas', 'x', 'x')",
+                         (OWNER,))
             conn.execute("UPDATE settings SET value = '3.0' WHERE key = 'multiplier'")
             conn.execute("UPDATE currency_settings SET value = '\"COP\"' WHERE key = 'display_currency'")
         try:
@@ -293,7 +296,7 @@ class DashboardTest(unittest.TestCase):
             self.assertFalse(m["first_import"]["done"])
         finally:
             with db.connect() as conn:
-                conn.execute("DROP TABLE collections")
+                conn.execute("DELETE FROM collections")
                 conn.execute("UPDATE settings SET value = '2.5' WHERE key = 'multiplier'")
                 conn.execute("UPDATE currency_settings SET value = '\"USD\"' WHERE key = 'display_currency'")
 
@@ -313,61 +316,231 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(d["charts"]["alerts_by_type"]["items"], [{"type": "price_up", "label": "Subió el costo", "count": 1}])
 
     def test_no_user_context_is_401(self):
-        with unittest.mock.patch.dict(os.environ, {dashboard.DEV_USER_ENV: ""}):
-            with self.assertRaises(ApiError) as cm:
-                dashboard.dashboard()
-            self.assertEqual(cm.exception.status, 401)
-            with self.assertRaises(ApiError):
-                dashboard.dismiss("currency")
-        with unittest.mock.patch.dict(os.environ, {dashboard.DEV_USER_ENV: "1"}):   # solo desarrollo
-            self.assertEqual(dashboard.dashboard()["kpis"]["imported"], 4)
+        """Sin contexto de usuario no hay atajos: 401, también con variables de entorno de desarrollo."""
+        self.assertFalse(hasattr(dashboard, "DEV_USER_ENV"))
+        with unittest.mock.patch.dict(os.environ, {"DROPFINDER_DEV_USER": "1"}):
+            for call in (dashboard.dashboard, lambda: dashboard.dismiss("currency")):
+                with self.assertRaises(ApiError) as cm:
+                    call()
+                self.assertEqual(cm.exception.status, 401)
 
     def test_http(self):
         srv = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{srv.server_address[1]}"
         try:
-            with unittest.mock.patch.dict(os.environ, {dashboard.DEV_USER_ENV: ""}):
-                with self.assertRaises(urllib.error.HTTPError) as cm:
-                    urllib.request.urlopen(base + "/api/dashboard", timeout=10).close()
-                self.assertEqual(cm.exception.code, 401)
-                cm.exception.close()
-            with unittest.mock.patch.dict(os.environ, {dashboard.DEV_USER_ENV: "1"}):
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(base + "/api/dashboard", timeout=10).close()
+            self.assertEqual(cm.exception.code, 401)
+            cm.exception.close()
+            # Sesión simulada (la pondrá el middleware de cuentas): el hilo del servidor ve al usuario 1
+            with unittest.mock.patch.object(auth_context, "current_user_id", return_value=OWNER), \
+                    unittest.mock.patch.object(auth_context, "is_owner", return_value=True):
                 with urllib.request.urlopen(base + "/api/dashboard", timeout=10) as r:
                     body = json.loads(r.read())
             self.assertEqual(set(body), {"kpis", "estimate", "charts", "attention", "recommendations", "onboarding",
                                          "assumptions", "generated_at", "took_ms"})
+            self.assertEqual(body["kpis"]["imported"], 4)
         finally:
             srv.shutdown()
             srv.server_close()
 
+    # ---------------------------------------------------------------- regresiones de la revisión
+
+    def test_alert_window_uses_history_clock(self):
+        """La ventana de alertas usa history.today() (como el resto del panel), no el reloj del sistema."""
+        old_today = history.today
+        try:
+            history.today = lambda: date(2025, 1, 31)
+            with db.connect() as conn:
+                conn.execute("INSERT INTO alerts(type, message, created_at, user_id) VALUES "
+                             "('price_up', 'x', '2025-01-15T10:00:00+00:00', 21), "
+                             "('price_down', 'x', '2024-12-01T10:00:00+00:00', 21)")
+            with auth_context.as_user(21):
+                items = dashboard.dashboard()["charts"]["alerts_by_type"]["items"]
+            self.assertEqual([(x["type"], x["count"]) for x in items], [("price_up", 1)])
+        finally:
+            history.today = old_today
+
+    def test_other_bucket_does_not_merge_real_category(self):
+        with db.connect() as conn:
+            for i, cat in enumerate(["Otras", "A", "B", "C", "D", "E", "F", "G"]):
+                pid = conn.execute("INSERT INTO products(supplier, supplier_sku, title, category, cost, shipping_cost, "
+                                   "shipping_days, warehouse, stock, orders, orders_7d, orders_prev_7d, rating, reviews, "
+                                   "updated_at) VALUES ('Y', ?, ?, ?, 1, 1, 1, 'CO', 1, 1, 1, 1, 4, 1, '')",
+                                   (f"O{i}", f"Otro {i}", cat)).lastrowid
+                add_import(conn, 22, pid, 10)
+                if cat == "Otras":
+                    pid2 = conn.execute("INSERT INTO products(supplier, supplier_sku, title, category, cost, shipping_cost, "
+                                        "shipping_days, warehouse, stock, orders, orders_7d, orders_prev_7d, rating, "
+                                        "reviews, updated_at) VALUES ('Y', 'O-bis', 'Otro bis', 'Otras', 1, 1, 1, 'CO', "
+                                        "1, 1, 1, 1, 4, 1, '')").lastrowid
+                    add_import(conn, 22, pid2, 10)
+        with auth_context.as_user(22):
+            items = dashboard.dashboard()["charts"]["imports_by_category"]["items"]
+        self.assertEqual(items[0], {"category": "Otras", "label": "Otras", "count": 2, "other": False})
+        self.assertEqual(items[-1], {"category": None, "label": dashboard.OTHER_LABEL, "count": 2, "other": True})
+
+    def test_onboarding_member_not_done_by_owner_settings(self):
+        with db.connect() as conn:
+            conn.execute("UPDATE settings SET value = '3.0' WHERE key = 'multiplier'")
+            conn.execute("UPDATE currency_settings SET value = '\"COP\"' WHERE key = 'display_currency'")
+        try:
+            with auth_context.as_user(23, "member"):
+                m = {i["key"]: i for i in dashboard.dashboard()["onboarding"]["items"]}
+                self.assertFalse(m["currency"]["done"])
+                self.assertFalse(m["pricing"]["done"])
+                dashboard.dismiss("pricing")                    # el miembro solo lo completa confirmando
+                m = {i["key"]: i for i in dashboard.dashboard()["onboarding"]["items"]}
+                self.assertTrue(m["pricing"]["done"] and m["pricing"]["dismissed"])
+            with auth_context.as_user(24, "owner"):
+                o = {i["key"]: i for i in dashboard.dashboard()["onboarding"]["items"]}
+                self.assertTrue(o["currency"]["done"] and o["pricing"]["done"])
+                self.assertFalse(o["currency"]["dismissed"])
+        finally:
+            with db.connect() as conn:
+                conn.execute("UPDATE settings SET value = '2.5' WHERE key = 'multiplier'")
+                conn.execute("UPDATE currency_settings SET value = '\"USD\"' WHERE key = 'display_currency'")
+
+    def test_collections_only_mine_without_favorites(self):
+        """Paso "Crea una colección": API pública de colecciones; ni Favoritos ni las de otro usuario cuentan."""
+        with db.connect() as conn:
+            collections_mod.ensure_schema(conn)
+            conn.execute("INSERT INTO collections(user_id, name, is_favorites, created_at, updated_at) "
+                         "VALUES (?, 'Favoritos', 1, 'x', 'x')", (OWNER,))
+            conn.execute("INSERT INTO collections(user_id, name, created_at, updated_at) VALUES (?, 'Ideas', 'x', 'x')",
+                         (MEMBER,))
+        try:
+            self.assertFalse({i["key"]: i for i in self.get()["onboarding"]["items"]}["collection"]["done"])
+            self.assertTrue({i["key"]: i for i in self.get(MEMBER)["onboarding"]["items"]}["collection"]["done"])
+        finally:
+            with db.connect() as conn:
+                conn.execute("DELETE FROM collections")
+
+    def test_saved_searches_public_api_no_ddl(self):
+        """new_counts es pública, coincide con el contador de la pestaña y el GET del panel no crea tablas."""
+        with db.connect() as conn:
+            conn.execute("DROP TABLE IF EXISTS saved_search_pending")
+        with as_owner(), db.connect() as conn:
+            counts = saved_searches.new_counts(conn, OWNER)
+        self.assertEqual(list(counts.values()), [1])
+        self.assertEqual(self.get()["kpis"]["new_in_saved_searches"], 1)
+        with db.connect() as conn:
+            self.assertIsNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'saved_search_pending'").fetchone())
+            self.assertEqual(saved_searches.new_counts(conn, MEMBER), {})
+        with open(dashboard.__file__, encoding="utf-8") as f:
+            src = f.read()
+        self.assertNotIn("_count_new", src)
+        self.assertNotIn("_ensure_schema", src)
+
+    def test_rankings_cache_shared(self):
+        """Importar otro producto o ser otro usuario no cambia la clave de caché de los rankings."""
+        self.get()
+        with unittest.mock.patch.object(history, "compute_ranking", wraps=history.compute_ranking) as spy:
+            self.get()
+            self.get(MEMBER)
+            with db.connect() as conn:
+                iid = add_import(conn, OWNER, self.p["C3"], 30.0)
+            try:
+                self.get()
+            finally:
+                with db.connect() as conn:
+                    conn.execute("DELETE FROM imported_products WHERE id = ?", (iid,))
+        self.assertEqual(spy.call_count, 0)
+
+
+class FrontendStartupTest(unittest.TestCase):
+    """Arranque sin carreras: el Panel es la vista activa desde el HTML (no se cambia de pestaña cuando llega
+    la respuesta) y la búsqueda inicial se difiere hasta abrir Buscar."""
+
+    @staticmethod
+    def read(*parts):
+        with open(os.path.join(os.path.dirname(__file__), "..", "frontend", *parts), encoding="utf-8") as f:
+            return f.read()
+
+    def test_panel_is_initial_view_in_html(self):
+        html = self.read("index.html")
+        self.assertIn('<button class="tab active" data-view="dashboard">', html)
+        self.assertIn('<section id="view-dashboard" class="view active">', html)
+        self.assertIn('<section id="view-search" class="view">', html)
+        self.assertEqual(html.count('class="tab active"'), 1)
+
+    def test_no_deferred_tab_switch_and_search_deferred(self):
+        js = self.read("js", "dashboard.js")
+        self.assertNotIn('show("dashboard");', js.split("DF.dashboard =")[0])   # solo DF.dashboard.home() cambia de pestaña
+        self.assertIn('home: () => show("dashboard")', js)
+        app = self.read("app.js")
+        self.assertIn("DF.deferInitialSearch", app)
+        self.assertNotIn(".then(search);", app)
+
 
 class DashboardPerformanceTest(unittest.TestCase):
-    """1.500 productos de demostración y 50 importados: el panel completo en < 300 ms."""
+    """Rendimiento con 20.000 productos, 1.000 importados, 5 búsquedas guardadas y 61 días de fotos de TODOS los
+    productos (1,2 M filas; el 5 % cambia de costo). Qué se mide (dashboard() completo + json.dumps, la
+    mediana de 3 llamadas):
+    - frío: justo después de invalidar la caché (como tras una carga de catálogo), con los rankings en
+      segundo plano (ASYNC_RANKINGS, el modo del servidor): < 150 ms y "pending" → luego, ya con la caché
+      llena, la siguiente llamada trae las 8 recomendaciones de los rankings, también < 150 ms;
+    - caliente (rankings en caché): < 150 ms.
+    No se mide la primera generación del historial sintético de la demo (la hace el hilo de history)."""
 
     @classmethod
     def setUpClass(cls):
         cls.env = _Env()
-        history.today = lambda: date.today()
-        db.init_db(seed_size=1500)
+        db.init_db(seed_size=20_000)
         with db.connect() as conn:
-            ids = [r[0] for r in conn.execute("SELECT id FROM products ORDER BY id LIMIT 50")]
+            conn.execute("DELETE FROM product_snapshots")
+            conn.execute(
+                "WITH RECURSIVE k(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM k WHERE n < 60) "
+                "INSERT INTO product_snapshots(product_id, date, orders, orders_day, cost, shipping_cost, stock) "
+                "SELECT p.id, date(:d0, '-' || k.n || ' days'), p.orders - k.n * (p.id % 7 + 1), p.id % 7 + 1, "
+                "  p.cost * (CASE WHEN p.id % 20 = 0 AND k.n > 10 THEN 0.92 ELSE 1.0 END), p.shipping_cost, p.stock "
+                "FROM products p, k", {"d0": D0.isoformat()})
+            ids = [r[0] for r in conn.execute("SELECT id FROM products ORDER BY (id * 7919) % 20011 LIMIT 1000")]
             for n, pid in enumerate(ids):
                 add_import(conn, OWNER, pid, 25.0, "active" if n % 2 else "draft")
+            for k in range(5):
+                conn.execute("INSERT INTO saved_searches(name, params, created_at, user_id) VALUES ('s', ?, ?, ?)",
+                             (json.dumps({"q": "led", "max_cost": 20 + k}), "2026-11-01", OWNER))
+        search.invalidate()
 
     @classmethod
     def tearDownClass(cls):
+        dashboard.wait_rankings()
         cls.env.close()
 
-    def test_fast(self):
+    def timed(self):
+        t = time.perf_counter()
+        d = dashboard.dashboard()
+        json.dumps(d, ensure_ascii=False)
+        return d, (time.perf_counter() - t) * 1000
+
+    def test_cold_and_warm(self):
+        cold, after, warm = [], [], []
+        with as_owner(), unittest.mock.patch.object(dashboard, "ASYNC_RANKINGS", True):
+            dashboard.dashboard()                    # primera conexión / páginas de SQLite en memoria
+            dashboard.wait_rankings()
+            for _ in range(3):
+                search.invalidate()                  # caché vacía: como tras una carga del catálogo
+                d, ms = self.timed()
+                cold.append(ms)
+                self.assertTrue(d["recommendations"]["pending"])
+                # respaldo "Mejor score" (la demo repite títulos y 1.000 importados cubren casi todos)
+                self.assertTrue(d["recommendations"]["items"])
+                dashboard.wait_rankings()
+                d, ms = self.timed()
+                after.append(ms)
+                self.assertFalse(d["recommendations"]["pending"])
+                self.assertIn(d["recommendations"]["items"][0]["reason"], ("En ascenso", "Más vendido"))
         with as_owner():
-            dashboard.dashboard()                      # primera llamada: rankings en caché
-            t = time.perf_counter()
-            d = dashboard.dashboard()
-            ms = (time.perf_counter() - t) * 1000
-        self.assertEqual(d["kpis"]["imported"], 50)
-        self.assertEqual(len(d["recommendations"]["items"]), 8)
-        self.assertLess(ms, 300)
+            for _ in range(3):
+                d, ms = self.timed()
+                warm.append(ms)
+        self.assertEqual(d["kpis"]["imported"], 1000)
+        med = lambda xs: sorted(xs)[1]  # noqa: E731
+        self.assertLess(med(cold), 150, cold)
+        self.assertLess(med(after), 150, after)
+        self.assertLess(med(warm), 150, warm)
 
 
 if __name__ == "__main__":
