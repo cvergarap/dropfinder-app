@@ -21,7 +21,7 @@ import dashboard
 import collections_mod
 import currency
 import db
-from errors import ApiError  # noqa: F401  (los módulos y pruebas usan server.ApiError)
+from errors import ApiError, FileResponse  # noqa: F401  (los módulos y pruebas usan server.ApiError)
 import history
 import hooks
 import saved_searches
@@ -138,7 +138,7 @@ def _best_effort(conn, fn, *args) -> None:
         conn.execute("PRAGMA busy_timeout = 5000")
 
 
-def search_products(qs: dict) -> dict:
+def search_products(qs: dict, *, log: bool = True) -> dict:
     """Búsqueda con texto completo, filtros, orden y paginación en SQL.
 
     Además de total/page/page_size/pages/items devuelve:
@@ -151,6 +151,7 @@ def search_products(qs: dict) -> dict:
       took_ms         tiempo de la consulta en el servidor (milisegundos)
 
     Con `exact=1` no se autocorrige (el usuario pidió buscar su texto tal cual).
+    log=False: no registra la consulta para el autocompletado (p. ej. al exportar resultados).
     """
     started = time.perf_counter()
     exact = qs.get("exact", ["0"])[0] == "1"
@@ -184,7 +185,7 @@ def search_products(qs: dict) -> dict:
                         total, items, corrected_from, effective = t2, i2, q, fix
                 elif _query(conn, fix_tokens, use_fts, where, args, sort, page, size, count_only=True)[0] > total:
                     suggestion = fix
-        if tokens and page == 1:      # para el autocompletado se guarda la consulta ya corregida
+        if tokens and page == 1 and log:   # para el autocompletado se guarda la consulta ya corregida
             _best_effort(conn, search.log_search, effective, total, db.now())
     return {
         "total": total, "page": page, "page_size": size, "pages": math.ceil(total / size) if total else 0,
@@ -523,6 +524,18 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_file(self, f: FileResponse):
+        """Descarga (p. ej. CSV): bytes tal cual con su tipo y nombre de archivo."""
+        self.send_response(200)
+        self.send_header("Content-Type", f.content_type)
+        self.send_header("Content-Length", str(len(f.body)))
+        if f.filename:
+            self.send_header("Content-Disposition", f'attachment; filename="{f.filename}"')
+        for k, v in f.headers.items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(f.body)
+
     def _api(self, method):
         url = urlparse(self.path)
         for m, pattern, fn in ROUTES:
@@ -535,7 +548,10 @@ class Handler(SimpleHTTPRequestHandler):
                         raise ApiError(413, "Archivo demasiado grande (máx. 20 MB)")
                     if length:
                         body = json.loads(self.rfile.read(length) or b"{}")
-                    return self._send_json(200, fn(match, parse_qs(url.query), body))
+                    result = fn(match, parse_qs(url.query), body)
+                    if isinstance(result, FileResponse):
+                        return self._send_file(result)
+                    return self._send_json(200, result)
                 except ApiError as e:
                     return self._send_json(e.status, {"error": str(e)})
                 except json.JSONDecodeError:

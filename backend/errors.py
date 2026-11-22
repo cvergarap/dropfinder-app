@@ -7,3 +7,13 @@ class ApiError(Exception):
     def __init__(self, status: int, message: str):
         super().__init__(message)
         self.status = status
+
+
+class FileResponse:
+    """Respuesta de archivo (descarga) en lugar de JSON: un handler la devuelve y server.py escribe los
+    bytes tal cual con Content-Type y, si hay filename, Content-Disposition: attachment."""
+
+    def __init__(self, body: bytes, content_type: str, filename: str | None = None, headers: dict | None = None):
+        self.body, self.content_type, self.headers = body, content_type, dict(headers or {})
+        # Solo caracteres seguros en el nombre (evita inyectar cabeceras o rutas)
+        self.filename = "".join(c for c in filename if c.isascii() and (c.isalnum() or c in "._-")) if filename else None
