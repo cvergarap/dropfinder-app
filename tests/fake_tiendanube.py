@@ -23,7 +23,7 @@ PRODUCT_FIELDS = {"name": dict, "description": dict, "published": bool, "brand":
 VARIANT_FIELDS = {"price": "money", "stock": "int", "sku": str, "cost": "money", "promotional_price": "money_or_null", "stock_management": bool}
 PUT_PRODUCT_FIELDS = {"published": bool}
 PUT_VARIANT_FIELDS = {k: v for k, v in VARIANT_FIELDS.items() if k != "sku"}
-OPS = ("store", "products_list", "sku_lookup", "product_create", "product_update", "variant_update", "product_delete")
+OPS = ("store", "products_list", "sku_lookup", "product_get", "product_create", "product_update", "variant_update", "product_delete")
 NOT_FOUND = {"code": 404, "message": "Not Found", "description": "Not found"}
 
 
@@ -100,6 +100,17 @@ class FakeTiendanube:
         """Resumen SIN secretos de lo recibido (para mensajes de fallo de las pruebas)."""
         return [f"{r['method']} {r['path']} -> {r['op']}" for r in self.requests]
 
+    def add_product(self, store: str, sku: str, tags="", *, published=True, price="5.00", stock=1, name="Ajeno") -> int:
+        """Producto que ya estaba en la tienda (del cliente o de otra instalación), con su propio estado."""
+        with self.lock:
+            st = self.stores[store]
+            pid, vid = next(self._ids), next(self._ids)
+            st["products"][pid] = {"id": pid, "name": {"es": name}, "description": {}, "published": published, "brand": "",
+                                   "tags": tags, "images": [],
+                                   "variants": [{"id": vid, "product_id": pid, "price": price, "stock": stock, "sku": sku,
+                                                 "cost": None, "promotional_price": None, "stock_management": True}]}
+        return pid
+
     def products(self, store: str) -> dict:
         return self.stores[store]["products"]
 
@@ -162,7 +173,7 @@ class FakeTiendanube:
             return "sku_lookup", {"sku": urllib.parse.unquote(m.group(1))}
         m = re.fullmatch(r"/products/(\d+)", path)
         if m:
-            return {"PUT": "product_update", "DELETE": "product_delete"}.get(method), {"pid": int(m.group(1))}
+            return {"GET": "product_get", "PUT": "product_update", "DELETE": "product_delete"}.get(method), {"pid": int(m.group(1))}
         m = re.fullmatch(r"/products/(\d+)/variants/(\d+)", path)
         if m and method == "PUT":
             return "variant_update", {"pid": int(m.group(1)), "vid": int(m.group(2))}
@@ -357,6 +368,10 @@ class FakeTiendanube:
                                "images": [{"id": next(self._ids), "src": i["src"], "product_id": pid}
                                           for i in body.get("images", [])], "variants": variants}
         return 201, self._product_json(st["products"][pid])
+
+    def _product_get(self, st, rest, body, pid):
+        p = st["products"].get(pid)
+        return (200, self._product_json(p)) if p is not None else (404, NOT_FOUND)
 
     def _product_update(self, st, rest, body, pid):
         p = st["products"].get(pid)

@@ -22,6 +22,11 @@ DE DESARROLLO y revisa estos supuestos:
      SKU permitido: [A-Za-z0-9._-] hasta 255, y no «.» ni «..» (evita segmentos de ruta).
   6. PUT /products/{id}/variants/{variant_id} acepta price, stock y promotional_price (cadenas decimales / entero) y
      PUT /products/{id} acepta {published}. DELETE /products/{id} borra y responde 200 (o 204).
+  7b. Etiquetas (propiedad): `tags` del producto es UNA cadena separada por comas (se envía exactamente
+     ",".join(product.tags); se lee igual). SIN VERIFICAR: que Tiendanube acepte «-» y letras en las etiquetas, que no
+     las pase a minúsculas ni las reordene (la comparación ignora mayúsculas) y que GET /products/{id} y
+     GET /products/sku/{sku} devuelvan `tags`. Solo se adopta (y solo se borra) un producto que lleve las etiquetas de
+     esta instalación; un SKU nuestro sin ellas es un conflicto (StoreValidationError), nunca se adopta ni se pisa.
   7. GET /products/sku/{sku} devuelve 404 si no existe y el producto (objeto, o una lista con él) si existe, con
      variants[].sku. El SKU va codificado en la ruta (%XX). Si la tienda tiene SKUs repetidos devuelve uno solo.
   8. Un 404 no distingue «producto inexistente» de «tienda o ruta inexistente»: por eso, ante un 404 de un
@@ -61,7 +66,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from . import http as shttp, register, scrub
 from .base import (ListingRef, StoreAuthError, StoreConnector, StoreError, StoreInfo, StoreNotFound,
-                   StoreProduct, StoreRateLimited, StoreValidationError)
+                   StoreProduct, StoreRateLimited, StoreValidationError, tags_match)
 
 log = logging.getLogger("dropfinder.tiendanube")
 
@@ -212,8 +217,9 @@ def _safe_images(urls) -> list[dict]:
     return out
 
 
-def _clean_tags(tags) -> str:
-    """Tiendanube recibe las etiquetas como UNA cadena separada por comas."""
+def _tag_list(tags) -> list[str]:
+    """Etiquetas saneadas (una lista de DropFinder). Las de propiedad (`dropfinder`, `dfi-<id>`) van primero en la lista
+    del motor, así que el tope de 50 nunca las deja fuera."""
     if isinstance(tags, str):
         tags = [tags]
     out = []
@@ -222,7 +228,25 @@ def _clean_tags(tags) -> str:
             t = _clean_text(t.replace(",", " "), 60)
             if t:
                 out.append(t)
-    return ",".join(out[:50])[:1000]
+    return out[:50]
+
+
+def _clean_tags(tags) -> str:
+    """Tiendanube recibe las etiquetas como UNA cadena separada por comas."""
+    return ",".join(_tag_list(tags))[:1000]
+
+
+def _parse_tags(value) -> list[str]:
+    """Etiquetas de un producto de la tienda: cadena separada por comas (o lista, por si la API cambia). Datos hostiles."""
+    if isinstance(value, str):
+        value = value.split(",")
+    return [t.strip() for t in value if isinstance(t, str) and t.strip()][:200] if isinstance(value, list) else []
+
+
+def _is_owned(tags) -> bool:
+    """¿Lo creó DropFinder (alguna instalación)? Etiqueta genérica `dropfinder` y alguna `dfi-…`."""
+    low = {t.lower() for t in _parse_tags(tags)}
+    return "dropfinder" in low and any(t.startswith("dfi-") and len(t) > 4 for t in low)
 
 
 def _pick_name(name, default: str = "") -> str:
@@ -494,13 +518,22 @@ class TiendanubeConnector(StoreConnector):
                 return _as_id(v["id"])
         return ""
 
-    def _find_existing(self, sku: str) -> dict | None:
-        """Producto ya creado con ese SKU (publicación idempotente). 404 = no existe."""
+    def _find_existing(self, sku: str, tags) -> dict | None:
+        """Producto con ese SKU que creó ESTA instalación (lleva todas las etiquetas `tags`): se adopta.
+        Un producto con ese SKU pero sin nuestras etiquetas es de otra persona o instalación: conflicto (nunca se adopta,
+        ni se crea encima). 404 / lista vacía / null = no existe."""
         data = self._call("GET", "/products/sku/" + urllib.parse.quote(sku, safe=""), missing="ok")
         cands = data if isinstance(data, list) else [data]
+        foreign = False
         for p in cands:
             if isinstance(p, dict) and _as_id(p.get("id")) and self._variant_for(p, sku):
-                return p
+                if tags_match(_parse_tags(p.get("tags")), tags):
+                    return p
+                foreign = True
+        if foreign:
+            raise StoreValidationError(
+                f"Ya existe en tu tienda un producto con el SKU {sku} que no creó esta instalación de DropFinder: "
+                "cámbiale el SKU o bórralo antes de publicar")
         return None
 
     @_foreign_errors
@@ -526,7 +559,7 @@ class TiendanubeConnector(StoreConnector):
         lang = self._language()
 
         # 2. Adoptar un producto ya creado por un intento anterior, o crearlo
-        existing = self._find_existing(sku)
+        existing = self._find_existing(sku, _tag_list(product.tags))
         adopted = existing is not None
         published = bool(existing.get("published")) if adopted else False
         if adopted:
@@ -622,6 +655,10 @@ class TiendanubeConnector(StoreConnector):
     def delete(self, ref: ListingRef) -> None:
         self._check_ref(ref)
         try:
+            prod = self._call("GET", f"/products/{ref.external_id}", missing="product")
+            if not isinstance(prod, dict) or not _is_owned(prod.get("tags")):
+                raise StoreValidationError("No se borra: ese producto de la tienda no lleva las etiquetas de DropFinder "
+                                           "(no lo creó DropFinder). Bórralo a mano en Tiendanube si de verdad quieres quitarlo")
             self._call("DELETE", f"/products/{ref.external_id}", missing="product")
         except StoreNotFound:
             return
