@@ -104,7 +104,7 @@ class MigrationV4Test(unittest.TestCase):
             conn.close()
             db.init_db()
             with db.connect() as c:
-                self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 4)
+                self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
                 self.assertEqual(c.execute("PRAGMA foreign_key_check").fetchall(), [])
         finally:
             tmp.close()

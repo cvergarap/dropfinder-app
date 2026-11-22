@@ -15,7 +15,7 @@ from search import unaccent  # noqa: F401  (se mantiene db.unaccent por compatib
 
 DB_PATH = os.environ.get("DROPFINDER_DB", os.path.join(os.path.dirname(__file__), "dropfinder.db"))
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 PRODUCTS_TABLE = """
 CREATE TABLE IF NOT EXISTS products (
@@ -67,6 +67,23 @@ CREATE INDEX IF NOT EXISTS ix_hits_product ON saved_search_hits(product_id);
 CREATE INDEX IF NOT EXISTS ix_alerts_product ON alerts(product_id);
 CREATE INDEX IF NOT EXISTS ix_alerts_saved ON alerts(saved_search_id);
 CREATE INDEX IF NOT EXISTS ix_alerts_imported ON alerts(imported_id);
+CREATE INDEX IF NOT EXISTS ix_imported_user ON imported_products(user_id);
+CREATE INDEX IF NOT EXISTS ix_alerts_user ON alerts(user_id, read);
+CREATE INDEX IF NOT EXISTS ix_saved_user ON saved_searches(user_id);
+CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id);
+"""
+
+# v5: cada usuario tiene sus propios productos importados (un producto puede importarlo más de un usuario)
+IMPORTED_TABLE = """
+CREATE TABLE IF NOT EXISTS imported_products (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL DEFAULT 1,
+  product_id INTEGER NOT NULL REFERENCES products(id),
+  title TEXT NOT NULL, sell_price REAL NOT NULL,
+  last_cost REAL NOT NULL, last_stock INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'draft', created_at TEXT NOT NULL,
+  UNIQUE (user_id, product_id)
+);
 """
 
 # v4: una alerta puede venir de un producto importado (monitor) o de una búsqueda guardada
@@ -76,18 +93,13 @@ CREATE TABLE IF NOT EXISTS alerts (
   imported_id INTEGER REFERENCES imported_products(id) ON DELETE CASCADE,
   saved_search_id INTEGER REFERENCES saved_searches(id) ON DELETE CASCADE,
   product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
-  type TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL, read INTEGER NOT NULL DEFAULT 0
+  type TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL, read INTEGER NOT NULL DEFAULT 0,
+  user_id INTEGER NOT NULL DEFAULT 1
 );
 """
 
 SCHEMA = PRODUCTS_TABLE + """
-CREATE TABLE IF NOT EXISTS imported_products (
-  id INTEGER PRIMARY KEY,
-  product_id INTEGER NOT NULL UNIQUE REFERENCES products(id),
-  title TEXT NOT NULL, sell_price REAL NOT NULL,
-  last_cost REAL NOT NULL, last_stock INTEGER NOT NULL,
-  status TEXT NOT NULL DEFAULT 'draft', created_at TEXT NOT NULL
-);
+IMPORTED_TABLE_DEF
 
 ALERTS_TABLE_DEF
 
@@ -116,7 +128,8 @@ CREATE INDEX IF NOT EXISTS ix_snapshots_date ON product_snapshots(date);
 -- v4: búsquedas guardadas (params = parámetros de /api/products en JSON)
 CREATE TABLE IF NOT EXISTS saved_searches (
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, params TEXT NOT NULL,
-  notify INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, last_checked_at TEXT
+  notify INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, last_checked_at TEXT,
+  user_id INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS saved_search_hits (     -- productos ya vistos por cada búsqueda guardada
   saved_search_id INTEGER NOT NULL REFERENCES saved_searches(id) ON DELETE CASCADE,
@@ -125,7 +138,26 @@ CREATE TABLE IF NOT EXISTS saved_search_hits (     -- productos ya vistos por ca
   PRIMARY KEY (saved_search_id, product_id)
 ) WITHOUT ROWID;
 """
-SCHEMA = SCHEMA.replace("ALERTS_TABLE_DEF", ALERTS_TABLE)
+SCHEMA += """
+-- v5: cuentas de usuario. role: 'owner' (administra catálogo, reglas de precio y usuarios) o 'member'
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE COLLATE NOCASE, name TEXT NOT NULL,
+  password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'member',
+  created_at TEXT NOT NULL, last_login_at TEXT, disabled INTEGER NOT NULL DEFAULT 0
+);
+-- token_hash: SHA-256 del token de la cookie (el token en claro nunca se guarda)
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  csrf_token TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+  user_agent TEXT
+);
+CREATE TABLE IF NOT EXISTS login_attempts (
+  id INTEGER PRIMARY KEY, email TEXT NOT NULL COLLATE NOCASE, ip TEXT NOT NULL,
+  ok INTEGER NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_login_attempts ON login_attempts(email, created_at);
+"""
+SCHEMA = SCHEMA.replace("ALERTS_TABLE_DEF", ALERTS_TABLE).replace("IMPORTED_TABLE_DEF", IMPORTED_TABLE)
 
 PRODUCT_COLS = ["supplier", "supplier_sku", "source", "title", "category", "tags", "image", "product_url",
                 "cost", "shipping_cost", "shipping_days", "warehouse", "stock", "orders", "orders_7d",
@@ -171,6 +203,24 @@ def _migrate_v1_to_v2(conn) -> None:
     conn.execute("ALTER TABLE products_new RENAME TO products")
     # Las imágenes de ejemplo ahora se generan en el navegador (sin depender de internet)
     conn.execute("UPDATE products SET image = '' WHERE image LIKE 'https://placehold.co/%'")
+
+
+def _migrate_v4_to_v5(conn) -> None:
+    """v5: datos por usuario. Los datos existentes quedan del usuario 1 (el primer propietario que se
+    registre los recibe). imported_products se reconstruye (UNIQUE pasa a ser por usuario) conservando
+    ids, así las alertas siguen apuntando a su producto importado. Requiere foreign_keys = OFF."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(imported_products)")}
+    if cols and "user_id" not in cols:
+        conn.execute(IMPORTED_TABLE.replace("IF NOT EXISTS imported_products", "imported_products_v5"))
+        conn.execute("INSERT INTO imported_products_v5(id, user_id, product_id, title, sell_price, last_cost, "
+                     "last_stock, status, created_at) SELECT id, 1, product_id, title, sell_price, last_cost, "
+                     "last_stock, status, created_at FROM imported_products")
+        conn.execute("DROP TABLE imported_products")
+        conn.execute("ALTER TABLE imported_products_v5 RENAME TO imported_products")
+    for table in ("alerts", "saved_searches"):
+        tcols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if tcols and "user_id" not in tcols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id INTEGER NOT NULL DEFAULT 1")
 
 
 def _migrate_v3_to_v4(conn) -> None:
@@ -303,6 +353,18 @@ def init_db(seed_size: int = 1500) -> None:
             conn.execute("PRAGMA foreign_keys = OFF")   # debe hacerse fuera de una transacción
             try:
                 _migrate_v1_to_v2(conn)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            conn.execute("PRAGMA foreign_keys = ON")
+        if has_products and version < 5:
+            # v4 -> v5 reconstruye imported_products (referenciada por alerts): con FOREIGN KEYS desactivadas
+            conn.execute("PRAGMA foreign_keys = OFF")
+            try:
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'alerts'").fetchone():
+                    _migrate_v3_to_v4(conn)         # alertas en formato v4 antes de agregar user_id
+                _migrate_v4_to_v5(conn)
                 conn.commit()
             except Exception:
                 conn.rollback()
