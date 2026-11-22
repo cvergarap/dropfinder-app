@@ -33,8 +33,12 @@ DropFinder hoy es Python 3 sin dependencias externas (`http.server` + SQLite con
    - protección CSRF en toda petición que modifica datos;
    - límite de intentos de inicio de sesión;
    - cabeceras de seguridad (CSP, `X-Content-Type-Options`, `X-Frame-Options`).
+   - **Parámetros fijos de scrypt:** `n=2**14`, `r=8`, `p=1`, sal de 16 bytes; la comparación se hace en tiempo constante (`hmac.compare_digest`). Lo mismo se aplica al token CSRF.
+   - **Defensa contra DNS rebinding y CSRF:** se valida `Host` contra una lista permitida (`127.0.0.1`, `localhost` y los hosts que se configuren) y `Origin`/`Referer` cuando vienen.
+   - **Detrás del proxy HTTPS:** la cookie se emite con `Secure` (prefijo `__Host-`) y la IP real del cliente se toma de `X-Forwarded-For` **solo** si la conexión viene del proxy configurado. Esto importa para el límite de intentos por IP.
+   - **Correos en minúsculas** (Unicode, `casefold`) antes de guardarlos o compararlos.
 2. **Por defecto se escucha solo en `127.0.0.1`.** Para exponer la app a internet hay que ponerla detrás de un proxy con HTTPS (Caddy o nginx); está documentado y la app no habla HTTPS por sí misma.
-3. **El acceso a datos queda concentrado** en `db.py` y en los módulos de funcionalidad, para que una futura migración a PostgreSQL sea mecánica (SQL estándar, sin depender de rarezas de SQLite fuera de FTS5).
+3. **El acceso a datos queda concentrado** en `db.py` y en los módulos de funcionalidad, para que una futura migración a PostgreSQL sea acotada. Las partes propias de SQLite están identificadas y se reemplazarían una por una: FTS5, `PRAGMA user_version` para el versionado del esquema, `COLLATE NOCASE`, `INSERT … ON CONFLICT` y las tablas `WITHOUT ROWID`.
 4. **Las tareas largas** (sincronización con tiendas, monitor programado) usan hilos de fondo con lotes cortos y transacciones breves, como el historial del Sprint 2.
 
 ## Cuándo revisar esta decisión

@@ -1,15 +1,22 @@
 """Usuario de la petición en curso (contexto por hilo).
 
-server.py fija el usuario autenticado al empezar cada petición y lo limpia al terminar. Los módulos
-consultan current_user_id() para separar sus datos por usuario, sin depender de cómo se autentica.
-Fuera de una petición (hilos de fondo, pruebas) devuelve DEFAULT_USER_ID, salvo que se fije otro.
+server.py fija el usuario autenticado al empezar cada petición y lo limpia al terminar (finally).
+Los módulos consultan current_user_id() para separar sus datos por usuario.
+
+Sin contexto NO hay usuario: current_user_id() lanza NoUserContext. Así una ruta o un hilo de fondo
+que olvide fijarlo falla de forma visible en vez de actuar como otro usuario (o como propietario).
+Hilos de fondo y pruebas usan `with as_user(id, rol): ...` con el usuario dueño de cada dato.
 """
 from __future__ import annotations
 
 import threading
 
-DEFAULT_USER_ID = 1           # instalación de un solo usuario / datos anteriores a las cuentas
+LEGACY_USER_ID = 1            # dueño de los datos anteriores a las cuentas (se reasignan al primer propietario)
 _local = threading.local()
+
+
+class NoUserContext(RuntimeError):
+    """Se pidió el usuario actual fuera de una petición autenticada o de un `as_user`."""
 
 
 def set_current(user_id: int | None, role: str | None = None) -> None:
@@ -23,12 +30,18 @@ def clear() -> None:
 
 def current_user_id() -> int:
     uid = getattr(_local, "user_id", None)
-    return DEFAULT_USER_ID if uid is None else uid
+    if uid is None:
+        raise NoUserContext("No hay un usuario en el contexto de esta petición")
+    return uid
 
 
-def current_role() -> str:
-    """'owner' (propietario: administra catálogo, reglas y usuarios) o 'member'."""
-    return getattr(_local, "role", None) or "owner"
+def current_role() -> str | None:
+    """'owner' (propietario: administra catálogo, reglas y usuarios), 'member' o None sin contexto."""
+    return getattr(_local, "role", None)
+
+
+def is_owner() -> bool:
+    return current_role() == "owner"
 
 
 class as_user:
