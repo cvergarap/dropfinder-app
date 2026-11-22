@@ -623,6 +623,12 @@ class PublishTest(Base):
         seed = self.fake.put_product(HOST, sku="DF-1", tags=[{"name": "DropFinder"}, {"name": "DFI AB12CD34"}])
         ref = self.conn().publish(self.product(image_urls=[], tags=["dropfinder", "dfi-ab12cd34"]))
         self.assertEqual(ref.external_id, str(seed["id"]))
+        self.fake.stores[HOST]["products"].clear()                                   # solo por nombre / solo por slug
+        by_name = self.fake.put_product(HOST, sku="DF-1", tags=[{"name": "dropfinder", "slug": "zz1"}, {"name": "dfi-ab12cd34", "slug": "zz2"}])
+        self.assertEqual(self.conn().publish(self.product(image_urls=[])).external_id, str(by_name["id"]))
+        self.fake.stores[HOST]["products"].clear()
+        by_slug = self.fake.put_product(HOST, sku="DF-1", tags=[{"name": "Etiqueta A", "slug": "dropfinder"}, {"name": "Etiqueta B", "slug": "dfi-ab12cd34"}])
+        self.assertEqual(self.conn().publish(self.product(image_urls=[])).external_id, str(by_slug["id"]))
 
     def test_trashed_product_with_our_sku_is_not_adopted(self):
         self.seed(status="trash")
@@ -848,11 +854,25 @@ class PublishTest(Base):
         self.assertLessEqual(max(self.sleeps), 1.5)
         self.assertLessEqual(sum(self.sleeps), 3.0)
 
+    def test_cleanup_sleep_budget_with_many_tries(self):
+        self.fake.inject("http500", op="update")
+        self.fake.inject("http429", op="delete", count=50, retry_after=1)
+        with mock.patch.object(woocommerce, "CLEANUP_TRIES", 12):
+            with self.assertRaises(StoreError):
+                self.conn().publish(self.product(active=True))
+        self.assertLessEqual(sum(self.sleeps), woocommerce.CLEANUP_SLEEP_BUDGET)
+        self.assertGreater(len(self.fake.requests_for("delete")), 2)
+
     def test_cleanup_respects_total_deadline(self):
         self.fake.inject("http500", op="update")
-        with mock.patch.object(woocommerce, "CLEANUP_DEADLINE", 0.0):
-            with self.assertRaises(StoreError) as cm:
-                self.conn().publish(self.product(active=True))
+        calls = []
+        real = shttp.request_json
+        with mock.patch.object(woocommerce.shttp, "request_json",
+                               lambda m, *a, **k: (calls.append(m), real(m, *a, **k))[1]):
+            with mock.patch.object(woocommerce, "CLEANUP_DEADLINE", 0.0):
+                with self.assertRaises(StoreError) as cm:
+                    self.conn().publish(self.product(active=True))
+        self.assertNotIn("DELETE", calls)
         self.assertEqual(self.fake.requests_for("delete"), [])
         self.assertTrue(hasattr(cm.exception, "orphan_external_id"))
 
@@ -1024,6 +1044,16 @@ class DeleteTest(Base):
             self.conn().delete(ListingRef(external_id="5"))
         self.assertNotIsInstance(cm.exception, StoreNotFound)
 
+    def test_delete_step_route_404_is_not_success(self):
+        p = self.seed()
+        for kind in ("route404", "http404"):
+            self.fake.injections.clear()
+            self.fake.inject(kind, op="delete")
+            with self.assertRaises(StoreValidationError) as cm:
+                self.conn().delete(self.ref(p))
+            self.assertNotIsInstance(cm.exception, StoreNotFound)
+        self.assertEqual(self.count(), 1)
+
     def test_delete_html_404_is_not_success(self):
         self.fake.inject("http404", op="get", html=True, code="")
         with self.assertRaises(StoreError) as cm:
@@ -1102,9 +1132,9 @@ class ErrorMappingTest(Base):
     def test_foreign_error_bodies_are_not_echoed_raw(self):
         e = self.check("http500", StoreError, html=True)
         self.assertNotIn("Error 500", str(e))                       # el HTML de un sitio ajeno no se refleja
-        e = self.check("http400", StoreValidationError, message="m" * 1000, code="x")
+        e = self.check("http400", StoreValidationError, message="palabra " * 200, code="x")
         self.assertLess(len(str(e)), 120 + 120)
-        self.assertNotIn("m" * 121, str(e))
+        self.assertNotIn("palabra " * 16, str(e))
         e = self.check("http400", StoreValidationError, message="<b>hola</b> <script>x()</script>", code="x")
         self.assertNotIn("<", str(e))
 
@@ -1188,9 +1218,10 @@ class SecretsTest(Base):
         """Defensa en profundidad: aunque el scrub genérico no reconociera la forma, el conector quita sus secretos."""
         from store_connectors import base
         with mock.patch.object(base, "_TOKEN_RE", re.compile(r"(?!x)x")):
-            out = self.conn()._text(f"a {CK} b {CS} c Basic {BASIC} d {BASIC} e")
-            self.leak_check(out)
-            self.assertIn("a", out)
+            for raw in (CK, CS, f"Basic {BASIC}", BASIC, f"x {BASIC} y {CK}"):          # (_text acorta a 120: se prueba la capa entera)
+                out = self.conn()._redact(raw)
+                self.leak_check(out)
+                self.assertIn("••••", out)
             self.fake.inject("http400", op="list", message=f"x {CK} {CS} {BASIC} Basic {BASIC}")
             with self.assertRaises(StoreError) as cm:
                 self.conn().validate()
@@ -1332,8 +1363,8 @@ CONNECTOR = "backend/store_connectors/woocommerce.py"
 MUTANTS = [
     ("draft_always", '"type": "simple", "status": "draft"', '"type": "simple", "status": "publish"'),
     ("draft_removed", '"type": "simple", "status": "draft", "sku": sku', '"type": "simple", "sku": sku'),
-    ("no_sku_lookup", "existing = self._find_by_sku(sku)\n        adopted = existing is not None",
-     "existing = None\n        adopted = False"),
+    ("no_sku_lookup", "        existing = self._find_by_sku(sku)\n        if existing is not None:",
+     "        existing = None\n        if existing is not None:"),
     ("sku_exists_not_adopted", 'if getattr(e, "wc_code", "") not in SKU_EXISTS_CODES:', "if True:"),
     ("sku_exists_other_code", 'SKU_EXISTS_CODES = ("woocommerce_rest_product_sku_already_exists", "product_invalid_sku")',
      'SKU_EXISTS_CODES = ("product_invalid_sku",)'),
@@ -1343,14 +1374,16 @@ MUTANTS = [
     ("price_half_up", "rounding=ROUND_HALF_UP)", "rounding=ROUND_HALF_EVEN)"),
     ("route404_as_notfound", "if code in PRODUCT_NOT_FOUND_CODES and ref_op:", "if st == 404 and ref_op:"),
     ("product404_any_notfound", "if code in PRODUCT_NOT_FOUND_CODES and ref_op:", "if (code in PRODUCT_NOT_FOUND_CODES or not code) and ref_op:"),
-    ("route_missing_is_success_on_delete", "        except StoreNotFound:\n            return\n",
-     "        except (StoreNotFound, StoreValidationError):\n            return\n"),
+    ("route_missing_is_success_on_delete", 'self._call("DELETE", f"/products/{pid}", query={"force": "true"}, ref_op=True)\n        except StoreNotFound:',
+     'self._call("DELETE", f"/products/{pid}", query={"force": "true"}, ref_op=True)\n        except (StoreNotFound, StoreValidationError):'),
+    ("route_missing_is_success_on_get", 'prod = self._call("GET", f"/products/{pid}", ref_op=True)\n        except StoreNotFound:',
+     'prod = self._call("GET", f"/products/{pid}", ref_op=True)\n        except (StoreNotFound, StoreValidationError):'),
     ("no_header_secret_scrub", "out += [header, header[len(\"Basic \"):]]", "pass"),
     ("no_secret_scrub", "return _plain(text, self._secrets())", "return _plain(text, ())"),
     ("secrets_in_url", 'headers={"Authorization": self._auth_header()}', 'headers={"Authorization": self._auth_header(), "X-K": self.credentials["consumer_key"]}'),
     ("creds_in_query", "url = self.BASE_URL_TEMPLATE.format(host=self._host()) + prefix + path\n        if query:",
      "url = self.BASE_URL_TEMPLATE.format(host=self._host()) + prefix + path\n        query = {**(query or {}), 'consumer_key': self.credentials['consumer_key']}\n        if query:"),
-    ("force_missing", 'query={"force": "true"}, ref_op=True)\n                return', 'ref_op=True)\n                return'),
+    ("force_missing", 'query={"force": "true"}, ref_op=True,\n                           limits', 'ref_op=True,\n                           limits'),
     ("delete_force_missing", 'self._call("DELETE", f"/products/{pid}", query={"force": "true"}, ref_op=True)\n        except StoreNotFound:\n            return',
      'self._call("DELETE", f"/products/{pid}", ref_op=True)\n        except StoreNotFound:\n            return'),
     ("images_allow_http", 'if p.scheme != "https" or "." not in host', 'if p.scheme not in ("https", "http") or "." not in host'),
@@ -1385,7 +1418,7 @@ MUTANTS = [
     ("cleanup_unbounded_none", "for attempt in range(CLEANUP_TRIES):", "for attempt in range(1):"),
     ("cleanup_no_orphan_id", "original.orphan_external_id = pid", "pass"),
     ("cleanup_adopted", "if not adopted:\n                self._cleanup_orphan(pid, e)", "if True:\n                self._cleanup_orphan(pid, e)"),
-    ("update_no_manage_stock", 'body = {"regular_price": p, "manage_stock": True, "stock_quantity": n}', 'body = {"regular_price": p, "stock_quantity": n}'),
+    ("update_no_manage_stock", 'payload={"regular_price": p, "manage_stock": True, "stock_quantity": n},', 'payload={"regular_price": p, "stock_quantity": n},'),
     ("price_as_float", 'body = {"name": title, "type": "simple", "status": "draft", "sku": sku, "regular_price": price,',
      'body = {"name": title, "type": "simple", "status": "draft", "sku": sku, "regular_price": float(price),'),
     ("description_unescaped", 'html.escape(p, quote=True).replace("\\n", "<br>")', 'p.replace("\\n", "<br>")'),
@@ -1401,7 +1434,7 @@ MUTANTS = [
     ("status_any_dropped", 'query={"sku": sku, "status": "any"}', 'query={"sku": sku}'),
     ("credentials_shape", "if not _KEY_RE.fullmatch(k):", "if False:"),
     ("check_secret_shape", "if not _SECRET_RE.fullmatch(s):", "if False:"),
-    ("empty_sku_allowed", "or not sku.strip() or sku != sku.strip()", "or sku != sku.strip()"),
+    ("empty_sku_allowed", '{1,255}$")      # sin comas', '{0,255}$")      # sin comas'),
     ("validation_after_call", "        existing = self._find_by_sku(sku)\n        adopted", "        existing = self._find_by_sku(sku)\n        adopted"),
     ("stock_negative", "if n < 0 or n > MAX_STOCK:", "if n > MAX_STOCK:"),
     ("title_empty", 'if not title:\n            raise StoreValidationError("El producto necesita un título")', "pass"),
@@ -1411,7 +1444,8 @@ MUTANTS = [
      "                adopted = True"),
     ("tags_match_any", "if not tags_match(self._tag_names(existing), [t[\"name\"] for t in tags]):",
      "if not set(x.lower() for x in self._tag_names(existing)) & set(t['name'].lower() for t in tags):"),
-    ("tags_match_names_only", 'out += [t[k] for k in ("name", "slug") if isinstance(t.get(k), str)]', 'out += [t[k] for k in ("slug",) if isinstance(t.get(k), str)]'),
+    ("tags_slug_only", 'out += [t[k] for k in ("name", "slug") if isinstance(t.get(k), str)]', 'out += [t[k] for k in ("slug",) if isinstance(t.get(k), str)]'),
+    ("tags_name_only", 'out += [t[k] for k in ("name", "slug") if isinstance(t.get(k), str)]', 'out += [t[k] for k in ("name",) if isinstance(t.get(k), str)]'),
     ("delete_without_ownership", "if OWN_TAG not in names or not any(", "if False and not any("),
     ("delete_only_generic_tag", "if OWN_TAG not in names or not any(n.startswith(INSTALL_TAG_PREFIX) and len(n) > len(INSTALL_TAG_PREFIX) for n in names):",
      "if OWN_TAG not in names:"),

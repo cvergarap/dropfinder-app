@@ -118,7 +118,8 @@ class FakeWooCommerce:
         out = []
         for i, t in enumerate(tags or []):
             name = t["name"] if isinstance(t, dict) else str(t)
-            out.append({"id": 10 + i, "name": name, "slug": re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")})
+            slug = t.get("slug") if isinstance(t, dict) and t.get("slug") else re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+            out.append({"id": 10 + i, "name": name, "slug": slug})
         return out
 
     # ------------------------------------------------------------ HTTP
