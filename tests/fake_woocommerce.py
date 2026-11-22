@@ -202,6 +202,8 @@ class FakeWooCommerce:
         except ValueError:
             rec["body"] = {"__invalid_json__": True}
         op, route = self._classify(h.command, m, st)
+        if op == "list" and "sku" in query:
+            op = "find_sku"
         rec["op"] = op
         with self.lock:
             self.requests.append(rec)
@@ -263,7 +265,7 @@ class FakeWooCommerce:
                 return self._err(403, "woocommerce_rest_cannot_view", "Sin permiso.")
             return 200, {"settings": {"currency": st["currency"]}}, {}
         products = st["products"]
-        if op == "list":
+        if op in ("list", "find_sku"):
             return self._list(rec["query"], products)
         pid = int(route.rsplit("/", 1)[1]) if route.startswith("/products/") else None
         if op == "create":

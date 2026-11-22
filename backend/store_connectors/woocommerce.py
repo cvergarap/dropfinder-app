@@ -91,7 +91,7 @@ _KEY_RE = re.compile(r"^ck_[A-Za-z0-9]{16,80}$")
 _SECRET_RE = re.compile(r"^cs_[A-Za-z0-9]{16,80}$")
 _ID_RE = re.compile(r"^[1-9]\d{0,17}$")
 _LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
-_TLD_RE = re.compile(r"^(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})$")
+_TLD_RE = re.compile(r"^[a-z]{2,63}$")          # los TLD IDN reales son no latinos (rechazados de todos modos)
 _SCHEME_RE = re.compile(r"^([a-z][a-z0-9+.-]*)://", re.I)
 _TAG_RE = re.compile(r"<[^>]*>")
 _RESERVED_TLDS = {"localhost", "local", "internal", "localdomain", "lan", "home", "corp", "intranet", "invalid", "test",
@@ -214,6 +214,13 @@ class _Creds(dict):
 
 
 # ---------------------------------------------------------------- dominio
+def _latin_accented(ch: str) -> bool:
+    """Letra latina minúscula con tilde/diéresis/ñ (a + marca combinante). Rechaza ı, ſ, ß, ø, æ…, que se parecen a
+    otras letras o no se pueden validar contra homógrafos."""
+    d = unicodedata.normalize("NFD", ch)
+    return len(d) > 1 and "a" <= d[0] <= "z" and all(unicodedata.combining(c) for c in d[1:])
+
+
 def _label_to_ascii(label: str, bad: StoreValidationError) -> str:
     """Una etiqueta del dominio a ASCII. Unicode solo si son letras LATINAS (con tildes/ñ), NFC y la conversión a
     punycode vuelve exactamente a la misma etiqueta. Cirílico, griego, ancho completo, CJK… se rechazan: no se pueden
@@ -228,7 +235,7 @@ def _label_to_ascii(label: str, bad: StoreValidationError) -> str:
                 if not (ch.isalnum() or ch == "-"):
                     raise bad
                 continue
-            if not unicodedata.name(ch, "").startswith("LATIN SMALL LETTER "):
+            if not _latin_accented(ch):
                 raise bad
         try:
             ascii_label = label.encode("idna").decode("ascii")
@@ -246,7 +253,7 @@ def _label_to_ascii(label: str, bad: StoreValidationError) -> str:
         if decoded.isascii():                              # xn-- de algo que no necesita punycode: truco
             raise bad
         for ch in decoded:                                 # el punycode también debe ser solo latino
-            if not ch.isascii() and not unicodedata.name(ch, "").startswith("LATIN SMALL LETTER "):
+            if not ch.isascii() and not _latin_accented(ch):
                 raise bad
             if ch.isascii() and not (ch.isalnum() or ch == "-"):
                 raise bad
@@ -314,7 +321,7 @@ class WooCommerceConnector(StoreConnector):
                 raise bad
             s = s[m.end():]
         authority = re.split(r"[/?#]", s, maxsplit=1)[0]
-        if not authority or "@" in authority or "[" in authority or "]" in authority:
+        if not authority or "@" in s or "[" in authority or "]" in authority:
             raise bad
         host = authority
         if ":" in authority:
@@ -323,6 +330,8 @@ class WooCommerceConnector(StoreConnector):
                 raise bad
             if int(port) != 443:
                 raise StoreValidationError("Solo se admiten tiendas con HTTPS estándar (puerto 443): quita el puerto del dominio")
+        if any(not c.isascii() and c.lower().isascii() for c in host):        # K (Kelvin) -> k, etc.: lookalike
+            raise bad
         host = host.lower()
         if not host or len(host) > 253 or host.startswith(".") or host.endswith(".") or ".." in host:
             raise bad
@@ -432,7 +441,8 @@ class WooCommerceConnector(StoreConnector):
             detail = self._text(data.get("message", ""))
         else:
             detail = self._text(resp.body.decode("utf-8", "replace") if resp.body else "")
-        code = self._redact(code)
+        if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,100}", code):       # el code solo se compara: nunca se muestra ni se confía
+            code = ""
         extra = f" Detalle de la tienda: {detail}" if detail else ""
         if st in (401, 403):
             return StoreAuthError(f"WooCommerce rechazó las credenciales o los permisos (HTTP {st}). {AUTH_HINT}.{extra}")
@@ -481,13 +491,21 @@ class WooCommerceConnector(StoreConnector):
         try:
             data = self._call("GET", "/settings/general/woocommerce_currency")
             cur = data.get("value") if isinstance(data, dict) else None
-        except (StoreAuthError, StoreValidationError):
+        except StoreAuthError:
+            cur = None
+        except StoreValidationError as e:
+            if not hasattr(e, "wc_code"):                    # HTML, no JSON, redirección…: no es "falta de permiso/ruta"
+                raise
             cur = None
         if not (isinstance(cur, str) and re.fullmatch(r"[A-Za-z]{3}", cur.strip())):
             try:
                 data = self._call("GET", "/system_status")
                 cur = ((data.get("settings") or {}).get("currency")) if isinstance(data, dict) else None
-            except (StoreAuthError, StoreValidationError):
+            except StoreAuthError:
+                cur = None
+            except StoreValidationError as e:
+                if not hasattr(e, "wc_code"):
+                    raise
                 cur = None
         if not (isinstance(cur, str) and re.fullmatch(r"[A-Za-z]{3}", cur.strip())):
             raise StoreValidationError("No se pudo leer la moneda de la tienda: la clave necesita permiso para ver los "
