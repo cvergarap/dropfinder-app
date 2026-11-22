@@ -297,6 +297,15 @@ _IMP_SQL = ("SELECT i.id, i.title, i.sell_price, p.id AS pid, p.category, p.stoc
             "p.shipping_cost FROM imported_products i JOIN products p ON p.id = i.product_id")
 
 
+MAX_ID = 2 ** 63 - 1                 # SQLite no admite enteros mayores: sin esto sería un 500 (OverflowError)
+
+
+def _chk_id(n: int) -> int:
+    if not (0 < n <= MAX_ID):
+        raise ApiError(404, "No encontrado")
+    return n
+
+
 def _ids_from(body: dict, key: str = "imported_ids") -> list[int]:
     raw = body.get(key) if isinstance(body, dict) else None
     if not isinstance(raw, list) or not raw:
@@ -305,8 +314,8 @@ def _ids_from(body: dict, key: str = "imported_ids") -> list[int]:
         raise ApiError(400, f"Máximo {PUBLISH_MAX_IDS} productos por solicitud")
     ids: list[int] = []
     for v in raw:
-        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
-            raise ApiError(400, "imported_ids debe ser una lista de números")
+        if isinstance(v, bool) or not isinstance(v, int) or not (0 < v <= MAX_ID):
+            raise ApiError(400, "imported_ids debe ser una lista de números válidos")
         if v not in ids:
             ids.append(v)
     return ids
@@ -314,6 +323,7 @@ def _ids_from(body: dict, key: str = "imported_ids") -> list[int]:
 
 def publish(cid: int, body: dict) -> dict:
     uid = _uid()
+    _chk_id(cid)
     if not isinstance(body, dict):
         raise ApiError(400, "Cuerpo inválido")
     ids = _ids_from(body)
@@ -333,9 +343,6 @@ def publish(cid: int, body: dict) -> dict:
         existing = {r["imported_id"] for r in conn.execute(
             f"SELECT imported_id FROM store_listings WHERE connection_id = ? AND user_id = ? "
             f"AND imported_id IN ({','.join('?' * len(ids))})", [cid, uid, *ids])}
-        recent = conn.execute("SELECT COUNT(*) FROM store_jobs WHERE user_id = ? AND action = 'publish' "
-                              "AND created_at >= ?", (uid, _ts(datetime.now(timezone.utc) - timedelta(seconds=60)))
-                              ).fetchone()[0]
     skipped, todo = [], []
     for iid in ids:
         imp = imps.get(iid)
@@ -356,13 +363,21 @@ def publish(cid: int, body: dict) -> dict:
                 skipped.append({"imported_id": iid, "reason": reason, "message": msg})
             else:
                 todo.append((iid, imp, payload))
-    if todo and recent + len(todo) > PUBLISH_PER_MINUTE:
-        raise ApiError(429, f"Demasiadas publicaciones seguidas (máximo {PUBLISH_PER_MINUTE} por minuto). "
-                            "Espera un momento.", "publish_rate_limited")
     queued = []
     if todo:
         with db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            # Ventana deslizante persistida por usuario (meta), en la MISMA transacción que el encolado: no depende de
+            # los anuncios/trabajos (que se pueden borrar) ni tiene carrera entre peticiones paralelas.
+            key, t0 = f"ss:pub:{uid}", time.time()
+            row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+            try:
+                stamps = [x for x in json.loads(row[0]) if t0 - x < 60] if row else []
+            except (ValueError, TypeError):
+                stamps = []
+            if len(stamps) + len(todo) > PUBLISH_PER_MINUTE:
+                raise ApiError(429, f"Demasiadas publicaciones seguidas (máximo {PUBLISH_PER_MINUTE} por minuto). "
+                                    "Espera un momento.", "publish_rate_limited")
             for iid, imp, payload in todo:
                 try:
                     cur = conn.execute(
@@ -377,6 +392,8 @@ def publish(cid: int, body: dict) -> dict:
                 _log(conn, uid, cid, cur.lastrowid, "publish", True,
                      f"Publicación en cola: «{imp['title'][:80]}»" + (" (borrador)" if as_draft else ""))
                 queued.append({"listing_id": cur.lastrowid, "imported_id": iid})
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                         (key, json.dumps(stamps + [t0] * len(queued))))
         _kick()
     return {"queued": queued, "skipped": skipped}
 
@@ -413,6 +430,8 @@ def listings_for_imports(qs: dict) -> dict:
         ids = [int(x) for x in raw.split(",") if x.strip()]
     except ValueError:
         raise ApiError(400, "imported_ids inválido") from None
+    if any(not (0 < i <= MAX_ID) for i in ids):
+        raise ApiError(400, "imported_ids inválido")
     if len(ids) > 200:
         raise ApiError(400, "Máximo 200 ids")
     if not ids:
@@ -433,6 +452,7 @@ def _int_qs(qs, key, default, lo, hi) -> int:
 
 def store_listings(cid: int, qs: dict) -> dict:
     uid = _uid()
+    _chk_id(cid)
     status = (qs.get("status") or [""])[0]
     if status and status not in ("pending", "published", "hidden", "error", "removed"):
         raise ApiError(400, "Estado inválido")
@@ -453,6 +473,7 @@ def store_listings(cid: int, qs: dict) -> dict:
 
 def store_log(cid: int, qs: dict) -> dict:
     uid = _uid()
+    _chk_id(cid)
     limit = _int_qs(qs, "limit", 50, 1, 200)
     with db.connect() as conn:
         if not stores_mod.get_connection(conn, uid, cid):
@@ -466,8 +487,14 @@ def store_log(cid: int, qs: dict) -> dict:
 def queue_state() -> dict:
     uid = _uid()
     with db.connect() as conn:
-        c = dict(conn.execute("SELECT status, COUNT(*) FROM store_jobs WHERE user_id = ? GROUP BY status", (uid,)))
-    return {"pending": c.get("pending", 0), "running": c.get("running", 0), "failed": c.get("failed", 0)}
+        c = dict(conn.execute("SELECT status, COUNT(*) FROM store_jobs WHERE user_id = ? AND status IN "
+                              "('pending', 'running') GROUP BY status", (uid,)))
+        # `failed` solo cuenta lo que sigue pendiente de atender: el último trabajo del anuncio (si un reintento
+        # posterior funcionó, el fallo viejo ya no cuenta)
+        failed = conn.execute(
+            "SELECT COUNT(*) FROM store_jobs j WHERE j.user_id = ? AND j.status = 'failed' AND NOT EXISTS "
+            "(SELECT 1 FROM store_jobs n WHERE n.listing_id = j.listing_id AND n.id > j.id)", (uid,)).fetchone()[0]
+    return {"pending": c.get("pending", 0), "running": c.get("running", 0), "failed": failed}
 
 
 # ---------------------------------------------------------------- acciones del usuario sobre un anuncio
@@ -479,6 +506,7 @@ def _need_remote(r, what: str) -> None:
 
 def listing_action(lid: int, action: str) -> dict:
     uid = _uid()
+    _chk_id(lid)
     with db.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         r = _own_listing(conn, lid, uid)
@@ -555,6 +583,7 @@ def _retry(conn, r, uid: int) -> None:
 
 def delete_listing(lid: int, qs: dict) -> dict:
     uid = _uid()
+    _chk_id(lid)
     remove_remote = (qs.get("remove_remote") or ["0"])[0] == "1"
     with db.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -585,8 +614,13 @@ def _drop_listing(conn, lid: int) -> None:
     conn.execute("DELETE FROM meta WHERE key IN (?, ?)", (f"ss:base:{lid}", f"ss:prev:{lid}"))
 
 
+SYNC_NOW_LIMIT = 5                  # llamadas a la tienda dentro de una petición HTTP; el resto lo hace el hilo
+
+
 def sync_now() -> dict:
-    return run_due_jobs(user_id=_uid(), limit=25)
+    res = run_due_jobs(user_id=_uid(), limit=SYNC_NOW_LIMIT)
+    _kick()                                  # lo que quede lo procesa el hilo de fondo
+    return res
 
 
 # ---------------------------------------------------------------- ejecución de trabajos
@@ -1125,6 +1159,8 @@ def prune(now: datetime | None = None) -> dict:
 
 # ---------------------------------------------------------------- reglas automáticas (hook del catálogo)
 
+HOOK_SQL_IDS = 2000                  # hasta aquí se filtra por p.id IN (…) en SQL (trozos de 500)
+
 _RULE_SQL = (
     "SELECT l.id AS lid, l.user_id, l.connection_id, l.status, l.last_price, l.last_stock, l.title AS ltitle, "
     "l.hidden_by_rule, l.currency AS lcur, i.id AS imp_id, p.id AS pid, p.cost, p.shipping_cost, p.stock, c.settings AS settings, "
@@ -1143,8 +1179,17 @@ def _on_catalog_write(conn, ids) -> None:
             return
     except sqlite3.OperationalError:             # base sin las tablas de tiendas (esquema anterior a v7)
         return
-    wanted = None if ids is None else {int(i) for i in ids}
-    rows = [r for r in conn.execute(_RULE_SQL) if wanted is None or r["pid"] in wanted]
+    if ids is None:
+        rows = conn.execute(_RULE_SQL).fetchall()
+    else:
+        wanted = {int(i) for i in ids}
+        if len(wanted) <= HOOK_SQL_IDS:        # pocos ids: se filtra en SQL (usa el índice de la clave primaria)
+            lst, rows = sorted(wanted), []
+            for k in range(0, len(lst), 500):
+                chunk = lst[k:k + 500]
+                rows += conn.execute(_RULE_SQL + f" AND p.id IN ({','.join('?' * len(chunk))})", chunk).fetchall()
+        else:                                  # cargas enormes: un solo recorrido de anuncios y filtro en Python
+            rows = [r for r in conn.execute(_RULE_SQL) if r["pid"] in wanted]
     _evaluate(conn, rows)
 
 

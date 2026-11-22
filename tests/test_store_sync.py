@@ -1336,6 +1336,159 @@ class PerformanceTest(Base):
         self.assertLess(dt, 1.0)
 
 
+class ReviewMinorsTest(Base):
+    seed = 60
+
+    def test_rate_limit_survives_deleting_listings(self):
+        store = self.connect()
+        ids = [self.imp(source="mock") for _ in range(52)]
+        store_sync.publish(store["id"], {"imported_ids": ids[:50], "allow_demo": True})
+        for item in store_sync.store_listings(store["id"], {"page_size": ["100"]})["items"]:
+            store_sync.delete_listing(item["id"], {})
+        with self.assertRaises(ApiError) as cm:
+            store_sync.publish(store["id"], {"imported_ids": ids[50:], "allow_demo": True})
+        self.assertEqual(cm.exception.code, "publish_rate_limited")
+
+    def test_rate_limit_window_slides(self):
+        store = self.connect()
+        ids = [self.imp(source="mock") for _ in range(52)]
+        store_sync.publish(store["id"], {"imported_ids": ids[:50], "allow_demo": True})
+        real = time.time
+        store_sync.time.time = lambda: real() + 61                         # pasó un minuto
+        try:
+            self.assertEqual(len(store_sync.publish(store["id"], {"imported_ids": ids[50:], "allow_demo": True})["queued"]), 2)
+        finally:
+            store_sync.time.time = real
+
+    def test_huge_integers_are_400_or_404_not_500(self):
+        store = self.connect()
+        big = 2 ** 70
+        for call, status in ((lambda: store_sync.publish(store["id"], {"imported_ids": [big]}), 400),
+                             (lambda: store_sync.publish(big, {"imported_ids": [1]}), 404),
+                             (lambda: store_sync.listings_for_imports({"imported_ids": [str(big)]}), 400),
+                             (lambda: store_sync.store_listings(big, {}), 404),
+                             (lambda: store_sync.store_log(big, {}), 404),
+                             (lambda: store_sync.listing_action(big, "hide"), 404),
+                             (lambda: store_sync.delete_listing(big, {}), 404)):
+            with self.assertRaises(ApiError) as cm:
+                call()
+            self.assertEqual(cm.exception.status, status)
+
+    def test_sync_now_processes_at_most_five(self):
+        store = self.connect()
+        store_sync.publish(store["id"], {"imported_ids": [self.imp() for _ in range(8)]})
+        self.assertEqual(store_sync.sync_now(), {"processed": 5, "failed": 0})
+        self.assertEqual(store_sync.queue_state()["pending"], 3)
+
+    def test_failed_count_ignores_failures_already_superseded_by_a_retry(self):
+        store = self.connect()
+        r = store_sync.publish(store["id"], {"imported_ids": [self.imp()]})
+        lid = r["queued"][0]["listing_id"]
+        FakeStore.fail_next.append(sc.StoreValidationError("no"))
+        store_sync.run_due_jobs()
+        self.assertEqual(store_sync.queue_state()["failed"], 1)
+        store_sync.listing_action(lid, "retry")
+        store_sync.run_due_jobs()
+        self.assertEqual(self.listing(lid)["status"], "hidden")
+        self.assertEqual(store_sync.queue_state(), {"pending": 0, "running": 0, "failed": 0})
+
+    def test_exceptions_are_logged_without_foreign_messages_or_tracebacks(self):
+        store = self.connect()
+        store_sync.publish(store["id"], {"imported_ids": [self.imp()]})
+        FakeStore.fail_next.append(RuntimeError("token shpat_abcdef0123456789abcdef revocado"))
+        with self.assertLogs("dropfinder.store_sync", level="ERROR") as cm:
+            store_sync.run_due_jobs()
+        text = " ".join(cm.output)
+        self.assertNotIn("shpat_", text)
+        self.assertNotIn("Traceback", text)
+        self.assertTrue(all(r.exc_info is None for r in cm.records))
+
+    def test_hook_filters_in_sql_with_5000_listings(self):
+        store = self.connect()
+        n = 5000
+        with db.connect() as conn:
+            base = conn.execute("SELECT COALESCE(MAX(id), 0) FROM products").fetchone()[0]
+            conn.executemany(
+                "INSERT INTO products(id, supplier, supplier_sku, source, title, category, image, cost, shipping_cost, "
+                "shipping_days, warehouse, stock, orders, orders_7d, orders_prev_7d, rating, reviews, updated_at) "
+                "VALUES (?, 'P', ?, 'csv', 'Prod', 'Hogar', '', 10, 0, 7, 'CN', 5, 0, 0, 0, 4, 1, 'x')",
+                ((base + i, f"S{i}") for i in range(1, n + 1)))
+            conn.executemany("INSERT INTO imported_products(id, user_id, product_id, title, sell_price, last_cost, "
+                             "last_stock, created_at) VALUES (?, 1, ?, 'Prod', 20, 10, 5, 'x')",
+                             ((1000 + i, base + i) for i in range(1, n + 1)))
+            conn.executemany("INSERT INTO store_listings(user_id, imported_id, product_id, connection_id, title, status, "
+                             "external_id, last_price, last_stock, created_at) VALUES (1, ?, ?, ?, 'Prod', 'published', ?, 20, 5, 'x')",
+                             ((1000 + i, base + i, store["id"], str(i)) for i in range(1, n + 1)))
+            conn.execute("UPDATE products SET stock = 0 WHERE id = ?", (base + 7,))
+            t = time.perf_counter()
+            for _ in range(50):
+                store_sync._on_catalog_write(conn, [base + 7])
+            one = (time.perf_counter() - t) / 50
+            t = time.perf_counter()
+            store_sync._on_catalog_write(conn, list(range(base + 1, base + 101)))
+            hundred = time.perf_counter() - t
+            queued = conn.execute("SELECT COUNT(*) FROM store_jobs").fetchone()[0]
+        print(f"\n[hook 5000 anuncios: 1 id {one * 1000:.1f} ms/llamada, 100 ids {hundred * 1000:.1f} ms]", file=sys.stderr)
+        self.assertEqual(queued, 2)                                         # hide + sync solo del producto 7
+        self.assertLess(one, 0.01)
+
+
+class MutationSurvivorsTest(Base):
+    """Pruebas de las 5 mutaciones que sobrevivían en la revisión de PR #12."""
+
+    def test_normal_pass_recovers_expired_leases(self):
+        store = self.connect()
+        r = store_sync.publish(store["id"], {"imported_ids": [self.imp()]})
+        lid = r["queued"][0]["listing_id"]
+        with db.connect() as conn:
+            conn.execute("UPDATE store_jobs SET status = 'running', attempts = 1, locked_until = ?",
+                         ((utc() - timedelta(hours=1)).isoformat(timespec="seconds"),))
+        store_sync.run_due_jobs()                                          # SOLO el pase normal, sin recover_stuck a mano
+        self.assertEqual((self.jobs(lid)[0]["status"], self.listing(lid)["status"]), ("done", "hidden"))
+
+    def test_sync_never_runs_before_its_publish(self):
+        store = self.connect()
+        r = store_sync.publish(store["id"], {"imported_ids": [self.imp()]})
+        lid = r["queued"][0]["listing_id"]
+        with db.connect() as conn:                                         # un sync con vencimiento ANTERIOR al publish
+            conn.execute("INSERT INTO store_jobs(user_id, listing_id, action, status, attempts, run_after, payload, "
+                         "created_at, updated_at) VALUES (1, ?, 'sync', 'pending', 0, '2000-01-01T00:00:00+00:00', '{}', 'x', 'x')",
+                         (lid,))
+        first = store_sync._claim(None, utc())
+        self.assertEqual(first["action"], "publish")
+        self.assertIsNone(store_sync._claim(None, utc()))                  # el sync espera a que termine el publish
+
+    def test_scrub_masks_what_the_regex_layer_does_not(self):
+        secret = "ck_0123456789abcdef01234567"                             # clave WooCommerce: solo la reconoce sc.scrub
+        out = store_sync.clean_message(f"fallo con {secret} en la tienda")
+        self.assertNotIn(secret, out)
+        self.assertIn("••••", out)
+
+    def test_rule_show_is_skipped_at_execution_if_not_hidden_by_rule_any_more(self):
+        store, iid, lid = self.published(as_draft=False, stock=10)
+        pid = self.pid_of(iid)
+        self.catalog_change(pid, stock=0)
+        store_sync.run_due_jobs()
+        self.assertEqual(self.listing(lid)["hidden_by_rule"], 1)
+        self.catalog_change(pid, stock=5)                                  # show por regla pendiente
+        self.assertIn("show", [j["action"] for j in self.jobs(lid, "pending")])
+        with db.connect() as conn:                                         # …y el usuario lo oculta a mano antes de ejecutarse
+            conn.execute("UPDATE store_listings SET hidden_by_rule = 0 WHERE id = ?", (lid,))
+        store_sync.run_due_jobs()
+        self.assertEqual((self.listing(lid)["status"], self.remote(lid)["active"]), ("hidden", False))
+
+    def test_mock_product_with_is_demo_0_is_still_excluded_from_rules(self):
+        store = self.connect()
+        iid = self.imp(source="mock")
+        r = store_sync.publish(store["id"], {"imported_ids": [iid], "allow_demo": True, "as_draft": False})
+        store_sync.run_due_jobs()
+        lid = r["queued"][0]["listing_id"]
+        with db.connect() as conn:
+            conn.execute("UPDATE store_listings SET is_demo = 0 WHERE id = ?", (lid,))
+        self.catalog_change(self.pid_of(iid), stock=0)
+        self.assertEqual(self.jobs(lid, "pending"), [])
+
+
 class IsolationTest(Base):
     def test_user_b_gets_404_everywhere(self):
         store, iid, lid = self.published(as_draft=False)
