@@ -980,6 +980,18 @@ class SecretsTest(Base):
             self.conn().validate()
         self.leak_check(str(cm.exception))
 
+    def test_own_scrub_layer_without_generic_patterns(self):
+        """Defensa en profundidad: aunque el scrub genérico no reconociera la forma, el conector quita sus secretos."""
+        from store_connectors import base
+        with mock.patch.object(base, "_TOKEN_RE", re.compile(r"(?!x)x")):
+            out = self.conn()._text(f"a {CK} b {CS} c Basic {BASIC} d {BASIC} e")
+            self.leak_check(out)
+            self.assertIn("a", out)
+            self.fake.inject("http400", op="list", message=f"x {CK} {CS} {BASIC} Basic {BASIC}")
+            with self.assertRaises(StoreError) as cm:
+                self.conn().validate()
+            self.leak_check(str(cm.exception))
+
     def test_secrets_scrubbed_from_html_body_errors(self):
         with mock.patch.object(woocommerce.shttp, "request_json") as rj:
             rj.return_value = shttp.Response(502, {}, f"<html><body>Bad gateway {CK} {CS} {BASIC}<script>x</script></body></html>".encode())
@@ -1122,8 +1134,8 @@ MUTANTS = [
     ("sku_exists_other_code", 'SKU_EXISTS_CODES = ("woocommerce_rest_product_sku_already_exists", "product_invalid_sku")',
      'SKU_EXISTS_CODES = ("product_invalid_sku",)'),
     ("price_zero_allowed", "if d < 0 or (d == 0 and not allow_zero):", "if d < 0:"),
-    ("price_unrounded_check", "d = d.quantize(Decimal(\"0.01\"), rounding=ROUND_HALF_UP)\n    if d < 0",
-     "if d < 0 or d.quantize(Decimal(\"0.01\")) < 0:\n        pass\n    d = d.quantize(Decimal(\"0.01\"), rounding=ROUND_HALF_UP)\n    if d < 0"),
+    ("price_checked_before_rounding", "    d = d.quantize(Decimal(\"0.01\"), rounding=ROUND_HALF_UP)\n    if d < 0 or (d == 0 and not allow_zero):\n        raise StoreValidationError(f\"El {what} debe ser mayor que cero\")",
+     "    if d < 0 or (d == 0 and not allow_zero):\n        raise StoreValidationError(f\"El {what} debe ser mayor que cero\")\n    d = d.quantize(Decimal(\"0.01\"), rounding=ROUND_HALF_UP)"),
     ("price_half_up", "rounding=ROUND_HALF_UP)", "rounding=ROUND_HALF_EVEN)"),
     ("route404_as_notfound", "if code in PRODUCT_NOT_FOUND_CODES and ref_op:", "if st == 404 and ref_op:"),
     ("product404_any_notfound", "if code in PRODUCT_NOT_FOUND_CODES and ref_op:", "if (code in PRODUCT_NOT_FOUND_CODES or not code) and ref_op:"),
@@ -1143,13 +1155,17 @@ MUTANTS = [
     ("images_max", "if len(out) >= MAX_IMAGES:", "if len(out) >= MAX_IMAGES + 5:"),
     ("domain_ip_decimal", "if not _TLD_RE.fullmatch(tld) or tld in _RESERVED_TLDS:", "if tld in _RESERVED_TLDS:"),
     ("domain_port_allowed", "if int(port) != 443:", "if False:"),
-    ("domain_userinfo", 'if not authority or "@" in authority or', "if not authority or"),
-    ("domain_trailing_dot", 'or host.startswith(".") or host.endswith(".")', 'or host.startswith(".")'),
+    ("domain_userinfo", 'if not authority or "@" in s or', "if not authority or"),
+    ("domain_userinfo_authority_only", 'if not authority or "@" in s or', 'if not authority or "@" in authority or'),
+    ("domain_trailing_dot", [('or host.startswith(".") or host.endswith(".") or ".." in host', 'or host.startswith(".") or ".." in host'),
+                             ("labels = [_label_to_ascii(lb, bad) for lb in host.split(\".\")]", "labels = [_label_to_ascii(lb, bad) for lb in host.rstrip(\".\").split(\".\")]")]),
+    ("domain_label_regex", "if len(ascii_label) > 63 or not _LABEL_RE.fullmatch(ascii_label):", "if len(ascii_label) > 63:"),
     ("domain_percent", 'c in "\\\\%"', 'c in "\\\\"'),
     ("domain_localhost_tld", '_RESERVED_TLDS = {"localhost", "local",', '_RESERVED_TLDS = {"local",'),
     ("domain_idna_latin_only", 'if not _latin_accented(ch):\n                raise bad\n        try:', 'pass\n        try:'),
     ("domain_idna_dotless", 'return len(d) > 1 and "a" <= d[0] <= "z"', 'return "a" <= d[0] <= "z" or ch in "ıſß"'),
-    ("domain_idna_roundtrip", "if ascii_label.encode(\"ascii\").decode(\"idna\") != label:\n                raise bad", "pass"),
+    ("domain_idna_roundtrip", "if decoded.encode(\"idna\").decode(\"ascii\") != ascii_label:\n                raise bad", "pass"),
+    ("domain_nameprep_ascii", 'if not ascii_label.startswith("xn--"):             # nameprep', 'if False:             # nameprep'),
     ("domain_no_dot", "if len(labels) < 2 or len(ascii_host) > 253:", "if len(ascii_host) > 253:"),
     ("retry_5xx_not_retryable", 'return StoreError(f"La tienda tuvo un error temporal (HTTP {st}).{extra}", retryable=True)',
      'return StoreError(f"La tienda tuvo un error temporal (HTTP {st}).{extra}", retryable=False)'),
@@ -1177,7 +1193,7 @@ MUTANTS = [
     ("ref_not_validated", "if not _ID_RE.fullmatch(pid):", "if False:"),
     ("adopt_deletes_nothing_but_skips_update", "            if adopted:                              # lo adoptado", "            if False:                              # lo adoptado"),
     ("find_exact_sku_filter", 'd.get("sku") == sku and d.get("type")', 'd.get("sku") is not None and d.get("type")'),
-    ("repr_leaks", 'return f"<WooCommerceConnector {self.domain}>"', 'return f"<WooCommerceConnector {self.domain} {self.credentials}>"'),
+    ("repr_leaks", 'return f"<WooCommerceConnector {self.domain}>"', 'return f"<WooCommerceConnector {self.domain} {dict(self.credentials)}>"'),
     ("creds_repr_leaks", 'return "<credenciales ocultas>"', "return dict.__repr__(self)"),
     ("basic_wrong_order", 'f"{k}:{s}".encode("utf-8")', 'f"{s}:{k}".encode("utf-8")'),
     ("validate_skips_products", 'prods = self._call("GET", "/products", query={"per_page": 1})', "prods = []"),
@@ -1195,7 +1211,7 @@ MUTANTS = [
 MUTANTS = [m for m in MUTANTS if m[0] != "validation_after_call"]       # (original == reemplazo: no es un mutante)
 
 
-def _run_mutant(root: str, name: str, old: str, new: str) -> tuple[str, str]:
+def _run_mutant(root: str, name: str, old, new=None) -> tuple[str, str]:
     """Devuelve (nombre, 'killed'|'SURVIVED'|'STALE')."""
     work = tempfile.mkdtemp(prefix="wcmut_")
     try:
@@ -1206,10 +1222,14 @@ def _run_mutant(root: str, name: str, old: str, new: str) -> tuple[str, str]:
         path = os.path.join(work, CONNECTOR)
         with open(path, encoding="utf-8") as f:
             src = f.read()
-        if src.count(old) != 1:
-            return name, f"STALE({src.count(old)})"
+        pairs = old if isinstance(old, list) else [(old, new)]
+        for o, _ in pairs:
+            if src.count(o) != 1:
+                return name, f"STALE({src.count(o)})"
+        for o, n in pairs:
+            src = src.replace(o, n)
         with open(path, "w", encoding="utf-8") as f:
-            f.write(src.replace(old, new))
+            f.write(src)
         env = {**os.environ, "DF_MUTATION": "", "PYTHONDONTWRITEBYTECODE": "1"}
         r = subprocess.run([sys.executable, "-m", "unittest", "test_woocommerce"], cwd=os.path.join(work, "tests"), env=env,
                            capture_output=True, text=True, timeout=600)

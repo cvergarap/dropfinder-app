@@ -228,9 +228,7 @@ def _label_to_ascii(label: str, bad: StoreValidationError) -> str:
     if label.isascii():
         ascii_label = label
     else:
-        if unicodedata.normalize("NFC", label) != label:
-            raise bad
-        for ch in label:
+        for ch in label:                                   # (las marcas combinantes sueltas no pasan: no son letras precompuestas)
             if ch.isascii():
                 if not (ch.isalnum() or ch == "-"):
                     raise bad
@@ -238,11 +236,11 @@ def _label_to_ascii(label: str, bad: StoreValidationError) -> str:
             if not _latin_accented(ch):
                 raise bad
         try:
-            ascii_label = label.encode("idna").decode("ascii")
-            if ascii_label.encode("ascii").decode("idna") != label:
-                raise bad
+            ascii_label = label.encode("idna").decode("ascii")      # el viaje de vuelta se comprueba más abajo
         except (UnicodeError, ValueError):
             raise bad from None
+        if not ascii_label.startswith("xn--"):             # nameprep lo convirtió en ASCII (ancho completo, etc.): truco
+            raise bad
     if ascii_label.startswith("xn--"):
         try:
             decoded = ascii_label.encode("ascii").decode("idna")
