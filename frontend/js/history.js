@@ -102,7 +102,7 @@
     }
     const season = h.seasonality
       ? `<span class="hx-badge" title="Su promedio de ese mes es ${fmt(h.seasonality.strength)} veces el promedio del año, en los dos últimos años">📅 ${esc(h.seasonality.label)}</span>` : "";
-    const peak = s.peak_date ? (h.resolution === "week" ? `semana al ${dayLabel(s.peak_date)}` : dayLabel(s.peak_date)) : "—";
+    const peak = s.peak_date ? (h.resolution === "week" ? `al ${dayLabel(s.peak_date)}` : dayLabel(s.peak_date)) : "—";
     body.innerHTML = `
       <div class="hx-stats">
         <div class="hx-stat"><span class="hx-label">Pedidos en ${h.days} días</span><b>${fmt(s.orders_period)}</b>

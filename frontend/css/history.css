@@ -108,7 +108,7 @@ details.hx-table { border-top: 0; padding: 0; }
 .hx-more { grid-column: 1 / -1; }
 
 .hx-sup h3 { margin-bottom: 4px; }
-.hx-sup .table-wrap { margin-top: 10px; }
+.hx-sup .table-wrap { margin-top: 10px; position: relative; }   /* contiene los textos .sr-only de las celdas */
 .hx-sup-table th { padding: 6px 8px; }
 .hx-sort { background: none; border: 0; padding: 4px 2px; font: inherit; color: inherit; font-weight: 600; cursor: pointer; white-space: nowrap; }
 .hx-sort:hover { color: var(--text); }
