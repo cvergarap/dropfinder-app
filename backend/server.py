@@ -30,6 +30,7 @@ from errors import ApiError, FileResponse  # noqa: F401  (los módulos y pruebas
 import history
 import hooks
 import saved_searches
+import store_sync
 import stores_mod
 import search
 from connectors import CsvSupplierConnector, MockSupplierConnector
@@ -570,8 +571,9 @@ ROUTES = [
 ]
 
 # Rutas de los módulos de funcionalidades (cada uno define su propia lista ROUTES)
-for _module in (auth, history, compare, saved_searches, dashboard, collections_mod, stores_mod):
+for _module in (auth, history, compare, saved_searches, dashboard, collections_mod, stores_mod, store_sync):
     ROUTES.extend(_module.ROUTES)
+store_sync.set_monitor_runner(run_monitor)      # monitor programado de tiendas (mismo código que el botón)
 
 # ---------------------------------------------------------------- acceso por ruta
 # TODA ruta debe estar en una de estas tres tablas (lo comprueba tests/test_auth.py, que recorre ROUTES):
@@ -587,6 +589,7 @@ OWNER_ONLY = {
     ("POST", r"/api/catalog/csv"): "cargar catálogos de proveedores",
     ("DELETE", r"/api/catalog"): "eliminar catálogos",
     ("POST", r"/api/currency/refresh"): "actualizar la TRM de la instalación",
+    ("PUT", r"/api/stores/monitor-schedule"): "programar el monitor de precios y stock",
     **auth.OWNER_ONLY,
 }
 USER_ROUTES = {
@@ -622,6 +625,11 @@ USER_ROUTES = {
     ("GET", r"/api/stores/platforms"), ("GET", r"/api/stores"), ("POST", r"/api/stores"),
     ("GET", r"/api/stores/(\d+)"), ("PATCH", r"/api/stores/(\d+)"), ("POST", r"/api/stores/(\d+)/validate"),
     ("DELETE", r"/api/stores/(\d+)"),
+    # publicación y sincronización (propias; la cola solo actúa con el usuario dueño de cada trabajo)
+    ("POST", r"/api/stores/(\d+)/publish"), ("GET", r"/api/store-listings"), ("GET", r"/api/stores/(\d+)/listings"),
+    ("POST", r"/api/store-listings/(\d+)/(sync|hide|show|retry)"), ("DELETE", r"/api/store-listings/(\d+)"),
+    ("GET", r"/api/stores/(\d+)/log"), ("POST", r"/api/stores/sync"), ("GET", r"/api/stores/queue"),
+    ("GET", r"/api/stores/monitor-schedule"),
 }
 
 

@@ -197,6 +197,7 @@ CREATE TABLE IF NOT EXISTS store_listings (
   status TEXT NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending', 'published', 'hidden', 'error', 'removed')),
   last_price REAL, last_stock INTEGER, last_synced_at TEXT, last_error TEXT, created_at TEXT NOT NULL,
+  currency TEXT,                                -- moneda en la que se publicó el precio (la de la tienda al publicar)
   UNIQUE (imported_id, connection_id)
 );
 -- Un mismo producto de la tienda no puede estar registrado dos veces en la misma conexión

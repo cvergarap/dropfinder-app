@@ -34,7 +34,7 @@ rechazadas = 400, tienda caída = 502, límite de velocidad = 429.
 | `POST /api/stores/sync` | procesa ya los trabajos vencidos del usuario → `{processed, failed}` |
 | `GET /api/stores/queue` | `{pending, running, failed}` del usuario |
 
-`listing` (`is_demo` sale de la columna del anuncio, no del producto: sobrevive a que se quite de Mis productos) = `{id, imported_id (puede ser null), connection_id, store_name, platform, title, status (pending|published|hidden|error|removed), external_url, last_price, last_stock, last_synced_at, last_error, pending_action (publish|sync|hide|show|delete|null), is_demo, created_at}`. Los precios son de la moneda de la tienda.
+`listing` (`is_demo` sale de la columna del anuncio, no del producto: sobrevive a que se quite de Mis productos) = `{id, imported_id (puede ser null), connection_id, store_name, platform, title, status (pending|published|hidden|error|removed), external_url, last_price, last_stock, last_synced_at, last_error, pending_action (publish|sync|hide|show|delete|null), is_demo, currency, hidden_by_rule, created_at}`. Los precios (`last_price`) están en `currency`: la moneda en la que se publicó el anuncio.
 
 ## Reglas que el motor debe respetar
 - Los productos de demostración (`source = 'mock'`) son ficticios: solo se publican con `allow_demo` explícito y **nunca**
@@ -42,3 +42,25 @@ rechazadas = 400, tienda caída = 502, límite de velocidad = 429.
 - Publicar crea el producto como **borrador** salvo que la tienda o la petición digan otra cosa.
 - Nunca se baja un precio automáticamente; subir precio solo con `auto_raise_price` y respetando `max_price_increase_pct`.
 - Toda acción sobre la tienda queda en `store_sync_log`.
+
+## Notas del motor de sincronización (aditivas; no rompen lo anterior)
+- `skipped[]` puede traer además `message` (texto en español para mostrar). `listing.currency` es la moneda del precio del anuncio (guardada al publicar/sincronizar); `hidden_by_rule` (bool) indica que lo ocultó la regla de stock (solo esos se vuelven a mostrar solos).
+- Un producto publicado **como borrador** queda con `status: "hidden"` (no visible en la tienda); "Mostrar" lo activa. Las reglas
+  automáticas nunca lo hacen visible: solo vuelven a mostrar lo que ellas mismas ocultaron por falta de stock.
+- `already_published` aplica a cualquier anuncio existente (también `error`/`removed`): para volver a publicarlo, `POST /api/store-listings/{id}/retry`.
+- `retry`: `removed` o `error` sin id externo → nueva publicación; si el último trabajo falló → se repite; `error` con id externo → sincroniza. 409 si ya hay una acción en curso.
+- Anuncios huérfanos (el usuario quitó el producto de "Mis productos"): `imported_id: null`; no se sincronizan solos; se pueden ocultar/mostrar/retirar,
+  no `sync` (409).
+- Rutas nuevas: `GET /api/stores/monitor-schedule` → `{minutes, allowed, last_run}` y `PUT /api/stores/monitor-schedule {minutes: 0|15|30|60|180|360|720|1440}` (solo propietario; 0 = apagado).
+- `publish` responde 429 si el usuario encola más de 50 publicaciones en un minuto. `store_error` también se usa si la tienda está en estado `error`.
+- Alerta nueva: `type: "store_margin_low"` (margen por debajo del mínimo tras subir el costo).
+- **Acción manual nunca se pierde**: `sync`/`hide`/`show` responden 409 `action_in_progress` si ya hay una igual *en curso*; si hay una de regla *pendiente*, se convierte en manual. `retry` responde 409 solo si ya hay en curso la misma acción.
+- **Fallos de ocultar/mostrar**: DropFinder conserva el estado anterior (no afirma "oculto" si la tienda pudo seguir visible), deja `last_error` y una alerta `store_visibility_failed`. `retry` lo vuelve a ejecutar aunque la regla ya no aplique.
+- **Precio**: cuando el motor sube un precio por regla también actualiza el `sell_price` de Mis productos y crea la alerta `store_price_raised`. Un `sync` manual sí puede bajar el precio (es una acción explícita del usuario).
+- **Cambio de moneda de la tienda tras publicar**: las reglas no empujan nada; el anuncio pasa a `error` ("La moneda de la tienda cambió (USD→COP)…") hasta un `sync` manual o volver a publicar.
+- **Publicación interrumpida**: si no se sabe si el producto llegó a crearse (caída, o no se pudo guardar el resultado) el anuncio queda en `error` con aviso de revisar la tienda (SKU `DF-<id>`); solo los conectores con `idempotent_publish` reintentan solos.
+- **Errores ambiguos de publicación** (timeouts, 5xx, conexión cortada tras enviar, errores internos) en un conector sin `idempotent_publish`: no se reintenta solo; el anuncio queda en `error` con "No sabemos si la tienda creó el producto: revisa tu tienda (SKU DF-…) antes de reintentar". Se reintenta solo únicamente si la tienda rechazó la petición (límite de velocidad) o `StoreError.not_sent` es verdadero. `POST /api/store-listings/{id}/retry` de un publish así responde `{listing, warning}` (puede duplicar el producto).
+- `POST /api/stores/sync` procesa como máximo **5** trabajos por petición (el hilo de fondo hace el resto). `GET /api/stores/queue`: `failed` cuenta solo fallos que siguen siendo el último trabajo de su anuncio.
+- Ids fuera de rango (> 2^63) → 400 en `imported_ids` y 404 en rutas con id.
+- El límite de 50 publicaciones por minuto se guarda por usuario y sobrevive a borrar anuncios.
+- Un `show` manual de un producto sin stock vuelve a ocultarse por la regla si `hide_when_out_of_stock` está activa.
