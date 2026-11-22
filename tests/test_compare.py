@@ -15,6 +15,7 @@ os.environ.setdefault("DROPFINDER_DB", os.path.join(tempfile.mkdtemp(), "test.db
 
 import compare  # noqa: E402
 import db  # noqa: E402
+import hooks  # noqa: E402
 import search  # noqa: E402
 import server  # noqa: E402
 
@@ -49,26 +50,60 @@ class _TempDb:
 
 
 class MatchKeyTest(unittest.TestCase):
+    C = "Electrónica"
+
+    def same(self, a, b, cat=None):
+        self.assertEqual(mk(a, cat or self.C), mk(b, cat or self.C), (a, b))
+
+    def differ(self, a, b, cat=None):
+        self.assertNotEqual(mk(a, cat or self.C), mk(b, cat or self.C), (a, b))
+
     def test_tildes_mayusculas_plurales_y_orden(self):
-        k = mk("Lámparas LED plegable", "Hogar y cocina")
-        self.assertEqual(k, mk("lampara plegable led", "hogar y cocina"))
-        self.assertEqual(k, mk("LAMPARA  Plegables LED", "HOGAR Y COCINA"))
-        self.assertEqual(mk("Cargador magnético", "Electrónica"), mk("cargadores magneticos", "electronica"))
+        self.same("Lámparas LED plegable", "lampara plegable led", "Hogar y cocina")
+        self.same("Lámparas LED plegable", "LAMPARA  Plegables LED", "HOGAR Y COCINA")
+        self.same("Cargador magnético", "cargadores magneticos")
+        self.same("Luces LED", "luz led")
+        self.same("Wi-Fi extensor", "wifi extensor")
 
     def test_palabras_vacias_y_relleno(self):
-        self.assertEqual(mk("Cepillo para mascotas", "Mascotas"), mk("cepillo mascotas", "Mascotas"))
-        self.assertEqual(mk("Organizador de bambú", "Hogar"), mk("Organizador bambú NUEVO original", "Hogar"))
-        self.assertEqual(mk("Reloj minimalista", "Moda"), mk("Reloj minimalista envío gratis oferta 2025", "Moda"))
-        self.assertEqual(mk("Reloj minimalista", "Moda"), mk("Reloj minimalista reloj", "Moda"))  # sin repetidos
+        self.same("Cepillo para mascotas", "cepillo mascotas", "Mascotas")
+        self.same("Organizador de bambú", "Organizador bambú NUEVO original", "Hogar")
+        self.same("Reloj minimalista", "Reloj minimalista envío gratis oferta", "Moda")
 
-    def test_no_mezcla(self):
+    def test_numeros_y_medidas(self):
+        self.same("Memoria USB 128GB", "Memoria USB 128 GB")
+        self.same("Botella 1.5 L", "Botella 1,5 L")
+        self.same("Botella 1.5 L 1 unidad", "Botella 1,5 L")
+        self.same("Funda 10 pulgadas", "Funda 10 in")
+        for a, b in [("Memoria USB 128GB", "Memoria USB 256GB"), ("Set de 3 tazas", "Set de 5 tazas"),
+                     ("Pack 2 x 3 m", "Pack 3 x 2 m"), ("Marco 20 x 30 cm", "Marco 30 x 20 cm"),
+                     ("Botella 1.5 L", "Botella 5 L 1 unidad"), ("Adaptador de 2 a 1", "Adaptador 1 a 2"),
+                     ("Bombilla E27 LED", "Bombilla E14 LED"), ("Hub USB 3.0 de 4 puertos", "Hub USB 4.0 de 3 puertos"),
+                     ("Cargador 2.4A doble", "Cargador 4.2A doble"), ("Agenda 2025 semanal", "Agenda 2026 semanal"),
+                     ("Mini proyector 4K", "Mini proyector HD")]:
+            self.differ(a, b)
+
+    def test_letras_sueltas_y_codigos(self):
+        self.differ("Cable USB-C a USB-C 1m", "Cable USB-A a USB-C 1m")
+        self.differ("Cable USB-C a USB-C 1m", "Cable USB-C 1m")
+        self.differ("Aceite vitamina E 30ml", "Aceite vitamina 30ml")
+        self.differ("Camiseta talla M", "Camiseta talla L")
+
+    def test_genero_y_palabras_que_identifican(self):
+        self.differ("Gorro de lana negro", "Gorra de lana negra")
+        self.differ("Puerta magnética", "Puerto magnético")
+        self.differ("Ventilador PC RGB", "Ventilador RGB")
+        self.differ("Top deportivo mujer", "Deportivo mujer")
+
+    def test_categoria(self):
         self.assertNotEqual(mk("Lámpara LED", "Hogar y cocina"), mk("Lámpara LED", "Bebés y niños"))
+        # Primera palabra significativa: el mismo producto con categorías escritas distinto se agrupa
+        self.assertEqual(mk("Lámpara LED", "Hogar"), mk("Lámpara LED", "Hogar y jardín"))
         self.assertNotEqual(mk("Lámpara LED", "Hogar"), mk("Lámpara LED plegable", "Hogar"))
         self.assertNotEqual(mk("Cepillo para mascotas", "Mascotas"), mk("Comedero automático", "Mascotas"))
-        self.assertNotEqual(mk("Mini proyector 4K", "Electrónica"), mk("Mini proyector HD", "Electrónica"))
 
     def test_nunca_vacia(self):
-        self.assertTrue(mk("Nuevo original", "Hogar").endswith("|nuev original"))
+        self.assertTrue(mk("Nuevo original", "Hogar").startswith("hogar|nuevo original"))
         self.assertNotEqual(mk("", ""), "")
 
 
@@ -159,6 +194,41 @@ class CompareApiTest(unittest.TestCase):
             conn.execute("UPDATE products SET match_key = 'x'")
             compare.update_keys(conn, ids + list(range(10**6, 10**6 + 1000)))     # > 900: camino json_each
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM products WHERE match_key = 'x'").fetchone()[0], 0)
+
+    def test_version_de_la_clave(self):
+        with db.connect() as conn:
+            conn.execute("UPDATE products SET match_key = 'clave vieja'")
+            conn.execute("UPDATE meta SET value = 'vieja' WHERE key = ?", (compare._META_KEY,))
+        self.ok(f"/api/alternatives/counts?ids={self.ids['A-1']}")       # relleno perezoso
+        with db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM products WHERE match_key IN ('', 'clave vieja')")
+                             .fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT value FROM meta WHERE key = ?", (compare._META_KEY,)).fetchone()[0],
+                             compare.MATCH_KEY_VERSION)
+            # También desde el hook (dentro de la transacción de una carga)
+            conn.execute("UPDATE products SET match_key = 'clave vieja'")
+            conn.execute("UPDATE meta SET value = 'vieja' WHERE key = ?", (compare._META_KEY,))
+            hooks.run_catalog_write(conn, [self.ids["A-2"]])
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM products WHERE match_key IN ('', 'clave vieja')")
+                             .fetchone()[0], 0)
+        self.assertEqual(self.ok(f"/api/alternatives/counts?ids={self.ids['A-1']}")["counts"][str(self.ids["A-1"])], 3)
+
+    def test_grupo_grande_recortado(self):
+        csv = "sku;titulo;costo;categoria\n" + "".join(f"G-{i};Taza grande;{1 + i % 97};Cocina\n" for i in range(120))
+        self.assertEqual(self.get("POST", "/api/catalog/csv", {"supplier": "Prov G", "csv": csv})[0], 200)
+        with db.connect() as conn:
+            pid = conn.execute("SELECT id FROM products WHERE supplier_sku = 'G-96'").fetchone()[0]   # el más caro
+        d = self.ok(f"/api/products/{pid}/alternatives")
+        self.assertEqual(d["total"], 120)
+        ids = [p["id"] for p in d["items"]]
+        self.assertIn(pid, ids)                                    # el propio producto aunque sea caro
+        self.assertLessEqual(len(ids), compare.MAX_ALTERNATIVES + 5)
+        self.assertEqual([p["total_cost"] for p in d["items"]], sorted(p["total_cost"] for p in d["items"]))
+        self.assertEqual(d["items"][0]["id"], d["best"]["cheapest"])
+        c = self.ok(f"/api/alternatives/counts?ids={pid},{d['items'][0]['id']}")
+        self.assertEqual(set(c["counts"].values()), {120})
+        self.assertEqual(set(c["suppliers"].values()), {1})
+        self.get("DELETE", "/api/catalog?source=csv&supplier=Prov%20G")
 
     def test_relleno_perezoso(self):
         with db.connect() as conn:

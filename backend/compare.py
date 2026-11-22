@@ -3,16 +3,28 @@
 Módulo de funcionalidad: expone ROUTES (método, regex, handler(match, qs, body)) que server.py agrega
 a sus rutas, y se registra en hooks.on_catalog_write para mantener products.match_key al día.
 
-match_key = "<categoría normalizada>|<raíces del título ordenadas y sin repetir>"
-  - Se normaliza con las mismas piezas que el buscador (search.tokenize: minúsculas y sin tildes;
-    search.stem: plural/género/diminutivo), así "Lámparas LED plegable" y "lampara plegable led"
-    dan la misma clave.
-  - Se quitan las palabras vacías del buscador (search.STOPWORDS: "de", "para", "con"…) y las palabras
-    de relleno comercial de NOISE_WORDS ("nuevo", "original", "oferta", "envío gratis"…), que los
-    proveedores agregan al título pero no cambian el producto.
-  - La categoría forma parte de la clave: el mismo título en categorías distintas no se agrupa.
-  - Coincidencia exacta del conjunto de raíces (conservador): "Lámpara LED" y "Lámpara LED plegable"
-    NO se agrupan. Preferimos no mezclar productos distintos a encontrar todos los equivalentes.
+match_key = "<categoría>|<palabras del título>|<números y medidas en orden>"   (ver key_parts)
+  Tokenizador propio (no el del buscador, que es más permisivo a propósito):
+  - Minúsculas y sin tildes; "1,5" → "1.5"; un número seguido de su unidad se une ("128 GB" → "128gb",
+    "1,5 L" → "1.5l", "10 pulgadas" → "10in"). Se conservan decimales ("3.0") y códigos de modelo con
+    guion o dígitos ("USB-C" → "usbc" ≠ "usba", "E27", "2.4A").
+  - Palabras: solo se normaliza el plural (lámparas → lampara, cargadores → cargador, luces → luz;
+    plegable/plegables → plegabl). NO se quita el género: gorro ≠ gorra, puerta ≠ puerto.
+    Se quitan las palabras vacías de KEY_STOPWORDS (artículos y preposiciones largas; las letras sueltas
+    "a", "e", "o", "y" se conservan: USB-A a USB-C, vitamina E) y el relleno comercial de NOISE_WORDS.
+    Van ordenadas alfabéticamente pero con repetición: "Lámparas LED plegable" == "lampara plegable led",
+    y "Cable USB-C a USB-C" ≠ "Cable USB-C".
+  - Números y medidas: secuencia EN ORDEN y con repetición ("2 x 3 m" ≠ "3 x 2 m",
+    "Hub USB 3.0 de 4 puertos" ≠ "Hub USB 4.0 de 3 puertos", "Agenda 2025" ≠ "Agenda 2026").
+    "1 unidad / 1 pieza" se ignora.
+  - Coincidencia exacta (conservador): "Lámpara LED" y "Lámpara LED plegable" NO se agrupan. Preferimos no
+    mezclar productos distintos a encontrar todos los equivalentes.
+  Categoría: es texto libre de cada proveedor ("Hogar", "Hogar y jardín", "Hogar y cocina"…). Para no
+  separar el mismo producto por cómo cada uno nombra la categoría, se usa solo su PRIMERA palabra
+  significativa ("hogar"); el título igual debe coincidir exactamente. Límite conocido: dos catálogos
+  con categorías de nombre distinto ("Casa" vs "Hogar") o un CSV sin categoría ("Sin categoría") no se
+  agrupan con los demás; haría falta un mapeo de categorías (siguiente iteración).
+  MATCH_KEY_VERSION se guarda en meta: si cambia la normalización, todas las claves se recalculan.
 """
 from __future__ import annotations
 
@@ -30,14 +42,24 @@ from errors import ApiError
 
 ROUTES: list = []
 
-# Relleno comercial que no identifica al producto (se comparan por raíz: "nuevos" == "nuevo").
+# Cambiar cuando cambie la normalización (obliga a recalcular todas las claves; ver _check_version)
+MATCH_KEY_VERSION = f"2/{search.STEMMER_VERSION}"
+_META_KEY = "match_key_version"
+
+# Palabras vacías de la clave. A diferencia de search.STOPWORDS, NO incluye letras sueltas
+# ("a", "e", "o", "y"), que pueden identificar el producto (USB-A, vitamina E).
+KEY_STOPWORDS = frozenset({
+    "de", "del", "la", "las", "el", "los", "un", "una", "unos", "unas", "en", "con", "para", "por", "al",
+    "su", "sus", "lo", "que", "the", "for", "and", "of", "with",
+})
+# Relleno comercial que no identifica al producto (se comparan en singular: "ofertas" == "oferta").
+# No incluye años (agendas, calendarios, modelos), "pc" ni "top" (Ventilador PC, Top deportivo).
 NOISE_WORDS = {
-    "nuevo", "nueva", "new", "original", "originales", "oferta", "ofertas", "promo", "promocion", "descuento",
-    "gratis", "envio", "free", "shipping", "calidad", "premium", "top", "hot", "sale", "venta", "tendencia", "unidad", "unidades", "pieza", "piezas", "pcs", "pc", "und", "uds",
-    "x", "producto", "articulo", "2023", "2024", "2025", "2026", "2027",
+    "nuevo", "nueva", "new", "original", "oferta", "promo", "promocion", "descuento", "gratis", "envio",
+    "free", "shipping", "calidad", "premium", "hot", "sale", "venta", "tendencia", "unidad", "pieza", "pcs",
+    "und", "uds", "x", "producto", "articulo",
 }
-_NOISE_STEMS = frozenset(search.stem(w) for w in NOISE_WORDS) | frozenset(NOISE_WORDS)
-_SKIP = frozenset(search.STOPWORDS) | _NOISE_STEMS
+_UNIT_COUNT = {"unidad", "unidades", "pieza", "piezas", "pcs", "und", "uds"}   # "1 unidad" no cuenta
 
 MAX_COUNT_IDS = 100            # /api/alternatives/counts
 MAX_ALTERNATIVES = 50          # filas devueltas por /api/products/{id}/alternatives (el grupo puede ser grande)
@@ -52,18 +74,75 @@ _SELECT = "SELECT p.*, i.id AS imported_id FROM products p LEFT JOIN imported_pr
 
 # ---------------------------------------------------------------- clave de agrupación
 
-def _words(text: str | None, skip=_SKIP) -> list[str]:
-    return [search.stem(t) for t in search.tokenize(text) if t not in skip]
+_VOWELS = set("aeiou")
+_DEC_COMMA = re.compile(r"(?<=\d),(?=\d)")
+_UNITS = ("gb|tb|mb|kb|mah|wh|kw|w|v|hz|khz|mhz|ghz|cm|mm|km|m|ml|cl|lt|l|kg|gr|g|mg|oz|lb|pulgadas|pulgada|in|"
+          "mp|fps|db|rpm|k|p")
+_NUM_UNIT = re.compile(rf"(\d+(?:\.\d+)?)\s+({_UNITS})\b")
+_TOKEN = re.compile(r"[a-z0-9]+(?:[.\-][a-z0-9]+)*")
+
+
+def singular(w: str) -> str:
+    """Solo plural (sin género ni diminutivos): luces → luz, lámparas → lampara, cargadores → cargador.
+    La "e" final tras consonante se quita siempre para que plegable/plegables y cargador/cargadores
+    coincidan (plegabl, cargador). Palabras cortas o con dígitos no se tocan."""
+    if len(w) < 4 or not w.isalpha():
+        return w
+    if len(w) >= 5 and w.endswith("ces") and w[-4] in _VOWELS:
+        return w[:-3] + "z"
+    if w.endswith("s") and w[-2] in _VOWELS:
+        w = w[:-1]
+    if len(w) >= 4 and w.endswith("e") and w[-2] not in _VOWELS:
+        w = w[:-1]
+    return w
+
+
+_NOISE = frozenset(singular(w) for w in NOISE_WORDS)
+
+
+def _tokens(text: str | None) -> list[str]:
+    t = search.unaccent(text or "")
+    t = _DEC_COMMA.sub(".", t)
+    t = _NUM_UNIT.sub(lambda m: m[1] + m[2], t)
+    out = []
+    for tok in _TOKEN.findall(t):
+        tok = tok.replace("-", "").rstrip(".")
+        tok = re.sub(r"pulgadas?$", "in", tok) if tok[:1].isdigit() else tok
+        if tok:
+            out.append(tok)
+    return out
+
+
+@lru_cache(maxsize=4096)
+def _category_key(category: str | None) -> str:
+    words = [singular(t) for t in _tokens(category) if t not in KEY_STOPWORDS and t != "y"]
+    return words[0] if words else ""
+
+
+def key_parts(title: str | None) -> tuple[list[str], list[str]]:
+    """(palabras ordenadas con repetición, números/medidas en orden) del título."""
+    toks = _tokens(title)
+    words, nums = [], []
+    for i, tok in enumerate(toks):
+        if any(c.isdigit() for c in tok):
+            nxt = toks[i + 1] if i + 1 < len(toks) else ""
+            if tok == "1" and nxt in _UNIT_COUNT:     # "1 unidad", "1 pieza"
+                continue
+            nums.append(tok)
+        elif tok not in KEY_STOPWORDS:
+            w = singular(tok)
+            if w not in _NOISE:
+                words.append(w)
+    if not words and not nums:   # título hecho solo de relleno: se usan todas sus palabras
+        words = [singular(t) for t in toks]
+    return sorted(words), nums
 
 
 @lru_cache(maxsize=200_000)
 def match_key(title: str | None, category: str | None) -> str:
     """Firma normalizada del producto (ver docstring del módulo). Nunca devuelve '' (= "sin calcular")."""
-    cat = " ".join(sorted(set(_words(category, search.STOPWORDS)))) or " ".join(search.tokenize(category))
-    stems = sorted(set(_words(title)))
-    if not stems:   # título hecho solo de relleno: se usan todas sus palabras
-        stems = sorted({search.stem(t) for t in search.tokenize(title)})
-    return f"{cat}|{' '.join(stems)}"
+    words, nums = key_parts(title)
+    return f"{_category_key(category)}|{' '.join(words)}|{' '.join(nums)}"
 
 
 def _update(conn, rows) -> int:
@@ -79,6 +158,21 @@ def _update(conn, rows) -> int:
             conn.executemany("UPDATE products SET match_key = ? WHERE id = ?", changes)
             n += len(changes)
     return n
+
+
+def _backfill_empty(conn) -> int:
+    return _update(conn, conn.execute("SELECT id, title, category, match_key FROM products WHERE match_key = ''"))
+
+
+def _check_version(conn) -> bool:
+    """Si las claves guardadas son de otra versión de la normalización, las marca para recalcular
+    (match_key = '') y guarda la versión actual. Devuelve True si las marcó. Una lectura por PK."""
+    r = conn.execute("SELECT value FROM meta WHERE key = ?", (_META_KEY,)).fetchone()
+    if r and r[0] == MATCH_KEY_VERSION:
+        return False
+    conn.execute("UPDATE products SET match_key = '' WHERE match_key != ''")
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (_META_KEY, MATCH_KEY_VERSION))
+    return True
 
 
 def update_keys(conn, ids=None) -> int:
@@ -102,6 +196,8 @@ def update_keys(conn, ids=None) -> int:
 @hooks.on_catalog_write
 def _on_catalog_write(conn, ids) -> None:
     """Se ejecuta dentro de la transacción que escribió el catálogo (misma conexión)."""
+    if _check_version(conn):
+        _backfill_empty(conn)      # cambio de versión: se recalcula todo una vez
     update_keys(conn, ids)
 
 
@@ -109,24 +205,27 @@ _backfill_lock = threading.Lock()
 
 
 def _ensure_keys(conn) -> None:
-    """Relleno perezoso: bases existentes (v3 → v4) o escrituras que no pasaron por el hook dejan filas con
-    match_key = ''. La comprobación usa el índice ix_products_match y es casi gratis. Si otra escritura
-    larga tiene la base bloqueada, se omite (la API responde igual: esas filas no se agrupan todavía)."""
-    if not conn.execute("SELECT 1 FROM products WHERE match_key = '' LIMIT 1").fetchone():
+    """Relleno perezoso en el primer uso de la API: bases existentes (v3 → v4), cambio de MATCH_KEY_VERSION
+    o escrituras que no pasaron por el hook. Las comprobaciones son una lectura por PK en meta y una por el
+    índice ix_products_match: casi gratis.
+    Si otra escritura tiene la base bloqueada, se omite (la API responde igual; esas filas no se agrupan
+    todavía). Nota: el SELECT ya abrió una transacción de lectura y SQLite no espera (busy handler) al
+    pasar de lectura a escritura, así que el UPDATE falla al instante con SQLITE_BUSY: es lo deseable en
+    una petición GET."""
+    ver = conn.execute("SELECT value FROM meta WHERE key = ?", (_META_KEY,)).fetchone()
+    if (ver and ver[0] == MATCH_KEY_VERSION
+            and not conn.execute("SELECT 1 FROM products WHERE match_key = '' LIMIT 1").fetchone()):
         return
     with _backfill_lock:
-        conn.execute("PRAGMA busy_timeout = 500")
         try:
             conn.execute("SAVEPOINT compare_backfill")
-            rows = conn.execute("SELECT id, title, category, match_key FROM products WHERE match_key = ''")
-            _update(conn, rows)
+            _check_version(conn)
+            _backfill_empty(conn)
             conn.execute("RELEASE compare_backfill")
             conn.commit()
         except sqlite3.OperationalError:
             conn.execute("ROLLBACK TO compare_backfill")
             conn.execute("RELEASE compare_backfill")
-        finally:
-            conn.execute("PRAGMA busy_timeout = 5000")
 
 
 # ---------------------------------------------------------------- utilidades de la API
@@ -175,8 +274,19 @@ def _best(items: list, field: str, higher: bool, tiebreak=None):
 
 # ---------------------------------------------------------------- handlers
 
+# Ganadores del grupo: orden SQL (con desempates) → el primero gana
+_BEST_ORDER = {
+    "cheapest": "p.total_cost, p.shipping_days, p.id",
+    "fastest": "p.shipping_days, p.total_cost, p.id",
+    "best_margin": "p.margin DESC, p.total_cost, p.id",
+    "best_rating": "p.rating DESC, p.reviews DESC, p.id",
+}
+
+
 def alternatives(pid: int) -> dict:
-    """El mismo producto en otros proveedores (incluye el producto pedido), ordenado por costo total."""
+    """El mismo producto en otros proveedores (incluye el producto pedido), ordenado por costo total.
+    Solo se leen las MAX_ALTERNATIVES más baratas más el producto y los ganadores (calculados en SQL sobre
+    todo el grupo), así un grupo enorme (títulos genéricos) no se carga entero en memoria."""
     srv = _server()
     with db.connect() as conn:
         _ensure_keys(conn)
@@ -184,33 +294,35 @@ def alternatives(pid: int) -> dict:
         if not me:
             raise ApiError(404, "Producto no encontrado")
         key = me["match_key"] or match_key(me["title"], me["category"])
-        rows = conn.execute(f"{_SELECT} WHERE p.match_key = ? OR p.id = ?", (key, pid)).fetchall()
-    group = [srv._item(r) for r in rows]
-    by_cost = lambda d: (d["total_cost"], d["id"])  # noqa: E731
-    best = {
-        "cheapest": _best(group, "total_cost", False, lambda d: (d["shipping_days"], d["id"])),
-        "fastest": _best(group, "shipping_days", False, lambda d: by_cost(d)),
-        "best_margin": _best(group, "margin", True, lambda d: by_cost(d)),
-        "best_rating": _best(group, "rating", True, lambda d: (-d["reviews"], d["id"])),
-    }
-    group.sort(key=by_cost)
-    keep = {pid, *best.values()}
-    items = [d for i, d in enumerate(group) if i < MAX_ALTERNATIVES or d["id"] in keep]
-    return {"product_id": pid, "match_key": key, "total": len(group), "items": items, "best": best}
+        where, args = "(p.match_key = ? OR p.id = ?)", (key, pid)
+        total = conn.execute(f"SELECT COUNT(*) FROM products p WHERE {where}", args).fetchone()[0]
+        best = {name: conn.execute(f"SELECT p.id FROM products p WHERE {where} ORDER BY {order} LIMIT 1",
+                                   args).fetchone()[0] for name, order in _BEST_ORDER.items()}
+        rows = conn.execute(f"{_SELECT} WHERE {where} ORDER BY p.total_cost, p.id LIMIT ?",
+                            (*args, MAX_ALTERNATIVES)).fetchall()
+        items = {r["id"]: srv._item(r) for r in rows}
+        items.update(_fetch(conn, [i for i in {pid, *best.values()} if i not in items]))
+    ordered = sorted(items.values(), key=lambda d: (d["total_cost"], d["id"]))
+    return {"product_id": pid, "match_key": key, "total": total, "items": ordered, "best": best}
 
 
 def alternative_counts(qs: dict) -> dict:
     """counts[id] = productos que comparten la clave (incluido él mismo); suppliers[id] = proveedores
-    distintos entre ellos (el badge "N proveedores" usa este). Los ids desconocidos se omiten."""
+    distintos entre ellos (el badge "N proveedores" usa este). Los ids desconocidos se omiten.
+    Se agrega una vez por clave distinta (no por id): 100 ids de un grupo de 20.000 cuestan lo mismo que 1."""
     ids = _parse_ids(qs, MAX_COUNT_IDS)
+    marks = ",".join("?" * len(ids))
     with db.connect() as conn:
         _ensure_keys(conn)
-        rows = conn.execute(
-            f"SELECT p.id, COUNT(q.id), COUNT(DISTINCT q.supplier) FROM products p "
-            f"LEFT JOIN products q ON q.match_key = p.match_key AND p.match_key != '' "
-            f"WHERE p.id IN ({','.join('?' * len(ids))}) GROUP BY p.id", ids).fetchall()
-    return {"counts": {str(r[0]): max(1, r[1]) for r in rows},
-            "suppliers": {str(r[0]): max(1, r[2]) for r in rows}}
+        keys = {r[0]: r[1] for r in conn.execute(f"SELECT id, match_key FROM products WHERE id IN ({marks})", ids)}
+        agg = {r[0]: (r[1], r[2]) for r in conn.execute(
+            f"SELECT match_key, COUNT(*), COUNT(DISTINCT supplier) FROM products WHERE match_key IN "
+            f"(SELECT match_key FROM products WHERE id IN ({marks}) AND match_key != '') GROUP BY match_key", ids)}
+    counts, suppliers = {}, {}
+    for pid, key in keys.items():
+        n, sup = agg.get(key, (1, 1))
+        counts[str(pid)], suppliers[str(pid)] = max(1, n), max(1, sup)
+    return {"counts": counts, "suppliers": suppliers}
 
 
 def compare(qs: dict) -> dict:
