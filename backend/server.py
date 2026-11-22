@@ -21,7 +21,7 @@ import dashboard
 import collections_mod
 import currency
 import db
-from errors import ApiError  # noqa: F401  (los módulos y pruebas usan server.ApiError)
+from errors import ApiError, FileResponse  # noqa: F401  (los módulos y pruebas usan server.ApiError)
 import history
 import hooks
 import saved_searches
@@ -523,6 +523,18 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_file(self, f: FileResponse):
+        """Descarga (p. ej. CSV): bytes tal cual con su tipo y nombre de archivo."""
+        self.send_response(200)
+        self.send_header("Content-Type", f.content_type)
+        self.send_header("Content-Length", str(len(f.body)))
+        if f.filename:
+            self.send_header("Content-Disposition", f'attachment; filename="{f.filename}"')
+        for k, v in f.headers.items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(f.body)
+
     def _api(self, method):
         url = urlparse(self.path)
         for m, pattern, fn in ROUTES:
@@ -535,7 +547,10 @@ class Handler(SimpleHTTPRequestHandler):
                         raise ApiError(413, "Archivo demasiado grande (máx. 20 MB)")
                     if length:
                         body = json.loads(self.rfile.read(length) or b"{}")
-                    return self._send_json(200, fn(match, parse_qs(url.query), body))
+                    result = fn(match, parse_qs(url.query), body)
+                    if isinstance(result, FileResponse):
+                        return self._send_file(result)
+                    return self._send_json(200, result)
                 except ApiError as e:
                     return self._send_json(e.status, {"error": str(e)})
                 except json.JSONDecodeError:
