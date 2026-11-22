@@ -89,6 +89,7 @@ function show(view) {
   if (view === "alerts") loadAlerts();
   if (view === "settings") { loadSettings(); Currency.load(); }
   if (view === "suppliers") loadSuppliers();
+  if (view === "search" && DF.deferInitialSearch) { DF.deferInitialSearch = false; search(); }
   if (DF.viewLoaders[view]) dfSafe(DF.viewLoaders[view]);
 }
 $$(".tab").forEach((b) => b.addEventListener("click", () => show(b.dataset.view)));
@@ -701,5 +702,7 @@ initSuggest({
 });
 
 /* ---------------- Inicio ---------------- */
-Promise.allSettled([loadFacets(), Currency.load()]).then(search);
+/* Si la vista inicial no es Buscar (el Panel lo es), la primera búsqueda se hace al abrir Buscar */
+DF.deferInitialSearch = !$("#view-search").classList.contains("active");
+Promise.allSettled([loadFacets(), Currency.load()]).then(() => { if (!DF.deferInitialSearch && searchSeq === 0) search(); });
 refreshCounts();
