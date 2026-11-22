@@ -957,5 +957,215 @@ class FakeStrictnessTest(Base):
         f.stop()                                                   # idempotente
 
 
+class StockManagementTest(Base):
+    """Sin stock_management=true la variante real queda con stock ilimitado (null): sobreventa de un producto agotado."""
+
+    def variant(self, ref):
+        return next(v for v in self.products()[int(ref.external_id)]["variants"] if str(v["id"]) == ref.variant_id)
+
+    def test_bodies_carry_stock_management(self):
+        ref = self.publish(stock=0)
+        self.assertIs(self.fake.requests_for("product_create")[0]["body"]["variants"][0]["stock_management"], True)
+        self.conn().update_price_stock(ref, 10, 3)
+        self.publish(price=12, stock=2, active=False)                       # adopción
+        puts = self.fake.requests_for("variant_update")
+        self.assertEqual(len(puts), 2)
+        for r in puts:
+            self.assertIs(r["body"]["stock_management"], True)
+            self.assertIn("stock", r["body"])
+
+    def test_end_to_end_numeric_stock_including_zero(self):
+        ref = self.publish(stock=0, active=True)
+        v = self.variant(ref)
+        self.assertEqual((v["stock"], v["stock_management"]), (0, True))      # agotado de verdad: no comprable
+        self.conn().update_price_stock(ref, 10, 5)
+        self.assertEqual(self.variant(ref)["stock"], 5)
+        self.conn().update_price_stock(ref, 10, 0)
+        self.assertEqual(self.variant(ref)["stock"], 0)
+        self.publish(stock=9, active=False)                                   # adopta
+        self.assertEqual(self.variant(ref)["stock"], 9)
+
+    def test_adopting_a_variant_without_management_turns_it_on(self):
+        ref = self.publish(stock=4)
+        v = self.variant(ref)
+        v["stock_management"], v["stock"] = False, None                       # alguien lo dejó ilimitado
+        self.publish(stock=0, active=False)
+        self.assertEqual((v["stock"], v["stock_management"]), (0, True))
+
+    def test_fake_models_unlimited_semantics(self):
+        body = {"name": {"es": "X"}, "published": False, "variants": [{"price": "1.00", "stock": 0, "sku": "A"}]}
+        r = shttp.request_json("POST", self.fake.api_template.format(store=STORE, path="/products"), body, headers={
+            "Authentication": f"bearer {TOKEN}", "User-Agent": f"DropFinder ({EMAIL})"}).json()
+        self.assertIsNone(r["variants"][0]["stock"])                          # sin gestión: ilimitado, ignora stock
+
+
+class SkuLookupFormatsTest(Base):
+    def test_all_answers_when_absent(self):
+        for mode in ("404", "empty_list", "null"):
+            self.st["sku_mode"] = mode
+            self.products().clear()
+            ref = self.publish()
+            self.assertEqual(len(self.products()), 1, mode)
+            ref2 = self.publish(price=21)                                      # ahora existe: adopta
+            self.assertEqual((len(self.products()), ref2.external_id), (1, ref.external_id), mode)
+
+    def test_list_answer_picks_matching_item_not_first(self):
+        self.st["sku_mode"] = "list"
+        other = self.publish(sku="OTRO-1")
+        ref = self.publish(sku="DF-1")
+        self.assertNotEqual(other.external_id, ref.external_id)
+        n = len(self.fake.requests_for("product_create"))
+        again = self.publish(sku="DF-1", price=30)
+        self.assertEqual(again.external_id, ref.external_id)
+        self.assertEqual(len(self.fake.requests_for("product_create")), n)
+        lookup = self.conn()._call("GET", "/products/sku/DF-1")
+        self.assertEqual(lookup[0]["variants"][0]["sku"], "OTRO-1")           # el coincidente va después
+
+    def test_list_without_matching_sku_creates(self):
+        items = [{"id": 5, "variants": [{"id": 6, "sku": "OTRO"}]}, {"id": 7, "variants": [{"id": 8, "sku": "TAMBIEN-OTRO"}]}]
+        with mock.patch.object(C, "_call", return_value=items):
+            self.assertIsNone(self.conn()._find_existing("DF-1"))
+        items.append({"id": 9, "variants": [{"id": 10, "sku": "DF-1"}]})
+        with mock.patch.object(C, "_call", return_value=items):
+            self.assertEqual(self.conn()._find_existing("DF-1")["id"], 9)
+
+
+class LanguageTest(Base):
+    def names(self):
+        return self.fake.requests_for("product_create")[-1]["body"]
+
+    def test_uses_main_language(self):
+        self.st["main_language"] = "pt"
+        self.publish()
+        b = self.names()
+        self.assertEqual(list(b["name"]), ["pt"])
+        self.assertEqual(list(b["description"]), ["pt"])
+
+    def test_fallbacks(self):
+        for main, langs, exp in [("pt-BR", {"pt": "x"}, "pt"), ("ES", {"es": "x"}, "es"), (None, {"es": "x", "en": "y"}, "es"),
+                                 (None, {"pt": "x", "en": "y"}, "pt"), (None, {}, "es"), (None, None, "es"),
+                                 ("e$!", {"en": "y"}, "en"), ("", ["en", "pt"], "en"), (5, {"fr": "z"}, "fr"),
+                                 ("xxxxx", {"es": "x"}, "es"), (None, ["es_AR"], "es")]:
+            tiendanube.clear_caches()
+            self.st["main_language"], self.st["languages"] = main, langs
+            self.products().clear()
+            self.publish()
+            self.assertEqual(list(self.names()["name"]), [exp], (main, langs))
+
+    def test_cached_per_store_and_token_for_ten_minutes(self):
+        clock = [1000.0]
+        with mock.patch.object(tiendanube, "_now", side_effect=lambda: clock[0]):
+            self.publish(sku="A1")
+            self.publish(sku="A2")
+            self.assertEqual(len(self.fake.requests_for("store")), 1)
+            clock[0] += 599
+            self.publish(sku="A3")
+            self.assertEqual(len(self.fake.requests_for("store")), 1)
+            clock[0] += 2
+            self.st["main_language"] = "pt"
+            self.publish(sku="A4")
+            self.assertEqual(len(self.fake.requests_for("store")), 2)
+            self.assertEqual(list(self.names()["name"]), ["pt"])
+            self.st["tokens"].add("tn_otro_token_999")
+            self.conn(token="tn_otro_token_999").publish(self.product(sku="A5"))      # otro token: otra entrada
+            self.assertEqual(len(self.fake.requests_for("store")), 3)
+
+    def test_validate_primes_cache(self):
+        self.conn().validate()
+        self.publish()
+        self.assertEqual(len(self.fake.requests_for("store")), 1)
+
+    def test_cache_is_bounded_and_pruned(self):
+        clock = [0.0]
+        with mock.patch.object(tiendanube, "MAX_LANG_ENTRIES", 3), mock.patch.object(tiendanube, "_now", side_effect=lambda: clock[0]):
+            for i in range(6):
+                clock[0] += 1
+                self.fake.add_store(str(100000 + i))
+                self.st_i = self.fake.stores[str(100000 + i)]
+                self.st_i["tokens"].add(TOKEN)
+                C(str(100000 + i), {"access_token": TOKEN, "contact_email": EMAIL})._language()
+            self.assertEqual(len(tiendanube._LANG_CACHE), 3)
+            clock[0] += 10_000
+            self.fake.add_store("200000").get("tokens").add(TOKEN)
+            C("200000", {"access_token": TOKEN, "contact_email": EMAIL})._language()
+            self.assertEqual(len(tiendanube._LANG_CACHE), 1)                      # lo caducado se poda
+
+    def test_language_lookup_errors_propagate(self):
+        self.fake.inject("http500", op="store")
+        with self.assertRaises(StoreError) as cm:
+            self.publish()
+        self.assertTrue(cm.exception.retryable)
+        self.assertEqual(self.products(), {})
+        with self.assertRaises(StoreValidationError):
+            self.conn(domain="999999").publish(self.product())
+
+
+class AdoptionVisibilityTest(Base):
+    def test_published_product_stays_visible_when_publish_inactive(self):
+        ref = self.publish(active=True)
+        self.publish(active=False, price=50)
+        self.assertTrue(self.products()[int(ref.external_id)]["published"])
+        self.assertEqual(self.fake.requests_for("product_update")[1:], [])
+        self.assertEqual(len(self.products()), 1)
+
+    def test_draft_is_published_when_active(self):
+        ref = self.publish(active=False)
+        self.publish(active=True)
+        self.assertTrue(self.products()[int(ref.external_id)]["published"])
+
+    def test_draft_stays_draft_when_inactive(self):
+        ref = self.publish(active=False)
+        self.publish(active=False)
+        self.assertFalse(self.products()[int(ref.external_id)]["published"])
+        self.assertEqual(self.fake.requests_for("product_update"), [])
+
+
+class ThrottleLimitsTest(Base):
+    def test_constants(self):
+        self.assertEqual((tiendanube.MAX_INLINE_WAIT, tiendanube.CLEANUP_MAX_SLEEP), (2.0, 3.0))
+
+    def test_inline_wait_boundary(self):
+        self.fake.inject("http429", op="product_create", reset_ms=2000)
+        self.publish()
+        self.assertEqual(self.sleeps, [2.0])
+        self.sleeps.clear()
+        self.fake.inject("http429", op="product_create", reset_ms=2001, count=1)
+        with self.assertRaises(StoreRateLimited) as cm:
+            self.publish(sku="B1")
+        self.assertEqual(cm.exception.retry_after, 2.001)
+        self.assertEqual(self.sleeps, [])                                       # no bloquea el hilo único
+        self.assertEqual(len(self.fake.requests_for("product_create")), 3)       # 2 de la primera + 1 sola de la segunda
+
+    def test_cleanup_pause_capped_at_three_seconds(self):
+        self.fake.inject("http500", op="product_update")
+        self.fake.inject("http429", op="product_delete", count=1, reset_ms=60000)
+        with self.assertRaises(StoreError):
+            self.publish(active=True)
+        self.assertEqual(self.sleeps, [3.0])
+        self.assertEqual(self.products(), {})
+
+
+class BoundaryTest(Base):
+    def test_shop_name_length(self):
+        for n, exp in ((99, 99), (100, 100), (101, 100)):
+            self.st["name"] = {"es": "n" * n}
+            self.assertEqual(len(self.conn().validate().name), exp)
+
+    def test_email_length(self):
+        def mail(total):
+            dom = ["b" * 63, "c" * 63, "d" * (total - 65 - 63 - 63 - 2)]
+            return "a" * 64 + "@" + ".".join(dom)
+        ok, bad = mail(254), mail(255)
+        self.assertEqual((len(ok), len(bad)), (254, 255))
+        C.check_credentials({"access_token": "abcdef123456", "contact_email": ok})
+        with self.assertRaises(StoreValidationError):
+            C.check_credentials({"access_token": "abcdef123456", "contact_email": bad})
+
+    def test_description_quotes_escaped(self):
+        self.publish(description="\"q\" & 'a'")
+        d = self.fake.requests_for("product_create")[0]["body"]["description"]["es"]
+        self.assertEqual(d, "&quot;q&quot; &amp; &#x27;a&#x27;")
+
+
 if __name__ == "__main__":
     unittest.main()
