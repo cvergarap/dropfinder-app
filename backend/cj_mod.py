@@ -347,10 +347,11 @@ def _gather(c: cj.CJConnector, params: dict) -> list:
     deadline = time.monotonic() + IMPORT_DEADLINE
     limit = params["limit"]
     items, seen, page = [], set(), 1
+    size = min(cj.PAGE_SIZE, limit)               # constante en todo el recorrido: las páginas de CJ se numeran con él
     while len(items) < limit and page <= MAX_PAGES:
         try:
             res = c.search(params["query"], category_id=params["category_id"], page=page,
-                           page_size=min(cj.PAGE_SIZE, max(limit - len(items), 1)))
+                           page_size=size)
         except StoreRateLimited:
             if not items:
                 raise

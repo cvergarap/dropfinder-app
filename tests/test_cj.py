@@ -32,6 +32,9 @@ from connectors.base import PriceStock  # noqa: E402
 from store_connectors import http as shttp  # noqa: E402
 from store_connectors.base import StoreAuthError, StoreError, StoreRateLimited  # noqa: E402
 from fake_cj import API_KEY, FakeCJ  # noqa: E402
+from test_stores_base import _TempDb  # noqa: E402
+
+ApiError = server.ApiError
 
 
 class Clock:
@@ -490,6 +493,641 @@ class ProductsTest(CJBase):
             if r["op"] != "token":
                 self.assertNotIn(API_KEY, json.dumps(r["body"]))
         self.assertNotIn(API_KEY, repr(c))
+
+
+# ====================================================================== módulo (API, importación, monitor)
+
+class ModBase(CJBase):
+    def setUp(self):
+        super().setUp()
+        self.tmp = _TempDb()
+        db.init_db(seed_size=20)
+        auth_context.set_current(1, "owner")
+        cj_mod.reset_job()
+        self.set_kwargs()
+        self.addCleanup(self._mod_cleanup)
+
+    def _mod_cleanup(self):
+        cj_mod.reset_job()
+        cj_mod.CONNECTOR_KWARGS.clear()
+        auth_context.set_current(1, "owner")
+        self.tmp.close()
+
+    def set_kwargs(self, **kw):
+        cj_mod.CONNECTOR_KWARGS.clear()
+        cj_mod.CONNECTOR_KWARGS.update(base_url=self.fake.base_url, min_interval=0, **kw)
+
+    def use_fake_clock(self):
+        self.set_kwargs(clock=self.clock.monotonic, wall=self.clock.wall, sleep=self.clock.sleep)
+
+    def connect(self, key=API_KEY):
+        return cj_mod.connect({"api_key": key})
+
+    def run_import(self, **body):
+        body.setdefault("query", "gadget")
+        body.setdefault("limit", 200)
+        cj_mod.start_import(body)
+        cj_mod.wait_for_import()
+        return cj_mod._snapshot()
+
+    def seed_many(self, n, price="2.00"):
+        for i in range(n):
+            self.fake.add_product(f"c{i:03d}", name=f"Gadget {i}", price=price, stock={"CN": 10 + i})
+
+    def products(self):
+        with db.connect() as conn:
+            return {r["supplier_sku"]: dict(r) for r in conn.execute(
+                "SELECT * FROM products WHERE supplier = 'CJ Dropshipping' AND source = 'api'")}
+
+    def import_for(self, uid, pid, price=30.0):
+        with auth_context.as_user(uid, "owner" if uid == 1 else "member"):
+            return server.create_import({"product_id": pid, "sell_price": price})
+
+
+class ConnectTest(ModBase):
+    def test_connect_validates_stores_encrypted_and_never_returns_key(self):
+        st = self.connect()
+        self.assertTrue(st["connected"] and st["unverified"])
+        self.assertNotIn(API_KEY, json.dumps(st))
+        with db.connect() as conn:
+            row = conn.execute("SELECT * FROM supplier_connections").fetchone()
+        self.assertNotIn(API_KEY, json.dumps(dict(row)))
+        self.assertEqual(secrets_store.decrypt(row["credentials_enc"], cj_mod.AAD), API_KEY)
+        with self.assertRaises(secrets_store.SecretError):
+            secrets_store.decrypt(row["credentials_enc"], "supplier:otro")        # atada a su fila
+        # ni la base (ni su WAL) contienen la clave en claro
+        for suffix in ("", "-wal"):
+            path = db.DB_PATH + suffix
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    self.assertNotIn(API_KEY.encode(), f.read())
+        self.assertEqual(self.fake.ops()[:2], ["token", "list"])                  # validó contra CJ antes de guardar
+
+    def test_invalid_key_is_not_saved_and_message_is_clean(self):
+        bad = "clave-mala-" + "q" * 25
+        with self.assertRaises(ApiError) as cm:
+            self.connect(bad)
+        self.assertEqual((cm.exception.status, cm.exception.code), (400, "cj_auth"))
+        self.assertNotIn(bad, str(cm.exception))
+        self.assertFalse(cj_mod.status()["connected"])
+
+    def test_error_text_from_cj_is_scrubbed_of_the_key(self):
+        self.fake.inject("code", op="token", count=1, code=1600001,
+                         message=f"Invalid apiKey {API_KEY} <script>alert(1)</script> Bearer abcdefghijklmnop")
+        with self.assertRaises(ApiError) as cm:
+            self.connect()
+        msg = str(cm.exception)
+        self.assertNotIn(API_KEY, msg)
+        self.assertNotIn("abcdefghijklmnop", msg)
+        self.assertNotIn("<script>", msg)
+
+    def test_bad_input(self):
+        for body in (None, [], {}, {"api_key": ""}, {"api_key": 5}, {"api_key": "con espacio"},
+                     {"api_key": "x" * 300}, {"api_key": "a\nb"}):
+            with self.assertRaises(ApiError) as cm:
+                cj_mod.connect(body)
+            self.assertEqual(cm.exception.status, 400, body)
+        self.assertEqual(self.fake.requests, [])                                  # ni siquiera molestó a CJ
+
+    def test_rate_limited_and_unreachable_are_mapped(self):
+        self.fake.token_rate_limited = True
+        with self.assertRaises(ApiError) as cm:
+            self.connect()
+        self.assertEqual((cm.exception.status, cm.exception.code), (429, "cj_rate_limited"))
+        self.fake.token_rate_limited = False
+        self.fake.stop()
+        with self.assertRaises(ApiError) as cm:
+            self.connect()
+        self.assertEqual((cm.exception.status, cm.exception.code), (502, "cj_unreachable"))
+        self.assertFalse(cj_mod.status()["connected"])
+
+    def test_reconnect_replaces_the_key_and_keeps_one_row(self):
+        self.connect()
+        key2 = "otra@api@" + "m3" * 12
+        self.fake.api_keys.add(key2)
+        self.connect(key2)
+        with db.connect() as conn:
+            rows = conn.execute("SELECT credentials_enc FROM supplier_connections").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(secrets_store.decrypt(rows[0][0], cj_mod.AAD), key2)
+
+    def test_validate_marks_error_when_key_is_revoked_and_recovers(self):
+        self.connect()
+        self.fake.api_keys.clear()
+        cj.forget_tokens()
+        with self.assertRaises(ApiError) as cm:
+            cj_mod.validate_connection()
+        self.assertEqual(cm.exception.code, "cj_auth")
+        st = cj_mod.status()
+        self.assertEqual(st["status"], "error")
+        self.assertNotIn(API_KEY, st["last_error"] or "")
+        self.fake.api_keys.add(API_KEY)
+        self.assertEqual(cj_mod.validate_connection()["status"], "active")
+
+    def test_lost_encryption_key_is_reported_not_silently_replaced(self):
+        self.connect()
+        os.remove(secrets_store.key_path())
+        secrets_store.forget_cache()
+        with self.assertRaises(ApiError) as cm:
+            cj_mod.validate_connection()
+        self.assertEqual((cm.exception.status, cm.exception.code), (409, "credentials_unreadable"))
+        self.assertFalse(os.path.exists(secrets_store.key_path()))               # no se generó una clave nueva
+        self.assertEqual(cj_mod.status()["status"], "error")
+
+    def test_disconnect_keeps_products_and_forgets_tokens(self):
+        self.seed_many(3)
+        self.connect()
+        self.run_import()
+        self.assertEqual(len(self.products()), 3)
+        out = cj_mod.disconnect()
+        self.assertEqual(out, {"ok": True, "products_kept": 3})
+        self.assertFalse(cj_mod.status()["connected"])
+        self.assertEqual(len(self.products()), 3)
+        self.assertEqual(cj._TOKENS, {})
+        with self.assertRaises(ApiError) as cm:
+            cj_mod.start_import({"query": "g"})
+        self.assertEqual(cm.exception.code, "not_connected")
+
+    def test_disconnect_refused_while_importing(self):
+        self.connect()
+        with cj_mod._job_lock:
+            cj_mod._job = {"state": "running", "warnings": []}
+        with self.assertRaises(ApiError) as cm:
+            cj_mod.disconnect()
+        self.assertEqual(cm.exception.code, "import_running")
+
+    def test_schema_is_lazy_atomic_idempotent_and_needs_no_new_version(self):
+        with db.connect() as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+            self.assertIsNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'supplier_connections'").fetchone())
+        errors = []
+
+        def go():
+            try:
+                for _ in range(5):
+                    with db.connect() as conn:
+                        cj_mod.ensure_schema(conn)
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+        ts = [threading.Thread(target=go) for _ in range(6)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(errors, [])
+        with db.connect() as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'supplier_connections'")
+                             .fetchone()[0], 1)
+
+    def test_encrypted_supplier_data_counts_as_encrypted_data(self):
+        self.connect()
+        os.remove(secrets_store.key_path())
+        secrets_store.forget_cache()
+        with self.assertRaises(secrets_store.SecretError):
+            secrets_store.encrypt("x")                                            # no inventa otra clave en silencio
+
+
+class ImportTest(ModBase):
+    def test_import_with_pagination_cap_and_fields(self):
+        self.seed_many(130)
+        self.connect()
+        self.fake.requests.clear()
+        job = self.run_import(query="gadget", limit=120)
+        self.assertEqual((job["state"], job["new"], job["updated"], job["total"]), ("done", 120, 0, 120))
+        self.assertEqual(self.fake.ops().count("list"), 3)                        # 50 + 50 + 20
+        self.assertEqual(self.fake.ops().count("stock"), 120)
+        prods = self.products()
+        self.assertEqual(len(prods), 120)
+        p = prods["c005"]
+        self.assertEqual((p["cost"], p["stock"], p["warehouse"], p["source"], p["orders"], p["rating"], p["shipping_cost"]),
+                         (2.0, 15, "CN", "api", 0, 0, 0))
+        self.assertEqual(p["category"], "Utensilios")
+        self.assertTrue(p["product_url"].startswith("https://cjdropshipping.com/"))
+        self.assertGreater(p["suggested_price"], 0)                               # métricas calculadas como en el CSV
+
+    def test_import_cap_is_enforced(self):
+        self.connect()
+        for bad in (0, 201, -1, True, "5", None, 1.5):
+            with self.assertRaises(ApiError, msg=bad) as cm:
+                cj_mod.start_import({"query": "x", "limit": bad})
+            self.assertEqual(cm.exception.status, 400)
+        with self.assertRaises(ApiError):
+            cj_mod.start_import({"limit": 5})                                     # sin palabra clave ni categoría
+        with self.assertRaises(ApiError):
+            cj_mod.start_import({"category_id": "../../x", "limit": 5})
+        self.seed_many(250)
+        job = self.run_import(query="gadget", limit=200)
+        self.assertEqual(job["new"], 200)
+        self.assertEqual(len(self.products()), 200)
+
+    def test_import_is_idempotent_and_updates_changes(self):
+        self.seed_many(10)
+        self.connect()
+        touched = []
+        hooks.on_catalog_write(lambda conn, ids: touched.append(list(ids or [])))
+        self.addCleanup(lambda: hooks._catalog_write.pop(
+            [k for k in hooks._catalog_write if k.endswith("<lambda>") and "test_cj" in k][-1], None))
+        self.run_import(query="gadget", limit=50)
+        first = self.products()
+        job = self.run_import(query="gadget", limit=50)
+        self.assertEqual((job["new"], job["updated"]), (0, 10))
+        self.assertEqual(len(self.products()), 10)
+        self.assertEqual({k: v["id"] for k, v in first.items()}, {k: v["id"] for k, v in self.products().items()})
+        self.assertGreaterEqual(len(touched), 2)                                  # los hooks del catálogo corrieron
+        self.assertEqual(sorted(touched[-1]), sorted(v["id"] for v in first.values()))
+        self.fake.set_product("c003", sellPrice="9.00", stock={"US": 0})
+        self.run_import(query="gadget", limit=50)
+        self.assertEqual((self.products()["c003"]["cost"], self.products()["c003"]["stock"]), (9.0, 0))
+        with db.connect() as conn:                                                # UNIQUE(supplier, sku): sin duplicados
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM products WHERE supplier_sku = 'c003'").fetchone()[0], 1)
+
+    def test_reimport_raises_alerts_for_users_who_imported_the_product(self):
+        self.seed_many(2)
+        self.connect()
+        self.run_import(query="gadget", limit=10)
+        pid = self.products()["c000"]["id"]
+        self.import_for(1, pid)
+        self.fake.set_product("c000", sellPrice="4.00", stock={"CN": 0})
+        job = self.run_import(query="gadget", limit=10)
+        self.assertEqual(job["alerts"], 2)
+        with db.connect() as conn:
+            types = sorted(r[0] for r in conn.execute("SELECT type FROM alerts WHERE user_id = 1"))
+        self.assertEqual(types, ["out_of_stock", "price_up"])
+
+    def test_import_does_not_overwrite_user_loaded_rows(self):
+        self.seed_many(3)
+        self.connect()
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO products(supplier, supplier_sku, source, title, category, image, cost, shipping_cost, "
+                "shipping_days, warehouse, stock, orders, orders_7d, orders_prev_7d, rating, reviews, updated_at) "
+                "VALUES ('CJ Dropshipping', 'c001', 'csv', 'Mío', 'Hogar', '', 99, 1, 7, 'MX', 5, 0, 0, 0, 4, 1, ?)",
+                (db.now(),))
+        job = self.run_import(query="gadget", limit=10)
+        self.assertEqual((job["new"], job["conflicts"]), (2, 1))
+        with db.connect() as conn:
+            r = conn.execute("SELECT title, cost, source FROM products WHERE supplier_sku = 'c001'").fetchone()
+        self.assertEqual((r[0], r[1], r[2]), ("Mío", 99, "csv"))
+
+    def test_hostile_catalog_is_sanitized_and_never_breaks_the_import(self):
+        self.fake.add_product("h1", name="<img src=x onerror=alert(1)>Taza\u202e x", price="1.2 -- 3.4",
+                              category="<b>Cat</b>", image="javascript:alert(1)")
+        self.fake.add_product("h2", name="Sin precio x", price="NaN")
+        self.fake.add_product("h3", name="Neg x", price="-4")
+        self.fake.add_product("h4", name="Ok x", price="2", stock={"US": "muchos", "CN": -3})
+        self.connect()
+        cj_mod.start_import({"query": "x", "limit": 50})
+        cj_mod.wait_for_import()
+        job = cj_mod._snapshot()
+        self.assertEqual((job["state"], job["new"], job["invalid"]), ("done", 2, 2))
+        prods = self.products()
+        self.assertEqual(sorted(prods), ["h1", "h4"])
+        self.assertEqual((prods["h1"]["title"], prods["h1"]["category"], prods["h1"]["image"], prods["h1"]["cost"]),
+                         ("Taza x", "Cat", "", 3.4))
+        self.assertEqual(prods["h4"]["stock"], 0)
+
+    def test_stock_unknown_is_counted_and_not_failed(self):
+        self.seed_many(2)
+        self.connect()
+        self.fake.inject("raw", op="stock", count=1, data={"variantInventories": []})
+        job = self.run_import(query="gadget", limit=10)
+        self.assertEqual((job["new"], job["stock_unknown"], job["stock_failed"]), (2, 1, 0))
+
+    def test_rate_limit_during_stock_imports_what_it_has_and_reports(self):
+        self.seed_many(6)
+        self.connect()
+        self.use_fake_clock()
+        # las 2 primeras consultas de stock pasan; las demás reciben 429 hasta agotar los reintentos
+        orig = self.fake._take_injection
+        calls = {"n": 0}
+
+        def take(op):
+            if op == "stock":
+                calls["n"] += 1
+                if calls["n"] > 2:
+                    return {"kind": "http429", "op": op, "count": 1}
+            return orig(op)
+        self.fake._take_injection = take
+        job = self.run_import(query="gadget", limit=10)
+        self.assertEqual((job["state"], job["new"], job["rate_limited"], job["stock_failed"]), ("done", 2, True, 4))
+        self.assertTrue(job["warnings"])
+        self.assertEqual(len(self.products()), 2)                                 # nada a medias: sin stock real no se importa
+        self.assertLessEqual(sum(self.clock.sleeps), 3 * cj.BACKOFF_CAP)
+
+    def test_rate_limit_on_first_page_is_an_error_with_clear_message(self):
+        self.seed_many(2)
+        self.connect()
+        self.use_fake_clock()
+        self.fake.inject("http429", op="list", count=99)
+        job = self.run_import(query="gadget", limit=10)
+        self.assertEqual((job["state"], job["rate_limited"]), ("error", True))
+        self.assertIn("esperar", job["error"])
+        self.assertEqual(len(self.products()), 0)
+
+    def test_revoked_key_during_import_marks_connection(self):
+        self.seed_many(2)
+        self.connect()
+        self.fake.api_keys.clear()
+        self.fake.expire_access()
+        cj.forget_tokens()
+        job = self.run_import(query="gadget", limit=10)
+        self.assertEqual(job["state"], "error")
+        self.assertNotIn(API_KEY, json.dumps(job))
+        self.assertEqual(cj_mod.status()["status"], "error")
+
+    def test_only_one_import_at_a_time(self):
+        self.seed_many(3)
+        self.connect()
+        self.fake.inject("sleep", op="list", count=1, seconds=0.6)
+        cj_mod.start_import({"query": "gadget", "limit": 5})
+        with self.assertRaises(ApiError) as cm:
+            cj_mod.start_import({"query": "gadget", "limit": 5})
+        self.assertEqual((cm.exception.status, cm.exception.code), (409, "import_running"))
+        cj_mod.wait_for_import()
+        self.assertEqual(cj_mod._snapshot()["state"], "done")
+
+    def test_category_import_and_categories_endpoint(self):
+        self.fake.add_product("k1", name="Una", price="2", categoryId="cat-cocina")
+        self.fake.add_product("k2", name="Otra", price="2", categoryId="cat-bano")
+        self.connect()
+        self.assertEqual([c["id"] for c in cj_mod.categories()["items"]], ["cat-cocina", "cat-bano"])
+        job = self.run_import(query="", category_id="cat-bano", limit=10)
+        self.assertEqual(sorted(self.products()), ["k2"])
+        self.assertEqual(job["category_id"], "cat-bano")
+
+    def test_secrets_never_reach_logs_or_job(self):
+        import logging
+        import io
+        buf = io.StringIO()
+        h = logging.StreamHandler(buf)
+        h.setLevel(logging.DEBUG)
+        root = logging.getLogger()
+        old = root.level
+        root.setLevel(logging.DEBUG)
+        root.addHandler(h)
+        self.addCleanup(lambda: (root.removeHandler(h), root.setLevel(old)))
+        self.seed_many(3)
+        self.connect()
+        self.fake.inject("http500", op="stock", count=1)
+        job = self.run_import(query="gadget", limit=10)
+        self.assertNotIn(API_KEY, buf.getvalue())
+        self.assertNotIn(API_KEY, json.dumps(job))
+        self.assertNotIn(API_KEY, json.dumps(cj_mod.status()))
+        with self.fake.lock:
+            tokens = list(self.fake.access_tokens) + list(self.fake.refresh_tokens)
+        for t in tokens:
+            self.assertNotIn(t, buf.getvalue())
+            self.assertNotIn(t, json.dumps(cj_mod.status()))
+
+
+class MonitorTest(ModBase):
+    def setUp(self):
+        super().setUp()
+        self.seed_many(3, price="5.00")
+        self.connect()
+        self.run_import(query="gadget", limit=10)
+        self.pids = {k: v["id"] for k, v in self.products().items()}
+        self.iids = {k: self.import_for(1, pid, 20.0)["id"] for k, pid in self.pids.items()}
+        self.fake.requests.clear()
+
+    def test_price_up_and_out_of_stock_alerts(self):
+        self.fake.set_product("c000", sellPrice="8.00")
+        self.fake.set_product("c001", stock={"CN": 0, "US": 0})
+        res = server.run_monitor(user_id=1)
+        self.assertEqual((res["checked"], res["skipped"], res["cooldown"]), (3, 0, 0))
+        kinds = sorted((a["title"], a["type"]) for a in res["alerts"])
+        self.assertEqual(kinds, [("Gadget 0", "price_up"), ("Gadget 1", "out_of_stock")])
+        p = self.products()
+        self.assertEqual((p["c000"]["cost"], p["c001"]["stock"]), (8.0, 0))
+        self.assertEqual(self.fake.ops().count("detail"), 3)
+        self.assertEqual(self.fake.ops().count("stock"), 3)
+        # el costo de envío conocido se conserva (CJ no se consulta por envío en el monitor)
+        self.assertEqual(p["c000"]["shipping_cost"], 0)
+
+    def test_cooldown_prevents_new_requests_and_force_overrides(self):
+        server.run_monitor(user_id=1)
+        n = len(self.fake.requests)
+        res = server.run_monitor(user_id=1)
+        self.assertEqual((res["checked"], res["cooldown"]), (0, 3))
+        self.assertEqual(len(self.fake.requests), n)
+        res = server.run_monitor(user_id=1, force=True)
+        self.assertEqual(res["checked"], 3)
+        self.assertGreater(len(self.fake.requests), n)
+
+    def test_back_in_stock_and_price_down(self):
+        self.fake.set_product("c002", stock={"CN": 0})
+        server.run_monitor(user_id=1)
+        self.fake.set_product("c002", stock={"CN": 9}, sellPrice="3.00")
+        res = server.run_monitor(user_id=1, force=True)
+        self.assertEqual(sorted(a["type"] for a in res["alerts"] if a["title"] == "Gadget 2"),
+                         ["back_in_stock", "price_down"])
+
+    def test_rate_limit_stops_without_false_alerts_and_reports(self):
+        self.use_fake_clock()
+        self.fake.inject("http429", op="detail", count=99)
+        res = server.run_monitor(user_id=1)
+        self.assertEqual((res["checked"], res["alerts"]), (0, []))
+        self.assertEqual(res["skipped"], 3)
+        self.assertIn("esperar", res["notice"])
+        self.assertEqual(self.fake.ops().count("detail"), cj.MAX_RETRIES + 1)      # se detuvo: no insiste con los demás
+        self.assertEqual(self.products()["c000"]["cost"], 5.0)
+
+    def test_hostile_or_invalid_data_is_skipped_not_alerted(self):
+        self.fake.set_product("c000", sellPrice="basura")
+        self.fake.inject("notjson", op="detail", count=99)
+        self.set_kwargs(max_retries=0)
+        res = server.run_monitor(user_id=1)
+        self.assertEqual((res["checked"], res["alerts"]), (0, []))
+
+    def test_revoked_key_marks_connection_and_stops(self):
+        self.fake.api_keys.clear()
+        self.fake.expire_access()
+        cj.forget_tokens()
+        res = server.run_monitor(user_id=1)
+        self.assertEqual(res["checked"], 0)
+        self.assertIn("rechazó", res["notice"])
+        self.assertEqual(cj_mod.status()["status"], "error")
+        self.assertNotIn(API_KEY, json.dumps(res))
+
+    def test_not_connected_is_skipped_with_notice(self):
+        cj_mod.disconnect()
+        res = server.run_monitor(user_id=1)
+        self.assertEqual((res["checked"], res["skipped"]), (0, 3))
+        self.assertIn("no está conectado", res["notice"])
+
+    def test_per_run_cap(self):
+        n = cj_mod.MONITOR_MAX_PRODUCTS + 5
+        self.seed_many(n)
+        self.run_import(query="gadget", limit=200)
+        with db.connect() as conn:
+            ids = [r[0] for r in conn.execute("SELECT id FROM products WHERE source = 'api' AND id NOT IN "
+                                              "(SELECT product_id FROM imported_products)")]
+        for pid in ids:
+            self.import_for(1, pid)
+        self.fake.requests.clear()
+        res = server.run_monitor(user_id=1)
+        self.assertEqual(res["checked"], cj_mod.MONITOR_MAX_PRODUCTS)
+        self.assertIn("Solo se revisaron", res["notice"])
+
+    def test_network_calls_do_not_hold_the_write_lock(self):
+        self.fake.inject("sleep", op="detail", count=1, seconds=1.0)
+        out = {}
+        t = threading.Thread(target=lambda: out.setdefault("r", self._run_as_owner()))
+        t.start()
+        time.sleep(0.3)                                                           # el monitor está esperando a CJ
+        t0 = time.monotonic()
+        conn = db.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('prueba', '1')")
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertLess(time.monotonic() - t0, 0.5)
+        t.join(10)
+        self.assertEqual(out["r"]["checked"], 3)
+
+    def _run_as_owner(self):
+        with auth_context.as_user(1, "owner"):
+            return server.run_monitor(user_id=1)
+
+    def test_users_only_see_and_get_their_own_alerts(self):
+        with db.connect() as conn:
+            conn.execute("INSERT INTO users(email, name, password_hash, role, created_at) "
+                         "VALUES ('m@x.co', 'Miembro', 'x', 'member', ?)", (db.now(),))
+        self.import_for(2, self.pids["c000"], 25.0)
+        self.fake.set_product("c000", sellPrice="9.00")
+        with auth_context.as_user(2, "member"):
+            res = server.run_monitor()
+        self.assertEqual([a["type"] for a in res["alerts"]], ["price_up"])
+        with db.connect() as conn:
+            owners = sorted(r[0] for r in conn.execute("SELECT user_id FROM alerts WHERE type = 'price_up'"))
+        self.assertEqual(owners, [1, 2])                                          # cada alerta es de su dueño
+        with auth_context.as_user(2, "member"):                                   # el miembro no puede forzar
+            self.fake.set_product("c000", sellPrice="12.00")
+            res = server.run_monitor(force=True)
+        self.assertEqual((res["checked"], res["cooldown"]), (0, 1))
+
+
+class PermissionsTest(ModBase):
+    def member(self):
+        with db.connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO users(id, email, name, password_hash, role, created_at) "
+                         "VALUES (2, 'm@x.co', 'Miembro', 'x', 'member', ?)", (db.now(),))
+        return auth_context.as_user(2, "member")
+
+    def test_routes_are_classified(self):
+        want = {("GET", r"/api/suppliers/cj"): "user", ("POST", r"/api/suppliers/cj"): "owner",
+                ("DELETE", r"/api/suppliers/cj"): "owner", ("POST", r"/api/suppliers/cj/validate"): "owner",
+                ("GET", r"/api/suppliers/cj/categories"): "owner", ("POST", r"/api/suppliers/cj/import"): "owner"}
+        got = {(m, p): server.route_access(m, p) for m, p, _ in cj_mod.ROUTES}
+        self.assertEqual(got, want)
+        for key in want:
+            self.assertTrue(key in server.USER_ROUTES or key in server.OWNER_ONLY, key)
+            self.assertNotIn(key, server.USER_ROUTES if want[key] == "owner" else server.OWNER_ONLY)
+        for route in cj_mod.ROUTES:
+            self.assertIn(route, server.ROUTES)
+
+    def test_member_cannot_manage_even_calling_handlers_directly(self):
+        self.connect()
+        with self.member():
+            for fn, args in ((cj_mod.connect, ({"api_key": API_KEY},)), (cj_mod.disconnect, ()),
+                             (cj_mod.validate_connection, ()), (cj_mod.categories, ()),
+                             (cj_mod.start_import, ({"query": "x", "limit": 1},))):
+                with self.assertRaises(ApiError, msg=fn.__name__) as cm:
+                    fn(*args)
+                self.assertEqual(cm.exception.status, 403)
+            st = cj_mod.status()
+        self.assertFalse(st["can_manage"])
+        self.assertTrue(st["connected"])
+        self.assertEqual(set(st), {"provider", "connected", "status", "last_error", "connected_at", "last_validated_at",
+                                   "last_import_at", "products", "can_manage", "max_import", "unverified", "import"})
+        self.assertEqual(self.fake.ops().count("token"), 1)                       # el miembro no gastó la API de CJ
+
+
+class HttpTest(ModBase):
+    def setUp(self):
+        super().setUp()
+        import auth
+        self.srv = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        self.base = f"http://127.0.0.1:{self.srv.server_address[1]}"
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (self.srv.shutdown(), self.srv.server_close()))
+        self.owner = authtest.auth_headers()
+        with db.connect() as conn:
+            conn.execute("INSERT INTO users(id, email, name, password_hash, role, created_at) "
+                         "VALUES (2, 'm@x.co', 'Miembro', 'x', 'member', ?)", (db.now(),))
+            tok, csrf = auth.create_session(conn, 2)
+        self.member = authtest.session_headers(tok, csrf)
+
+    def call(self, method, path, body=None, headers=None, raw=False):
+        import urllib.error
+        import urllib.request
+        h = {"Content-Type": "application/json", **(headers if headers is not None else self.owner)}
+        req = urllib.request.Request(self.base + path, method=method, headers=h,
+                                     data=json.dumps(body).encode() if body is not None else None)
+        try:
+            with urllib.request.urlopen(req) as r:
+                text = r.read().decode()
+                return r.status, text if raw else json.loads(text)
+        except urllib.error.HTTPError as e:
+            text = e.read().decode()
+            return e.code, text if raw else json.loads(text)
+
+    def test_full_flow_over_http_and_key_never_in_any_response(self):
+        self.seed_many(4)
+        texts = []
+        st, body = self.call("POST", "/api/suppliers/cj", {"api_key": API_KEY}, raw=True)
+        texts.append(body)
+        self.assertEqual(st, 200)
+        st, body = self.call("GET", "/api/suppliers/cj", raw=True)
+        texts.append(body)
+        st, body = self.call("POST", "/api/suppliers/cj/validate", raw=True)
+        texts.append(body)
+        st, body = self.call("POST", "/api/suppliers/cj/import", {"query": "gadget", "limit": 10}, raw=True)
+        texts.append(body)
+        self.assertEqual(st, 200)
+        cj_mod.wait_for_import()
+        st, body = self.call("GET", "/api/suppliers/cj", raw=True)
+        texts.append(body)
+        self.assertEqual(json.loads(body)["import"]["new"], 4)
+        st, body = self.call("POST", "/api/suppliers/cj", {"api_key": "mala-" + "x" * 20}, raw=True)
+        texts.append(body)
+        self.assertEqual(st, 400)
+        st, body = self.call("GET", "/api/suppliers", raw=True)
+        texts.append(body)
+        for t in texts:
+            self.assertNotIn(API_KEY, t)
+            self.assertNotIn("credentials_enc", t)
+
+    def test_member_gets_403_owner_actions_but_can_read_status(self):
+        self.connect()
+        for method, path, body in (("POST", "/api/suppliers/cj", {"api_key": API_KEY}),
+                                   ("DELETE", "/api/suppliers/cj", None),
+                                   ("POST", "/api/suppliers/cj/validate", None),
+                                   ("GET", "/api/suppliers/cj/categories", None),
+                                   ("POST", "/api/suppliers/cj/import", {"query": "x", "limit": 1})):
+            st, data = self.call(method, path, body, headers=self.member)
+            self.assertEqual(st, 403, (method, path))
+            self.assertIn("propietario", data["error"])
+        st, data = self.call("GET", "/api/suppliers/cj", headers=self.member)
+        self.assertEqual((st, data["can_manage"]), (200, False))
+        self.assertTrue(cj_mod.status()["connected"])
+
+    def test_csrf_and_auth_are_required(self):
+        no_csrf = {k: v for k, v in self.owner.items() if k != "X-CSRF-Token"}
+        st, _ = self.call("POST", "/api/suppliers/cj", {"api_key": API_KEY}, headers=no_csrf)
+        self.assertEqual(st, 403)
+        st, _ = self.call("POST", "/api/suppliers/cj/import", {"query": "x", "limit": 1}, headers=no_csrf)
+        self.assertEqual(st, 403)
+        st, _ = self.call("GET", "/api/suppliers/cj", headers={})
+        self.assertEqual(st, 401)
+        st, _ = self.call("DELETE", "/api/suppliers/cj", headers={})
+        self.assertEqual(st, 401)
+        self.assertFalse(cj_mod.status()["connected"])
+
+    def test_oversized_body_is_refused(self):
+        st, data = self.call("POST", "/api/suppliers/cj", {"api_key": "x" * 20000})
+        self.assertEqual(st, 413)
 
 
 if __name__ == "__main__":
