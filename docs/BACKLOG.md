@@ -23,6 +23,30 @@ sugiere adónde ir y el texto pasa desapercibido. La persona no sabe si terminó
 **Criterio de aceptación.** Prueba E2E con navegador: guardar muestra confirmación, ofrece «Ver productos» y «Volver», y
 «Cancelar» restaura los valores; sin inline styles/handlers; 390 px y modo oscuro.
 
+### BUG-002 — «Proveedores»: no se pueden agregar ni editar proveedores de forma genérica (API, MCP o archivo)  *(funcional, prioridad alta)*
+**Reportado por:** el usuario, con captura de la pestaña «Proveedores» (tras el Sprint 7).
+**Qué pasa.** La pantalla lista AliExpress, Almacén Local, Amazon y CJ Dropshipping, pero son los catálogos **demo (ficticios)**
+y la fila no ofrece ninguna acción: no se puede abrir, editar, conectar ni configurar un proveedor. Lo único disponible hoy es:
+(a) el panel específico de «CJ Dropshipping (API)» (clave API), (b) «Cargar catálogo desde CSV» con un nombre de proveedor
+escrito a mano y (c) «Eliminar productos de demostración». No existe un concepto de «proveedor» administrable: no hay alta,
+edición, baja, estado de conexión ni elección del tipo de integración. AliExpress y Amazon no tienen conector real
+(`SupplierConnector` solo implementado para demo, CSV y CJ).
+**Comportamiento esperado.** Un registro de proveedores con alta, edición y baja, y por cada uno el tipo de integración:
+- **API**: conector con credenciales cifradas (CJ ya existe; AliExpress Open Platform y Amazon PA-API quedan por hacer, con
+  sus restricciones de acceso), estado de conexión, validar, importar y monitoreo de precio/stock.
+- **MCP**: conectar un servidor MCP como fuente de catálogo (requiere diseño: seguridad, permisos y mapeo de herramientas
+  al contrato `SupplierConnector`).
+- **Archivo**: CSV/Excel con plantilla y **mapeo de columnas**, y recarga programada o manual asociada al proveedor guardado
+  (hoy se vuelve a escribir el nombre cada vez).
+- Datos propios del proveedor: nombre, país, moneda, tiempos de envío por defecto, notas, activo/inactivo.
+- Convivencia clara de demo y real bajo el mismo nombre (hoy «CJ Dropshipping» demo y real comparten nombre; ver ADR 0004).
+**Pasos para reproducir.** Menú «Proveedores» → intentar editar o configurar la fila AliExpress o Amazon → no hay acción posible.
+**Por verificar antes de planear.** Qué ocurre exactamente al cargar un CSV con el nombre «AliExpress» o «Amazon» sobre el
+catálogo demo (se mezclarían bajo el mismo proveedor; no está comprobado).
+**Criterio de aceptación.** Se puede crear un proveedor de cada tipo (API, MCP, archivo), editarlo, verlo con su estado y
+eliminarlo sin perder los productos importados por usuarios; pruebas con conectores simulados, permisos solo del propietario,
+E2E con navegador y sin fugas de credenciales.
+
 ## B1 — Servicio público: registro, correo y recuperación de cuentas  *(interesa; sin fecha)*
 
 **Contexto.** Hoy no hay ningún servicio de correo: la cuenta del propietario se crea desde el mismo PC, el propietario da de
