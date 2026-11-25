@@ -568,7 +568,7 @@ class CJConnector(SupplierConnector):
             return "rate", code, message, None
         if code in NOT_FOUND_CODES:
             return "notfound", code, message, None
-        if code >= 500:
+        if 500 <= code < 600:                      # los códigos propios de CJ (1600xxx) NO son errores del servidor
             return "server", code, message, None
         return "error", code, message, None
 

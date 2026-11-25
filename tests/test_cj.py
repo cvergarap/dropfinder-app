@@ -158,6 +158,20 @@ class TokenTest(CJBase):
         self.assertNotIn(bad, repr(self.conn(bad)))
         self.assertEqual(self.fake.ops(), ["token"])           # no sigue intentando
 
+    def test_connector_itself_scrubs_cj_error_text(self):
+        """Capa 1: el conector no deja pasar la clave ni siquiera si el llamador no limpiara nada."""
+        self.fake.inject("code", op="token", count=1, code=1600001, message=f"mala {API_KEY} <b>x</b>")
+        with self.assertRaises(StoreAuthError) as cm:
+            self.conn().validate()
+        self.assertNotIn(API_KEY, str(cm.exception))
+        self.seed(1)
+        c = self.conn()
+        c.search("")
+        self.fake.inject("code", op="list", count=1, code=1234, message=f"fallo con {API_KEY}")
+        with self.assertRaises(StoreError) as cm:
+            c.search("")
+        self.assertNotIn(API_KEY, str(cm.exception))
+
     def test_token_endpoint_rate_limit_is_clear_and_not_retried(self):
         self.fake.token_rate_limited = True
         with self.assertRaises(StoreRateLimited) as cm:
@@ -580,6 +594,21 @@ class ConnectTest(ModBase):
         self.assertNotIn(API_KEY, msg)
         self.assertNotIn("abcdefghijklmnop", msg)
         self.assertNotIn("<script>", msg)
+
+    def test_module_layer_scrubs_errors_even_if_connector_leaked(self):
+        """Capa 2: aunque un conector dejara la clave en un error, la API no la devuelve."""
+        from unittest import mock
+        for exc in (StoreAuthError(f"rechazada {API_KEY}"), StoreRateLimited(f"espera {API_KEY}"),
+                    StoreError(f"caída {API_KEY}")):
+            with mock.patch.object(cj.CJConnector, "validate", side_effect=exc):
+                with self.assertRaises(ApiError) as cm:
+                    self.connect()
+            self.assertNotIn(API_KEY, str(cm.exception), type(exc).__name__)
+        self.connect()
+        with mock.patch.object(cj.CJConnector, "get_categories", side_effect=StoreError(f"x {API_KEY}")):
+            with self.assertRaises(ApiError) as cm:
+                cj_mod.categories()
+        self.assertNotIn(API_KEY, str(cm.exception))
 
     def test_bad_input(self):
         for body in (None, [], {}, {"api_key": ""}, {"api_key": 5}, {"api_key": "con espacio"},
