@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import currency
 import hooks
 import metrics
+import profit
 import search
 from connectors import MockSupplierConnector
 from metrics import DEFAULT_SETTINGS, METRIC_COLS
@@ -15,7 +16,7 @@ from search import unaccent  # noqa: F401  (se mantiene db.unaccent por compatib
 
 DB_PATH = os.environ.get("DROPFINDER_DB", os.path.join(os.path.dirname(__file__), "dropfinder.db"))
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 PRODUCTS_TABLE = """
 CREATE TABLE IF NOT EXISTS products (
@@ -476,6 +477,7 @@ def init_db(seed_size: int = 1500) -> None:
             _migrate_v3_to_v4(conn)
             fts = search.create_schema(conn)
             currency.ensure_schema(conn)
+            profit.ensure_schema(conn)       # v8: supuestos de la calculadora contraentrega, por usuario
             for k, v in DEFAULT_SETTINGS.items():
                 conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, json.dumps(v)))
             # Métricas e índice de búsqueda: se recalculan si la base viene de una versión anterior
