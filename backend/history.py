@@ -1141,7 +1141,9 @@ def supplier_stats(qs: dict | None = None) -> dict:
             w = f"-{SUPPLIER_WINDOW} days"
             win = "s.product_id = x.id AND s.date >= date(x.lp, :w)"
             rows = conn.execute(
-                "WITH x AS (SELECT p.id, p.supplier, p.source, p.shipping_days, p.stock, p.rating, p.margin, "
+                "WITH x AS (SELECT p.id, p.supplier, p.source, p.stock, "
+                "  CASE WHEN p.source = 'api' AND p.supplier = 'CJ Dropshipping' AND p.shipping_cost = 0 "
+                "  AND p.shipping_days = 15 THEN NULL ELSE p.shipping_days END AS shipping_days, p.rating, p.margin, "
                 "  (SELECT MAX(s.date) FROM product_snapshots s WHERE s.product_id = p.id) AS lp FROM products p), "
                 "y AS (SELECT x.*, "
                 f"  (SELECT COUNT(*) FROM product_snapshots s WHERE {win}) AS n, "
@@ -1164,7 +1166,7 @@ def supplier_stats(qs: dict | None = None) -> dict:
             changes = round(100 * (r["changed"] or 0) / tracked, 1) if tracked else None
             items.append({
                 "supplier": r["supplier"], "source": r["source"], "products": r["products"],
-                "avg_shipping_days": round(r["ship"], 1), "pct_out_of_stock": round(r["oos"], 1),
+                "avg_shipping_days": round(r["ship"], 1) if r["ship"] is not None else None, "pct_out_of_stock": round(r["oos"], 1),
                 "avg_rating": round(r["rating"], 2), "avg_margin": round(r["margin"], 1),
                 "price_changes_30d": changes, "tracked_products": tracked,
                 "reliability": reliability(r["ship"], r["oos"], r["rating"], changes),

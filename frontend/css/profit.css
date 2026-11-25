@@ -1,0 +1,63 @@
+/* Estilos del módulo profit (ver js/profit.js): pestaña «Rentabilidad». Solo usa los tokens de styles.css (modo oscuro incluido). */
+#view-profit { min-width: 0; --pf-warn-bg: #fef3c7; --pf-warn-ink: #92400e; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) #view-profit { --pf-warn-bg: #3a2a0c; --pf-warn-ink: #fde68a; }
+}
+:root[data-theme="dark"] #view-profit { --pf-warn-bg: #3a2a0c; --pf-warn-ink: #fde68a; }
+
+.pf-cur { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.pf-cur select { color: var(--text); }
+.pf-note { margin-bottom: 12px; }
+.pf-product { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px;
+  padding: 8px 12px; border: 1px solid var(--primary); border-radius: var(--radius); background: var(--surface); overflow-wrap: anywhere; }
+
+.pf-layout { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.pf-form { min-width: 0; }
+.pf-group { border: 0; border-top: 1px solid var(--border); margin: 0; padding: 10px 0 4px; min-width: 0; }
+.pf-group:first-of-type { border-top: 0; padding-top: 0; }
+.pf-group legend { font-weight: 650; padding: 0 0 6px; }
+.pf-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px 12px; }
+.pf-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; margin-bottom: 6px; }
+.pf-field label { font-size: 12px; color: var(--muted); }
+.pf-field input { width: 100%; min-width: 0; color: var(--text); box-sizing: border-box; }
+.pf-field input::placeholder { color: var(--muted); opacity: .7; }
+.pf-field input[aria-invalid="true"] { border-color: var(--bad); }
+.pf-req { color: var(--bad); }
+.pf-hint { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+.pf-err { font-size: 12px; color: var(--bad); overflow-wrap: anywhere; }
+.pf-err:empty { display: none; }
+.pf-modes { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 6px; }
+.pf-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+.pf-msg { margin: 8px 0 0; font-size: 13px; overflow-wrap: anywhere; }
+.pf-msg:empty { display: none; }
+
+.pf-results { min-width: 0; position: sticky; top: 70px; }
+.pf-summary { padding: 12px 14px; border-radius: var(--radius); border: 1px solid var(--border); background: var(--surface); margin-bottom: 12px; overflow-wrap: anywhere; }
+.pf-verdict { font-weight: 700; font-size: 16px; }
+.pf-summary.pf-good { border-color: var(--good); color: var(--good); }
+.pf-summary.pf-bad { border-color: var(--bad); color: var(--bad); }
+.pf-summary.pf-warn { border-color: var(--warn); color: var(--warn); }
+.pf-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; margin: 0 0 12px; }
+.pf-metric { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; min-width: 0; }
+.pf-metric dt { font-size: 12px; color: var(--muted); }
+.pf-metric dd { margin: 0; }
+.pf-metric dd:not(.pf-help) { font-size: 20px; font-weight: 650; overflow-wrap: anywhere; }
+.pf-help { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.pf-warnings { list-style: none; margin: 0 0 12px; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.pf-warnings li { padding: 8px 12px; border-radius: 8px; background: var(--pf-warn-bg); color: var(--pf-warn-ink); font-size: 13px; overflow-wrap: anywhere; }
+.pf-warnings li::before { content: "⚠ "; }
+.pf-warnings .pf-w-negative_margin, .pf-warnings .pf-w-all_returned { border-left: 4px solid var(--bad); }
+.pf-sub { font-size: 15px; margin: 0 0 6px; }
+.pf-breakdown { list-style: none; margin: 0; padding: 0; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+.pf-breakdown li { display: flex; justify-content: space-between; gap: 10px; padding: 6px 12px; border-top: 1px solid var(--border); font-size: 13px; }
+.pf-breakdown li:first-child { border-top: 0; }
+.pf-breakdown li span:last-child { text-align: right; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.pf-breakdown .pf-total { font-weight: 700; background: var(--chip); }
+.pf-foot { font-size: 12px; margin-top: 10px; overflow-wrap: anywhere; }
+
+.pf-detail-cta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 4px 0; }
+
+@media (max-width: 800px) {
+  .pf-layout { grid-template-columns: minmax(0, 1fr); }
+  .pf-results { position: static; }
+}

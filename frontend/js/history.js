@@ -549,7 +549,7 @@
   const SUP_COLS = [
     { key: "supplier", label: "Proveedor" },
     { key: "products", label: "Productos", num: true, f: fmt },
-    { key: "avg_shipping_days", label: "Envío prom.", num: true, better: "min", f: (v) => `${fmt(v)} d` },
+    { key: "avg_shipping_days", label: "Envío prom.", num: true, better: "min", f: (v) => (v === null ? "—" : `${fmt(v)} d`) },
     { key: "pct_out_of_stock", label: "Sin stock", num: true, better: "min", f: (v) => `${fmt(v)} %` },
     { key: "avg_rating", label: "Rating", num: true, better: "max", f: (v) => `⭐ ${fmt(v)}` },
     { key: "avg_margin", label: "Margen prom.", num: true, better: "max", f: (v) => `${fmt(v)} %` },
