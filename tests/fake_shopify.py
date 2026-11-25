@@ -324,20 +324,31 @@ class FakeShopify:
         rec = st["products"].get(v.get("id"))
         return {"id": rec["id"], "tags": rec["tags"]} if rec else None
 
-    def seed_product(self, shop: str, tags: list, title: str = "Producto ajeno") -> str:
+    def seed_product(self, shop: str, tags: list, title: str = "Producto ajeno", sku: str = "") -> str:
         """Producto ya existente en la tienda (de otra instalación o del cliente) con las etiquetas dadas."""
         st = self.shops[shop]
         r = self._productCreate(st, {"product": {"title": title, "tags": tags, "status": "ACTIVE"}})
+        if sku:                                  # SKU de la variante por defecto (producto del cliente)
+            st["items"][st["variants"][st["products"][r["product"]["id"]]["variant"]]["item"]]["sku"] = sku
         return r["product"]["id"]
 
     def _products(self, st, v):
-        m = re.fullmatch(r"tag:'([^']*)'", v.get("q", ""))
+        q = v.get("q", "")
+        m = re.fullmatch(r"tag:'([^']*)'", q)
+        ms = re.fullmatch(r"sku:'((?:[^'\\]|\\.)*)'", q)
+        want_sku = re.sub(r"\\(.)", r"\1", ms.group(1)).lower() if ms else None
         nodes = []
         for pid, rec in st["products"].items():
-            if m and m.group(1) in (rec["tags"] or []):
-                var = st["variants"][rec["variant"]]
+            var = st["variants"][rec["variant"]]
+            sku = str(st["items"][var["item"]].get("sku", "")).lower()
+            # Como Shopify: las etiquetas se comparan sin distinguir mayúsculas; el SKU, igual
+            tags = rec["tags"] if isinstance(rec["tags"], list) else []          # el fake admite siembras hostiles
+            hit = (m and m.group(1).lower() in [t.lower() for t in tags if isinstance(t, str)]) \
+                or (ms and sku == want_sku)
+            if hit:
                 nodes.append({"id": pid, "status": rec["status"], "tags": rec["tags"],
-                              "variants": {"nodes": [{"id": var["id"], "inventoryItem": {"id": var["item"]}}]}})
+                              "variants": {"nodes": [{"id": var["id"], "sku": st["items"][var["item"]].get("sku", ""),
+                                                      "inventoryItem": {"id": var["item"]}}]}})
         return {"nodes": nodes[:5]}
 
     def _productCreate(self, st, v):

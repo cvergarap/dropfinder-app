@@ -61,7 +61,9 @@ class Base(unittest.TestCase):
         self.assertEqual(self.fake.requests, [], self.fake.summary())
 
     def publish(self, **kw):
-        return self.conn().publish(self.product(**kw))
+        ref = self.conn().publish(self.product(**kw))
+        ref.owner_tag = OWN_TAGS[1]                 # la etiqueta de instalación con la que publica el motor
+        return ref
 
 
 class DomainTest(unittest.TestCase):
@@ -1259,16 +1261,39 @@ class OwnershipTest(Base):
             self.fake.requests.clear()
             pid = self.fake.add_product(STORE, "DF-1", tags)
             with self.assertRaises(StoreValidationError) as cm:
-                self.conn().delete(ListingRef(str(pid), "1"))
+                self.conn().delete(ListingRef(str(pid), "1", owner_tag="dfi-abc123"))
             self.assertNotIsInstance(cm.exception, StoreNotFound)
             self.assertIn(pid, self.products())
             self.assertEqual(self.fake.requests_for("product_delete"), [], tags)
 
-    def test_delete_accepts_dropfinder_products_of_any_installation(self):
-        for tags in ("dropfinder,dfi-abc123", "DropFinder,DFI-otra", "x,dfi-1,dropfinder"):
+    def test_delete_accepts_only_this_installations_products(self):
+        for tags in ("dropfinder,dfi-abc123", "DropFinder,DFI-ABC123", "x,dfi-abc123,dropfinder"):
             pid = self.fake.add_product(STORE, "DF-9", tags)
-            self.conn().delete(ListingRef(str(pid), "1"))
+            self.conn().delete(ListingRef(str(pid), "1", owner_tag="dfi-abc123"))
             self.assertNotIn(pid, self.products())
+
+    def test_delete_refuses_other_installation_and_names_its_tag(self):
+        """Regresión: antes bastaba `dropfinder` + ALGUNA `dfi-…`; un anuncio apuntando a un producto de OTRA instalación
+        lo borraba."""
+        pid = self.fake.add_product(STORE, "DF-9", "dropfinder,dfi-otra")
+        with self.assertRaises(StoreValidationError) as cm:
+            self.conn().delete(ListingRef(str(pid), "1", owner_tag="dfi-abc123"))
+        self.assertIn("dfi-otra", str(cm.exception))
+        self.assertIn(pid, self.products())
+        self.assertEqual(self.fake.requests_for("product_delete"), [])
+
+    def test_delete_without_owner_tag_never_deletes(self):
+        pid = self.fake.add_product(STORE, "DF-9", "dropfinder,dfi-abc123")
+        for tag in ("", "dropfinder", "dfi-", "otra"):
+            with self.assertRaises(StoreValidationError, msg=tag):
+                self.conn().delete(ListingRef(str(pid), "1", owner_tag=tag))
+        self.assertIn(pid, self.products())
+
+    def test_conflict_message_names_foreign_dfi_tag(self):
+        self.fake.add_product(STORE, "DF-1", "dropfinder,dfi-zzz999")
+        with self.assertRaises(StoreValidationError) as cm:
+            self.publish()
+        self.assertIn("dfi-zzz999", str(cm.exception))
 
     def test_delete_of_published_product_roundtrip_and_missing(self):
         ref = self.publish()
@@ -1289,9 +1314,9 @@ class OwnershipTest(Base):
         for bad in (None, 5, {"dropfinder": 1}, [None, 3]):
             self.products()[pid]["tags"] = bad
             with self.assertRaises(StoreValidationError):
-                self.conn().delete(ListingRef(str(pid), "1"))
+                self.conn().delete(ListingRef(str(pid), "1", owner_tag="dfi-x"))
         self.products()[pid]["tags"] = ["dropfinder", "dfi-x"]            # lista (si la API cambiara) también vale
-        self.conn().delete(ListingRef(str(pid), "1"))
+        self.conn().delete(ListingRef(str(pid), "1", owner_tag="dfi-x"))
 
     def test_cleanup_only_deletes_what_this_call_created(self):
         own = self.fake.add_product(STORE, "DF-1", "dropfinder,dfi-abc123", published=False)

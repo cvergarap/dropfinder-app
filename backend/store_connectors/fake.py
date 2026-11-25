@@ -26,6 +26,7 @@ class FakeStore(StoreConnector):
     lock = threading.Lock()
     calls: list[tuple] = []
     fail_next: list[Exception] = []          # excepciones que lanzará la siguiente operación (en orden)
+    delete_tags: list[str] = []              # ref.owner_tag con el que se llamó a delete() (para comprobar que el motor la pasa)
 
     @classmethod
     def reset(cls) -> None:
@@ -33,6 +34,7 @@ class FakeStore(StoreConnector):
             cls.stores.clear()
             cls.calls.clear()
             cls.fail_next.clear()
+            cls.delete_tags.clear()
 
     @classmethod
     def normalize_domain(cls, raw: str) -> str:
@@ -84,4 +86,6 @@ class FakeStore(StoreConnector):
 
     def delete(self, ref) -> None:
         st = self._enter("delete", ref.external_id)
+        with self.lock:
+            self.delete_tags.append(ref.owner_tag)
         st["products"].pop(ref.external_id, None)

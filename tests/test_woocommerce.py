@@ -76,7 +76,7 @@ class Base(unittest.TestCase):
 
     def ref(self, p=None):
         p = p or self.fake.put_product(HOST, sku="DF-1")
-        return ListingRef(external_id=str(p["id"]))
+        return ListingRef(external_id=str(p["id"]), owner_tag=OWN[1])
 
 
 # ================================================================ dominio
@@ -619,16 +619,42 @@ class PublishTest(Base):
             p = self.fake.products(HOST)[0]
             self.assertEqual((p["name"], p["regular_price"], p["stock_quantity"]), ("Camiseta del cliente", "50.00", 99))
 
-    def test_ownership_by_slug_or_name_and_case(self):
-        seed = self.fake.put_product(HOST, sku="DF-1", tags=[{"name": "DropFinder"}, {"name": "DFI AB12CD34"}])
+    def test_ownership_by_name_only_never_by_slug(self):
+        """La propiedad se prueba SOLO con el `name` de la etiqueta (sin distinguir mayúsculas). El slug lo puede fijar el
+        cliente en una etiqueta suya (name «Etiqueta A», slug `dropfinder`): si contara, un producto ajeno pasaría por
+        propio y se adoptaría (y luego se borraría)."""
+        seed = self.fake.put_product(HOST, sku="DF-1", tags=[{"name": "DropFinder"}, {"name": "DFI-AB12CD34"}])
         ref = self.conn().publish(self.product(image_urls=[], tags=["dropfinder", "dfi-ab12cd34"]))
         self.assertEqual(ref.external_id, str(seed["id"]))
-        self.fake.stores[HOST]["products"].clear()                                   # solo por nombre / solo por slug
+        self.fake.stores[HOST]["products"].clear()
         by_name = self.fake.put_product(HOST, sku="DF-1", tags=[{"name": "dropfinder", "slug": "zz1"}, {"name": "dfi-ab12cd34", "slug": "zz2"}])
         self.assertEqual(self.conn().publish(self.product(image_urls=[])).external_id, str(by_name["id"]))
         self.fake.stores[HOST]["products"].clear()
-        by_slug = self.fake.put_product(HOST, sku="DF-1", tags=[{"name": "Etiqueta A", "slug": "dropfinder"}, {"name": "Etiqueta B", "slug": "dfi-ab12cd34"}])
-        self.assertEqual(self.conn().publish(self.product(image_urls=[])).external_id, str(by_slug["id"]))
+        self.fake.put_product(HOST, sku="DF-1", tags=[{"name": "Etiqueta A", "slug": "dropfinder"}, {"name": "Etiqueta B", "slug": "dfi-ab12cd34"}])
+        self.fake.requests.clear()
+        with self.assertRaises(StoreValidationError):
+            self.conn().publish(self.product(image_urls=[]))
+        self.assertEqual(self.fake.ops(), ["find_sku"])                              # no se adopta ni se crea
+
+    def test_delete_ignores_slug_only_tags(self):
+        p = self.fake.put_product(HOST, sku="DF-1", tags=[{"name": "A", "slug": "dropfinder"}, {"name": "B", "slug": "dfi-ab12cd34"}])
+        with self.assertRaises(StoreValidationError):
+            self.conn().delete(ListingRef(external_id=str(p["id"]), owner_tag="dfi-ab12cd34"))
+        self.assertNotIn("delete", self.fake.ops())
+
+    def test_hostile_tags_are_rejected_safely(self):
+        for hostile in (5, {"name": "dropfinder"}, None, "dropfinder", [5, None, {"name": 3}, ["x"]], [{"name": ["dropfinder"]}],
+                        [{"name": "dropfinder"}, 7, {"name": None}]):
+            p = self.fake.put_product(HOST, sku="DF-1", tags=[])
+            self.fake.stores[HOST]["products"][p["id"]]["tags"] = hostile
+            with self.subTest(hostile=hostile):
+                with self.assertRaises(StoreValidationError) as cm:     # mensaje correcto, no el genérico de TypeError
+                    self.conn().delete(ListingRef(external_id=str(p["id"]), owner_tag="dfi-ab12cd34"))
+                self.assertIn("no lleva las etiquetas de DropFinder", str(cm.exception))
+                with self.assertRaises(StoreValidationError) as cm:
+                    self.conn().publish(self.product(image_urls=[], tags=["dropfinder", "dfi-ab12cd34"]))
+                self.assertIn("no creó esta instalación", str(cm.exception))
+            self.fake.stores[HOST]["products"].clear()
 
     def test_trashed_product_with_our_sku_is_not_adopted(self):
         self.seed(status="trash")
@@ -1027,11 +1053,34 @@ class DeleteTest(Base):
             self.assertEqual(self.fake.requests_for("delete"), [], tags)
             self.assertEqual(self.count(), 1)
 
-    def test_delete_accepts_any_dfi_tag_and_slug_match(self):
-        for tags in (["dropfinder", "dfi-zzzz9999"], ["x", "DropFinder", "DFI-AB12CD34", "y"]):
+    def test_delete_accepts_only_this_installations_tag(self):
+        for tags in (["dropfinder", "dfi-ab12cd34"], ["x", "DropFinder", "DFI-AB12CD34", "y"]):
             p = self.seed(tags=tags)
             self.conn().delete(self.ref(p))
         self.assertEqual(self.count(), 0)
+
+    def test_delete_refuses_other_installation_and_names_its_tag(self):
+        """Regresión: antes bastaba `dropfinder` + ALGUNA `dfi-…`, y un anuncio apuntando a un producto de OTRA
+        instalación lo borraba."""
+        p = self.seed(tags=["dropfinder", "dfi-zzzz9999"])
+        with self.assertRaises(StoreValidationError) as cm:
+            self.conn().delete(self.ref(p))
+        self.assertIn("dfi-zzzz9999", str(cm.exception))
+        self.assertEqual(self.fake.requests_for("delete"), [])
+        self.assertEqual(self.count(), 1)
+
+    def test_delete_without_owner_tag_never_deletes(self):
+        p = self.seed()
+        for tag in ("", "dropfinder", "dfi-", "otra"):
+            with self.assertRaises(StoreValidationError, msg=tag):
+                self.conn().delete(ListingRef(external_id=str(p["id"]), owner_tag=tag))
+        self.assertEqual(self.fake.requests_for("delete"), [])
+
+    def test_conflict_message_names_foreign_dfi_tag(self):
+        self.seed(tags=["dropfinder", "dfi-zzzz9999"])
+        with self.assertRaises(StoreValidationError) as cm:
+            self.conn().publish(self.product(image_urls=[]))
+        self.assertIn("dfi-zzzz9999", str(cm.exception))
 
     def test_delete_get_garbage_does_not_delete(self):
         with mock.patch.object(C, "_call", return_value=["no", "dict"]):
@@ -1240,7 +1289,7 @@ class SecretsTest(Base):
         c = self.conn()
         c.validate()
         c.publish(self.product(active=True, compare_at_price=None))
-        ref = ListingRef(external_id=str(self.fake.products(HOST)[0]["id"]))
+        ref = ListingRef(external_id=str(self.fake.products(HOST)[0]["id"]), owner_tag=OWN[1])
         c.update_price_stock(ref, 5, 2)
         c.set_active(ref, False)
         c.delete(ref)
@@ -1442,16 +1491,18 @@ MUTANTS = [
      "            pass\n        adopted = existing is not None"),
     ("adopt_race_without_tags", "                existing = self._own_or_conflict(existing, tags, sku)\n                adopted = True",
      "                adopted = True"),
-    ("tags_match_any", "if not tags_match(self._tag_names(existing), [t[\"name\"] for t in tags]):",
-     "if not set(x.lower() for x in self._tag_names(existing)) & set(t['name'].lower() for t in tags):"),
-    ("tags_slug_only", 'out += [t[k] for k in ("name", "slug") if isinstance(t.get(k), str)]', 'out += [t[k] for k in ("slug",) if isinstance(t.get(k), str)]'),
-    ("tags_name_only", 'out += [t[k] for k in ("name", "slug") if isinstance(t.get(k), str)]', 'out += [t[k] for k in ("name",) if isinstance(t.get(k), str)]'),
-    ("delete_without_ownership", "if OWN_TAG not in names or not any(", "if False and not any("),
-    ("delete_only_generic_tag", "if OWN_TAG not in names or not any(n.startswith(INSTALL_TAG_PREFIX) and len(n) > len(INSTALL_TAG_PREFIX) for n in names):",
-     "if OWN_TAG not in names:"),
-    ("delete_only_dfi_tag", "if OWN_TAG not in names or not any(", "if False or not any("),
-    ("delete_dfi_empty_suffix", "and len(n) > len(INSTALL_TAG_PREFIX) for n in names)", "for n in names)"),
-    ("delete_get_skipped", '            prod = self._call("GET", f"/products/{pid}", ref_op=True)', "            prod = {'tags': [{'name': 'dropfinder'}, {'name': 'dfi-x'}]}"),
+    ("tags_match_any", "if not tags_match(names, [t[\"name\"] for t in tags]):",
+     "if not set(x.lower() for x in names) & set(t['name'].lower() for t in tags):"),
+    ("tags_slug_only", 'out.append(t["name"].strip())', 'out.append(str(t.get("slug") or ""))'),
+    ("tags_include_slug", 'out.append(t["name"].strip())', 'out.append(t["name"].strip()); out.append(str(t.get("slug") or ""))'),
+    ("tags_hostile_unchecked", 'for t in tags if isinstance(tags, list) else []:', 'for t in tags:'),
+    ("delete_without_ownership", "if not is_owned_by(names, ref.owner_tag):", "if False:"),
+    ("delete_only_generic_tag", "if not is_owned_by(names, ref.owner_tag):", "if OWN_TAG not in [n.lower() for n in names]:"),
+    ("delete_any_dfi_tag", "if not is_owned_by(names, ref.owner_tag):",
+     "if OWN_TAG not in [n.lower() for n in names] or not any(n.lower().startswith(INSTALL_TAG_PREFIX) for n in names):"),
+    ("delete_empty_owner_tag_defaults", "if not is_owned_by(names, ref.owner_tag):", "if not is_owned_by(names, ref.owner_tag or 'dfi-ab12cd34'):"),
+    ("conflict_without_found_tag", "found = sorted({n for n in names if n.lower().startswith(INSTALL_TAG_PREFIX)})\n            extra = f\" (lleva la etiqueta", "found = []\n            extra = f\" (lleva la etiqueta"),
+    ("delete_get_skipped", '            prod = self._call("GET", f"/products/{pid}", ref_op=True)', "            prod = {'tags': [{'name': 'dropfinder'}, {'name': 'dfi-ab12cd34'}]}"),
     ("sale_empty_adopt", 'upd = {"regular_price": price, "manage_stock": True, "stock_quantity": stock}', 'upd = {"regular_price": price, "manage_stock": True, "stock_quantity": stock, "sale_price": ""}'),
     ("sale_in_update", 'payload={"regular_price": p, "manage_stock": True, "stock_quantity": n},', 'payload={"regular_price": p, "manage_stock": True, "stock_quantity": n, "sale_price": ""},'),
     ("sale_in_create", '"stock_quantity": stock, "description": description, "tags": tags}', '"stock_quantity": stock, "description": description, "tags": tags, "sale_price": "1.00"}'),

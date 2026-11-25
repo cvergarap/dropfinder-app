@@ -158,7 +158,7 @@ class ValidateTest(Base):
 class PublishTest(Base):
     def test_happy_path_sequence_and_inputs(self):
         ref = self.conn().publish(self.product(active=False))
-        self.assertEqual(self.fake.ops(), ["locations", "products", "productCreate", "productVariantsBulkUpdate",
+        self.assertEqual(self.fake.ops(), ["locations", "products", "products", "productCreate", "productVariantsBulkUpdate",
                                             "inventorySetQuantities"])
         create = self.fake.requests_for("productCreate")[0]["body"]["variables"]
         p = create["product"]
@@ -244,7 +244,7 @@ class PublishTest(Base):
         self.fake.inject("http500", op="productCreate")
         with self.assertRaises(StoreError):
             self.conn().publish(self.product())
-        self.assertEqual(self.fake.ops(), ["locations", "products", "productCreate"])      # nada que limpiar
+        self.assertEqual(self.fake.ops(), ["locations", "products", "products", "productCreate"])      # nada que limpiar
 
     def test_missing_scope_on_publish(self):
         self.st["scopes"].discard("write_products")
@@ -258,6 +258,7 @@ class UpdateTest(Base):
     def setUp(self):
         super().setUp()
         self.ref = self.conn().publish(self.product())
+        self.ref.owner_tag = "dfi-test1"                         # etiqueta de la instalación (la pone el motor)
         self.fake.requests.clear()
 
     def test_update_price_stock(self):
@@ -1039,16 +1040,89 @@ class OwnershipTest(Base):
             self.fake.requests.clear()
             gid = self.seed(tags)
             with self.assertRaises(StoreValidationError, msg=tags):
-                self.conn().delete(ListingRef(gid))
+                self.conn().delete(ListingRef(gid, owner_tag="dfi-test1"))
             self.assertNotIn("productDelete", self.fake.ops())
             self.assertIn(gid, self.st["products"])
 
+    def test_delete_refuses_other_installation_and_names_its_tag(self):
+        """Regresión: antes bastaba `dropfinder` + ALGUNA `dfi-…`; un anuncio que apuntara a un producto de OTRA
+        instalación lo borraba."""
+        gid = self.seed(["dropfinder", "dfi-otra"])
+        with self.assertRaises(StoreValidationError) as cm:
+            self.conn().delete(ListingRef(gid, owner_tag="dfi-test1"))
+        self.assertIn("dfi-otra", str(cm.exception))
+        self.assertNotIn("productDelete", self.fake.ops())
+        self.assertIn(gid, self.st["products"])
+
+    def test_delete_without_owner_tag_never_deletes(self):
+        gid = self.seed(["dropfinder", "dfi-test1"])
+        for tag in ("", "dropfinder", "dfi-", "otra"):
+            with self.assertRaises(StoreValidationError, msg=tag):
+                self.conn().delete(ListingRef(gid, owner_tag=tag))
+        self.assertNotIn("productDelete", self.fake.ops())
+
+    def test_conflict_message_names_foreign_dfi_tag(self):
+        self.seed(["dropfinder", "dfi-otra", "df-sku:DF-1"])
+        with self.assertRaises(StoreValidationError) as cm:
+            self.conn().publish(self.product())
+        self.assertIn("dfi-otra", str(cm.exception))
+
+    def test_sku_tag_comparison_is_case_insensitive(self):
+        """Shopify no distingue mayúsculas en las etiquetas: una `DF-SKU:df-1` propia se adopta (no se duplica) y una
+        ajena es conflicto."""
+        own = self.seed(["dropfinder", "dfi-test1", "DF-SKU:DF-1"])
+        self.assertEqual(self.conn().publish(self.product()).external_id, own)
+        self.assertNotIn("productCreate", self.fake.ops())
+        self.st["products"].clear()
+        self.seed(["dropfinder", "dfi-otra", "DF-SKU:DF-1"])
+        with self.assertRaises(StoreValidationError):
+            self.conn().publish(self.product())
+
+    def test_customer_product_with_same_sku_and_no_tags_is_a_conflict(self):
+        """Un producto del cliente con el mismo SKU (sin etiqueta df-sku ni de propiedad) no se duplica ni se toca."""
+        gid = self.fake.seed_product(SHOP, ["ofertas"], sku="DF-1")
+        with self.assertRaises(StoreValidationError) as cm:
+            self.conn().publish(self.product())
+        self.assertIn("no creó esta instalación", str(cm.exception))
+        self.assertNotIn("productCreate", self.fake.ops())
+        self.assertEqual(list(self.st["products"]), [gid])
+
+    def test_own_product_found_by_sku_without_sku_tag_is_adopted(self):
+        gid = self.fake.seed_product(SHOP, ["dropfinder", "dfi-test1"], sku="df-1")
+        self.assertEqual(self.conn().publish(self.product()).external_id, gid)
+        self.assertNotIn("productCreate", self.fake.ops())
+
+    def test_hostile_tags_are_rejected_safely(self):
+        """`tags` hostiles de un producto ajeno (número, dict, None, mezclas) no provocan TypeError: rechazo limpio."""
+        for hostile in (5, {"a": "dropfinder"}, None, "dropfinder", [5, None, {"x": 1}, ["dropfinder"]]):
+            gid = self.fake.seed_product(SHOP, [], sku="DF-1")
+            self.st["products"][gid]["tags"] = hostile
+            with self.subTest(hostile=hostile):
+                with self.assertRaises(StoreValidationError) as cm:
+                    self.conn().delete(ListingRef(gid, owner_tag="dfi-test1"))
+                self.assertIn("no lleva las etiquetas", str(cm.exception))
+                with self.assertRaises(StoreValidationError) as cm:
+                    self.conn().publish(self.product())
+                self.assertIn("no creó esta instalación", str(cm.exception))
+                self.assertIn(gid, self.st["products"])
+            self.st["products"].clear()
+
+    def test_hostile_items_in_tags_next_to_the_sku_tag(self):
+        """Elementos no-str entre las etiquetas se ignoran (sin TypeError/AttributeError); lo propio se sigue adoptando
+        y lo ajeno sigue siendo conflicto."""
+        gid = self.seed(["dropfinder", "dfi-test1", "df-sku:DF-1", 5, None, {"a": 1}, ["x"]])
+        self.assertEqual(self.conn().publish(self.product()).external_id, gid)
+        self.st["products"].clear()
+        self.seed(["dfi-otra", "df-sku:DF-1", 5, None])
+        with self.assertRaises(StoreValidationError):
+            self.conn().publish(self.product())
+
     def test_delete_own_and_gone(self):
         gid = self.seed(["Dropfinder", "dfi-abc"])
-        self.conn().delete(ListingRef(gid))
+        self.conn().delete(ListingRef(gid, owner_tag="DFI-ABC"))
         self.assertNotIn(gid, self.st["products"])
         self.fake.requests.clear()
-        self.conn().delete(ListingRef(gid))                      # ya no existe: sin error y sin productDelete
+        self.conn().delete(ListingRef(gid, owner_tag="dfi-abc"))                      # ya no existe: sin error y sin productDelete
         self.assertNotIn("productDelete", self.fake.ops())
 
     def test_orphan_cleanup_deletes_only_what_this_call_created(self):
