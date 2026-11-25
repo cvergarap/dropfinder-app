@@ -3,6 +3,26 @@
 Ideas y trabajo pendiente, ordenado por prioridad dentro de cada bloque. Se actualiza al cerrar cada sprint.
 Última revisión: tras el Sprint 7.
 
+## BUGS — Defectos y fallos de experiencia abiertos
+
+### BUG-001 — «Reglas de precio»: tras guardar no hay un paso siguiente claro  *(UX, prioridad media)*
+**Reportado por:** el usuario, con captura de la pantalla «Reglas de precio» (tras el Sprint 7).
+**Qué pasa.** Hay dos botones, «Guardar» (reglas de precio) y «Guardar moneda». Al pulsarlos solo aparece un texto gris
+al lado («Guardado ✓ — las métricas se recalcularon» / «Guardado ✓»). No hay botón «Aceptar» ni «Volver», no se
+sugiere adónde ir y el texto pasa desapercibido. La persona no sabe si terminó, qué efecto tuvo ni dónde verlo.
+**Comportamiento esperado.**
+- Confirmación visible (aviso emergente accesible con `aria-live`) que diga qué cambió y cuántos productos se recalcularon.
+- Acciones claras tras guardar: «Ver productos» (lleva a Buscar productos) y «Seguir editando»; botón «Volver» o «Cancelar» que
+  descarte los cambios sin guardar y restaure los valores guardados.
+- Un solo flujo de guardado, o aviso explícito de que son dos formularios independientes (hoy cambiar una regla y la moneda
+  exige pulsar dos botones y es fácil dejar uno sin guardar).
+- Aviso al salir de la pestaña con cambios sin guardar.
+- Aclarar la mezcla de unidades: la pantalla está en COP pero «Monto fijo» y «Comisión fija» siguen en USD (el texto lo
+  dice en pequeño); mostrar el equivalente en la moneda elegida.
+**Pasos para reproducir.** Menú «Reglas de precio» → cambiar cualquier valor → «Guardar» → no hay otra acción disponible.
+**Criterio de aceptación.** Prueba E2E con navegador: guardar muestra confirmación, ofrece «Ver productos» y «Volver», y
+«Cancelar» restaura los valores; sin inline styles/handlers; 390 px y modo oscuro.
+
 ## B1 — Servicio público: registro, correo y recuperación de cuentas  *(interesa; sin fecha)*
 
 **Contexto.** Hoy no hay ningún servicio de correo: la cuenta del propietario se crea desde el mismo PC, el propietario da de
