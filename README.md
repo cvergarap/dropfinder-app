@@ -10,6 +10,7 @@ El análisis completo (metodología RAE: ingeniería inversa → análisis → e
   score mínimo, rating, días de envío, solo en tendencia, solo con stock.
 - **Métricas por producto**: precio sugerido, ganancia, margen, punto de equilibrio, tendencia de 7 días
   y "score ganador" (0–100).
+- **Rentabilidad contraentrega** (pestaña *Rentabilidad*): ganancia por pedido entregado y confirmado con devoluciones, fletes, recaudo y CPA/ROAS; supuestos editables por usuario ([fórmulas](docs/profit-calculator.md)).
 - **Reglas de precio** configurables (multiplicador, monto fijo, comisiones).
 - **Mis productos**: importar a drafts, editar precio y activar/desactivar.
 - **Monitor de precio/stock** con alertas (subida o bajada de costo, sin stock, venta a pérdida).

@@ -30,6 +30,7 @@ from auth_context import current_user_id
 from errors import ApiError, FileResponse  # noqa: F401  (los módulos y pruebas usan server.ApiError)
 import history
 import hooks
+import profit
 import saved_searches
 import store_sync
 import stores_mod
@@ -607,7 +608,7 @@ ROUTES = [
 ]
 
 # Rutas de los módulos de funcionalidades (cada uno define su propia lista ROUTES)
-for _module in (auth, history, compare, saved_searches, dashboard, collections_mod, stores_mod, store_sync, cj_mod):
+for _module in (auth, history, compare, saved_searches, dashboard, collections_mod, stores_mod, store_sync, cj_mod, profit):
     ROUTES.extend(_module.ROUTES)
 store_sync.set_monitor_runner(run_monitor)      # monitor programado de tiendas (mismo código que el botón)
 
@@ -674,6 +675,9 @@ USER_ROUTES = {
     ("GET", r"/api/stores/monitor-schedule"),
     # estado de CJ Dropshipping (solo lectura, sin ningún dato de la clave)
     ("GET", r"/api/suppliers/cj"),
+    # calculadora de rentabilidad contraentrega (supuestos propios; el cálculo no toca datos de otros)
+    ("POST", r"/api/profit/calc"), ("GET", r"/api/profit/defaults"), ("PUT", r"/api/profit/defaults"),
+    ("GET", r"/api/products/(\d+)/profit"),
 }
 
 
@@ -696,7 +700,7 @@ MAX_BODY_DEFAULT = 1024 * 1024
 
 
 def body_limit(method: str, path: str) -> int:
-    if path.startswith(("/api/auth/", "/api/users", "/api/suppliers/cj")):
+    if path.startswith(("/api/auth/", "/api/users", "/api/suppliers/cj", "/api/profit/")):
         return MAX_BODY_AUTH
     if method == "POST" and path == "/api/catalog/csv":
         return MAX_BODY
@@ -951,7 +955,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if getattr(e, "code", None):
                     payload["code"] = e.code
                 return e.status, payload, getattr(e, "headers", None) or {}
-            except (json.JSONDecodeError, UnicodeDecodeError):
+            except ValueError:                 # JSONDecodeError, UnicodeDecodeError y enteros de >4300 dígitos
                 return 400, {"error": "JSON inválido"}, {}
             except OverflowError:              # ids enormes (/api/users/99999999999999999999…)
                 return 400, {"error": "Identificador inválido"}, {}
