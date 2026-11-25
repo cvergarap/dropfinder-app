@@ -225,6 +225,52 @@ class FormulaTest(unittest.TestCase):
             self.assertLessEqual(more["profit_per_confirmed"], r["profit_per_confirmed"] + 1)
 
 
+class RegressionReviewTest(unittest.TestCase):
+    """Hallazgos de la revisión del PR #21: veredicto sin redondear, bordes exactos y detalles de salida."""
+
+    def test_veredicto_sin_redondear(self):
+        z = dict(ZERO, product_cost=0)
+        r = calc(**{**z, "price": 1000, "product_cost": 900.4})       # margen 9,96 % (se muestra 10,0)
+        self.assertEqual((r["margin_pct"], r["verdict"]), (10.0, "low_margin"))
+        self.assertIn("low_margin", [w["code"] for w in r["warnings"]])
+        self.assertEqual(calc(**{**z, "price": 1000, "product_cost": 900})["verdict"], "profitable")   # 10,0 exacto
+        self.assertNotIn("low_margin", [w["code"] for w in calc(**{**z, "price": 1000, "product_cost": 900})["warnings"]])
+        be = calc(**{**z, "price": 1000, "product_cost": 1000})       # utilidad exactamente 0
+        self.assertEqual(be["verdict"], "break_even")
+        self.assertNotIn("negative_margin", [w["code"] for w in be["warnings"]])
+        loss = calc(**{**z, "price": 1000, "product_cost": 1000.3})   # pierde 0,3: se redondea a 0
+        self.assertEqual(loss["verdict"], "loss")
+        msg = [w["message"] for w in loss["warnings"] if w["code"] == "negative_margin"][0]
+        self.assertIn("menos de", msg)
+        self.assertNotIn("Pierdes $ 0 ", msg)
+        self.assertEqual(calc(**{**z, "price": 1000, "product_cost": 1})["verdict"], "profitable")
+
+    def test_menos_cero_se_normaliza(self):
+        import math
+        r = calc(**{**ZERO, "price": 1000, "product_cost": 1000.3})
+        self.assertEqual(r["profit_per_confirmed"], 0)
+        self.assertEqual(math.copysign(1, r["profit_per_confirmed"]), 1.0)
+        self.assertEqual(math.copysign(1, r["breakdown"]["profit"]), 1.0)
+
+    def test_money_text_negativo(self):
+        self.assertEqual(profit.money_text(-5, "COP"), "-$ 5")
+        self.assertEqual(profit.money_text(-5.5, "USD"), "-US$ 5.50")
+        self.assertEqual(profit.money_text(12500, "COP"), "$ 12.500")
+
+    def test_roas_con_precio_cero_y_cpa(self):
+        r = calc(**{**ZERO, "price": 0, "product_cost": 0, "cpa": 500})
+        self.assertIsNone(r["roas_used"])
+        self.assertIsNone(r["breakeven_roas"])
+
+    def test_roas_objetivo_se_redondea_en_inputs(self):
+        self.assertEqual(calc(price=100000, product_cost=1, target_roas=3.456)["inputs"]["target_roas"], 3.46)
+
+    def test_devoluciones_y_efectividad_tolerancia(self):
+        with self.assertRaises(ProfitError):
+            calc(price=1, product_cost=1, return_rate_pct=25, delivery_rate_pct=74.5)
+        calc(price=1, product_cost=1, return_rate_pct=25, delivery_rate_pct=75.005)      # dentro de 0,01
+
+
 class ValidationTest(unittest.TestCase):
     BASE = dict(currency="COP", price=89900, product_cost=30000)
 
@@ -449,6 +495,20 @@ class ApiTest(unittest.TestCase):
             st, d = self.member.call("POST", "/api/profit/calc", raw=raw)
             self.assertEqual(st, 400, raw)
             self.assertIn("error", d)
+
+    def test_enteros_gigantes_en_json_dan_400(self):
+        """json.loads lanza ValueError (no JSONDecodeError) con enteros de más de 4300 dígitos: antes era un 500."""
+        big = b"9" * 5000
+        cases = [("POST", "/api/profit/calc", b'{"price": ' + big + b', "product_cost": 1}'),
+                 ("PUT", "/api/profit/defaults", b'{"currency": "COP", "defaults": {"packaging": ' + big + b"}}"),
+                 ("POST", "/api/imports", b'{"product_id": 1, "sell_price": ' + big + b"}")]
+        for method, path, raw in cases:
+            st, d = self.member.call(method, path, raw=raw)
+            self.assertEqual((st, d.get("error")), (400, "JSON inválido"), path)
+
+    def test_calc_devuelve_veredicto(self):
+        st, d = self.member.call("POST", "/api/profit/calc", self.BODY)
+        self.assertEqual(d["verdict"], "profitable")
 
     def test_supuestos_por_usuario_aislados(self):
         st, d = self.member.call("GET", "/api/profit/defaults?currency=COP")

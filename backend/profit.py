@@ -272,6 +272,14 @@ def _calculate(inputs, defaults) -> dict:
             "profit": q(profit_confirmed),
         },
     }
+    if profit_confirmed < 0:                  # el veredicto usa valores SIN redondear (la UI no recalcula)
+        result["verdict"] = "loss"
+    elif profit_confirmed == 0:
+        result["verdict"] = "break_even"
+    elif revenue > 0 and profit_confirmed / revenue * 100 < LOW_MARGIN_PCT:
+        result["verdict"] = "low_margin"
+    else:
+        result["verdict"] = "profitable"
     result["warnings"] = _warnings(result, code, profit_confirmed, revenue, ret_pct, warn_pct, price, "cpa" in v or "target_roas" in v)
     return result
 
@@ -285,7 +293,10 @@ def _warnings(res, code, profit, revenue, ret_pct, warn_pct, price, has_ads) -> 
     if ret_pct >= 100:
         add("all_returned", "Con 100 % de devoluciones ningún pedido se entrega: pierdes los fletes y el empaque de cada pedido.")
     if profit < 0:
-        add("negative_margin", f"Pierdes {money_text(-res['profit_per_confirmed'], code)} por cada pedido confirmado "
+        unit = Decimal(1).scaleb(-DECIMALS[code])
+        lost = money_text(-res["profit_per_confirmed"], code) if res["profit_per_confirmed"] < 0 \
+            else f"menos de {money_text(float(unit), code)}"          # pérdida real que se redondea a 0
+        add("negative_margin", f"Pierdes {lost} por cada pedido confirmado "
                                f"({money_text(-res['profit_per_100'], code)} por cada 100). Sube el precio o baja costos, fletes o devoluciones.")
     elif revenue > 0 and profit / revenue * 100 < LOW_MARGIN_PCT:
         add("low_margin", "El margen es menor a 10 %: una subida de devoluciones o de CPA te dejaría en pérdida.")

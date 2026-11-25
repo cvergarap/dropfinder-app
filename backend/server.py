@@ -911,7 +911,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if getattr(e, "code", None):
                     payload["code"] = e.code
                 return e.status, payload, getattr(e, "headers", None) or {}
-            except (json.JSONDecodeError, UnicodeDecodeError):
+            except ValueError:                 # JSONDecodeError, UnicodeDecodeError y enteros de >4300 dígitos
                 return 400, {"error": "JSON inválido"}, {}
             except OverflowError:              # ids enormes (/api/users/99999999999999999999…)
                 return 400, {"error": "Identificador inválido"}, {}

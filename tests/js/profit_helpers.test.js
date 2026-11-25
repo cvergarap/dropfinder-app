@@ -20,6 +20,20 @@ t("parseNumber: formatos colombianos y de EE. UU.", () => {
   assert.equal(h.parseNumber("  7  "), 7);
 });
 
+t("parseNumber: «0,500» y «0.125» NO son miles (error de 1000x)", () => {
+  assert.equal(h.parseNumber("0,500"), 0.5);
+  assert.equal(h.parseNumber("0.500"), 0.5);
+  assert.equal(h.parseNumber("0.500", 0), 0.5);
+  assert.equal(h.parseNumber("0,500", 0), 0.5);
+  assert.equal(h.parseNumber("0.125", 0), 0.125);
+  assert.equal(h.parseNumber("0,5"), 0.5);
+  assert.equal(h.parseNumber("1.500", 0), 1500);
+  assert.equal(h.parseNumber("1,500"), 1500);
+  assert.equal(h.parseNumber("1,500", 0), 1500);
+  assert.equal(h.parseNumber("1.500", 2), 1.5);
+  assert.equal(h.parseNumber("01.500", 0), 1.5);       // ceros a la izquierda: no es un grupo de miles
+});
+
 t("parseNumber: vacío es null y lo inválido es NaN", () => {
   assert.equal(h.parseNumber(""), null);
   assert.equal(h.parseNumber("   "), null);
@@ -100,6 +114,13 @@ t("verdict: tres tonos y estado vacío", () => {
   assert.equal(h.verdict({ ...base, profit_per_confirmed: 0, margin_pct: 0 }).tone, "warn");
   assert.equal(h.verdict(null).tone, "muted");
   assert.ok(h.verdict({ ...base, profit_per_confirmed: -1 }).label.length > 5);       // siempre hay texto, no solo color
+});
+
+t("verdict usa el campo del servidor (sin redondear)", () => {
+  assert.equal(h.verdict({ ...base, verdict: "low_margin", margin_pct: 10 }).tone, "warn");       // 9,96 % se muestra 10,0
+  assert.equal(h.verdict({ ...base, verdict: "loss", profit_per_confirmed: 0 }).tone, "bad");       // pérdida que se redondea a 0
+  assert.equal(h.verdict({ ...base, verdict: "break_even", profit_per_confirmed: 0 }).tone, "warn");
+  assert.equal(h.verdict({ ...base, verdict: "profitable" }).tone, "good");
 });
 
 t("summaryRows: valores y 'sin dato'", () => {

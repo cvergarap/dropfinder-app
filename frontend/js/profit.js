@@ -49,7 +49,7 @@
     if (dots && commas) dec = s.lastIndexOf(".") > s.lastIndexOf(",") ? "." : ",";
     else if (dots + commas === 1) {
       const sep = dots ? "." : ",";
-      const thousands = s.length - s.indexOf(sep) - 1 === 3 && s.indexOf(sep) > 0 && (sep === "," || decimals === 0);
+      const thousands = s.length - s.indexOf(sep) - 1 === 3 && /^[1-9]\d{0,2}$/.test(s.slice(0, s.indexOf(sep))) && (sep === "," || decimals === 0);
       dec = thousands ? null : sep;
     }
     let out;
@@ -113,6 +113,11 @@
   /* Veredicto de un resultado de la API: tono (clase CSS) y texto. Siempre texto además del color. */
   function verdict(r) {
     if (!r || typeof r.profit_per_confirmed !== "number") return { tone: "muted", icon: "", label: "Completa precio y costo para calcular" };
+    const sv = r.verdict;                             // el servidor decide con valores sin redondear
+    if (sv === "loss") return { tone: "bad", icon: "✕", label: "Pierdes dinero con estos supuestos" };
+    if (sv === "break_even") return { tone: "warn", icon: "!", label: "Estás en equilibrio: no ganas ni pierdes" };
+    if (sv === "low_margin") return { tone: "warn", icon: "!", label: "Margen bajo: cualquier desvío te deja en pérdida" };
+    if (sv === "profitable") return { tone: "good", icon: "✓", label: "Rentable con estos supuestos" };
     if (r.profit_per_confirmed < 0) return { tone: "bad", icon: "✕", label: "Pierdes dinero con estos supuestos" };
     if (r.margin_pct === null || r.margin_pct < 10) return { tone: "warn", icon: "!", label: "Margen bajo: cualquier desvío te deja en pérdida" };
     return { tone: "good", icon: "✓", label: "Rentable con estos supuestos" };
@@ -182,7 +187,7 @@
       <input id="${id}" name="${f.key}" type="text" inputmode="decimal" autocomplete="off" data-key="${f.key}" ${f.required ? "required" : ""}
         aria-describedby="${id}-hint ${id}-err">
       <small id="${id}-hint" class="pf-hint">${esc(f.help || "")}</small>
-      <small id="${id}-err" class="pf-err" role="alert"></small>
+      <small id="${id}-err" class="pf-err"></small>
     </div>`;
   }
 
@@ -211,7 +216,7 @@
               <label for="pf-ad" id="pf-ad-label">CPA: costo de publicidad por pedido confirmado</label>
               <input id="pf-ad" type="text" inputmode="decimal" autocomplete="off" data-key="ad" aria-describedby="pf-ad-hint pf-ad-err">
               <small id="pf-ad-hint" class="pf-hint">Vacío = sin publicidad en el cálculo.</small>
-              <small id="pf-ad-err" class="pf-err" role="alert"></small>
+              <small id="pf-ad-err" class="pf-err"></small>
             </div></div>
           </fieldset>
           <div class="pf-actions">
@@ -345,8 +350,8 @@
     }
     const v = verdict(r);
     sum.className = `pf-summary pf-${v.tone}`;
-    sum.innerHTML = `<span class="pf-verdict"><span aria-hidden="true">${v.icon}</span> ${esc(v.label)}</span>
-      <span class="sr-only">${esc(announce(r, fmtMoney))}</span>`;
+    sum.innerHTML = `<span class="pf-verdict" aria-hidden="true">${v.icon} ${esc(v.label)}</span>
+      <span class="sr-only">${esc(announce(r, fmtMoney))}</span>`;       // un solo texto para lectores: el visible va aria-hidden
     const rows = summaryRows(r, fmtMoney), bd = breakdownRows(r, fmtMoney);
     det.innerHTML = `
       <dl class="pf-metrics">${rows.map((x) => `<div class="pf-metric"><dt>${esc(x.label)}</dt>
@@ -361,7 +366,9 @@
 
   /* ---------------- supuestos del usuario ---------------- */
   async function saveDefaults() {
-    const { payload } = buildPayload(values(), { currency: st.currency });
+    const { payload, errors } = buildPayload(values(), { currency: st.currency });
+    const bad = Object.keys(errors).filter((k) => DEFAULT_FIELDS.includes(k));
+    if (bad.length) { showErrors(errors); msg("Corrige los campos marcados antes de guardar tus supuestos."); return; }
     const body = {};
     for (const k of DEFAULT_FIELDS) if (k in payload) body[k] = payload[k];
     if (!Object.keys(body).length) { msg("Escribe al menos un valor de logística o contraentrega para guardarlo como supuesto."); return; }

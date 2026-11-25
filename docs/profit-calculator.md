@@ -42,7 +42,7 @@ Supuestos de modelado (documentados porque cambian el resultado):
 - Cálculo con `Decimal`; se redondea **una sola vez**, al final, con «mitad hacia arriba»: COP sin decimales, USD 2,
   margen 1 decimal, ROAS 2. Las líneas del desglose se redondean cada una, así que pueden diferir de la suma en una unidad.
 - Entradas: números JSON (no texto, no booleanos); se rechazan NaN, infinitos, negativos, porcentajes fuera de 0–100,
-  ROAS fuera de 0,01–100 y montos sobre el tope (USD 100.000 / COP 400.000.000). Se admiten 4 decimales como máximo.
+  ROAS fuera de 0,01–100 y montos sobre el tope (USD 100.000 / COP 400.000.000). Los valores se redondean a 4 decimales al validarlos.
   Campos desconocidos, CPA y ROAS a la vez, o devoluciones y efectividad que no sumen 100 → 400 con `code: "invalid_<campo>"`.
 - Opcionales ausentes → supuestos del usuario (luego los de fábrica); quedan listados en `defaults_used` y en un aviso.
 
@@ -59,6 +59,7 @@ Supuestos de modelado (documentados porque cambian el resultado):
 Cada usuario guarda los suyos **por moneda** (tabla `profit_defaults`, esquema v8); nadie ve ni usa los de otro.
 
 ## Avisos
+El resultado trae `verdict` (`profitable`, `low_margin`, `loss`, `break_even`), calculado sin redondear.
 `negative_margin`, `low_margin` (< 10 %), `high_returns` (devoluciones > umbral), `all_returned`, `zero_price`,
 `no_ads` (sin CPA ni ROAS), `defaults_used`.
 
