@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from .base import (ListingRef, StoreAuthError, StoreConnector, StoreError, StoreInfo, StoreNotFound,
-                   StoreProduct, StoreRateLimited, StoreValidationError, scrub)
+                   StoreProduct, StoreRateLimited, StoreValidationError, is_owned_by, safe_tags, scrub, tags_match)
 
 _registry: dict[str, type[StoreConnector]] = {}
 
@@ -38,5 +38,5 @@ for _mod in ("shopify", "tiendanube", "woocommerce"):
         if _e.name != f"{__name__}.{_mod}":
             raise
 
-__all__ = ["scrub", "register", "platforms", "get_class", "create", "StoreConnector", "StoreProduct", "ListingRef",
+__all__ = ["scrub", "tags_match", "safe_tags", "is_owned_by", "register", "platforms", "get_class", "create", "StoreConnector", "StoreProduct", "ListingRef",
            "StoreInfo", "StoreError", "StoreAuthError", "StoreRateLimited", "StoreNotFound", "StoreValidationError"]

@@ -6,6 +6,15 @@ const h = require(path.join(__dirname, "../../frontend/js/stores.js"));
 let n = 0;
 const t = (name, fn) => { fn(); n += 1; console.log(`ok - ${name}`); };
 
+t("parseDomainInput: Tiendanube conserva el ID dentro del enlace pegado", () => {
+  assert.equal(h.parseDomainInput("1234567", "tiendanube"), "1234567");
+  assert.equal(h.parseDomainInput("  https://www.tiendanube.com/admin/v2/stores/1234567/products ", "tiendanube"),
+    "https://www.tiendanube.com/admin/v2/stores/1234567/products");
+  assert.equal(h.parseDomainInput("x".repeat(500), "tiendanube").length, 300);
+  assert.equal(h.parseDomainInput("https://MiTienda.com/wp-admin", "woocommerce"), "mitienda.com");   // otras: solo el host
+  assert.equal(h.parseDomainInput("https://MiTienda.com/x"), "mitienda.com");
+});
+
 t("parseDomainInput: enlaces pegados", () => {
   assert.equal(h.parseDomainInput("  https://MiTienda.myshopify.com/admin/products?x=1 "), "mitienda.myshopify.com");
   assert.equal(h.parseDomainInput("http://user:pw@tienda.com:8080/"), "tienda.com:8080");

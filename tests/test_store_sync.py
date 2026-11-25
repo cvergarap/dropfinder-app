@@ -170,7 +170,9 @@ class PublishTest(Base):
         self.assertNotIn("Proveedor Secreto", raw)
         self.assertNotIn("7.77", prod["description"])
         self.assertIn("Hogar", prod["description"])
-        self.assertEqual((prod["tags"], prod["active"], prod["price"]), (["dropfinder"], False, 20.0))
+        self.assertEqual((prod["tags"][0], prod["active"], prod["price"]), ("dropfinder", False, 20.0))
+        self.assertRegex(prod["tags"][1], r"^dfi-[0-9a-f]{8}$")        # marca de ESTA instalación (ver installation_tag)
+        self.assertEqual(len(prod["tags"]), 2)
 
     def test_not_draft_publishes_visible(self):
         store = self.connect()
@@ -728,6 +730,69 @@ class ChangeDuringRunningJobTest(Base):
         self.assertEqual(len(FakeStore.calls), calls)
         # y tras terminar varios trabajos seguidos el total de syncs es acotado
         self.assertLessEqual(len([j for j in self.jobs(lid) if j["action"] == "sync"]), 2)
+
+
+class OwnershipTagTest(Base):
+    """Propiedad por etiquetas: el motor pasa SIEMPRE a los conectores la `dfi-` de la instalación y los reintentos no la
+    regeneran."""
+
+    def tag(self):
+        with db.connect() as conn:
+            return store_sync.installation_tag(conn)
+
+    def set_installation(self, value):
+        with db.connect() as conn:
+            conn.execute("UPDATE meta SET value = ? WHERE key = 'installation_id'", (value,))
+
+    def test_remote_delete_passes_installation_tag(self):
+        store, iid, lid = self.published()
+        store_sync.delete_listing(lid, {"remove_remote": ["1"]})
+        store_sync.run_due_jobs()
+        self.assertEqual(FakeStore.delete_tags, [self.tag()])
+        self.assertRegex(FakeStore.delete_tags[0], r"^dfi-[0-9a-f]{8}$")
+
+    def test_compensation_delete_passes_the_tag_used_to_publish(self):
+        store = self.connect()
+        r = store_sync.publish(store["id"], {"imported_ids": [self.imp()]})
+        lid = r["queued"][0]["listing_id"]
+        orig = FakeStore.publish
+
+        def pub(self_, product):
+            ref = orig(self_, product)
+            with db.connect() as conn:                       # el usuario quita el anuncio durante la llamada
+                conn.execute("DELETE FROM store_listings WHERE id = ?", (lid,))
+            return ref
+        FakeStore.publish = pub
+        self.addCleanup(lambda: setattr(FakeStore, "publish", orig))
+        store_sync.run_due_jobs()
+        self.assertEqual(FakeStore.stores[self.domain]["products"], {})
+        self.assertEqual(FakeStore.delete_tags, [self.tag()])
+
+    def test_retry_reuses_tags_of_failed_publish_after_installation_id_change(self):
+        """Si cambia meta.installation_id, el reintento NO regenera la `dfi-`: el producto que el intento fallido pudo
+        crear lleva la vieja y el reintento chocaría con su propio producto."""
+        store = self.connect()
+        r = store_sync.publish(store["id"], {"imported_ids": [self.imp()]})
+        lid = r["queued"][0]["listing_id"]
+        old_tags = json.loads(self.jobs(lid)[0]["payload"])["product"]["tags"]
+        FakeStore.fail_next.append(sc.StoreValidationError("precio inválido"))
+        store_sync.run_due_jobs()
+        self.assertEqual(self.listing(lid)["status"], "error")
+        self.set_installation("ffff0000")
+        self.assertNotEqual(self.tag(), old_tags[1])
+        store_sync.listing_action(lid, "retry")
+        new = [j for j in self.jobs(lid) if j["status"] == "pending"][0]
+        self.assertEqual(json.loads(new["payload"])["product"]["tags"], old_tags)
+
+    def test_fresh_publish_uses_current_installation_tag(self):
+        store, iid, lid = self.published()
+        with db.connect() as conn:
+            conn.execute("DELETE FROM store_listings WHERE id = ?", (lid,))
+        self.set_installation("ffff0000")
+        store2 = self.connect("otra.fake.test")
+        r = store_sync.publish(store2["id"], {"imported_ids": [iid]})
+        tags = json.loads(self.jobs(r["queued"][0]["listing_id"])[0]["payload"])["product"]["tags"]
+        self.assertEqual(tags, ["dropfinder", "dfi-ffff0000"])
 
 
 class PublishSaveFailureTest(Base):

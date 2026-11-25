@@ -41,9 +41,12 @@
   const MAX_BULK = 50;
 
   /* Dirección de la tienda: acepta enlaces pegados y devuelve solo el dominio (el servidor vuelve a normalizar). */
-  function parseDomainInput(value) {
+  function parseDomainInput(value, platform) {
     let s = String(value == null ? "" : value).trim();
     if (!s) return "";
+    // Tiendanube se identifica por el ID NUMÉRICO de la tienda, que puede venir dentro de un enlace del panel: no se
+    // reduce a un host (se perdería el ID). Se envía el texto tal cual (acotado) y el servidor extrae el número.
+    if (platform === "tiendanube") return s.replace(/\s+/g, " ").slice(0, 300);
     const m = /^[a-z][a-z0-9+.-]*:\/\/(.*)$/i.exec(s);
     if (m) s = m[1]; else if (s.startsWith("//")) s = s.slice(2);
     const cut = s.search(/[/?#]/);
@@ -633,7 +636,18 @@
     });
   }
 
-  const domainExample = (p) => (p === "shopify" ? "mitienda.myshopify.com" : "mitienda.com");
+  /* Cómo pedir la dirección de cada plataforma. Lo demás (campos, ayuda, grupos) viene del servidor. */
+  const PLATFORM_UI = {
+    shopify: { label: "Dirección de la tienda", example: "mitienda.myshopify.com",
+      hint: "Puedes pegar el enlace completo: nos quedamos con el dominio." },
+    tiendanube: { label: "ID de la tienda", example: "1234567",
+      hint: "Es el número de tu tienda. Puedes pegar un enlace de tu panel de Tiendanube que lo contenga." },
+    woocommerce: { label: "Dirección de la tienda", example: "mitienda.com",
+      hint: "Escribe el dominio EXACTO con el que carga tu tienda (con o sin www, como lo ves en el navegador): no se siguen redirecciones." },
+  };
+  const platformUi = (p) => PLATFORM_UI[p] || { label: "Dirección de la tienda", example: "mitienda.com",
+    hint: "Puedes pegar el enlace completo: nos quedamos con el dominio." };
+  const domainExample = (p) => platformUi(p).example;
 
   async function openConnect() {
     let platforms;
@@ -660,10 +674,10 @@
         <details class="st-help" open><summary>Cómo conectar ${esc(platform.label)}</summary>
           <div class="st-help-body">${helpHtml(platform.setup_help) || "<p>Completa los datos que te pide la plataforma.</p>"}</div></details>
         <div class="st-field">
-          <label for="stcDomain">Dirección de la tienda</label>
+          <label for="stcDomain">${esc(platformUi(platform.platform).label)}</label>
           <input id="stcDomain" name="domain" type="text" inputmode="url" autocomplete="off" autocapitalize="none" spellcheck="false"
             placeholder="${esc(domainExample(platform.platform))}" aria-required="true" aria-describedby="stcDomainHint">
-          <small class="muted" id="stcDomainHint">Ej.: ${esc(domainExample(platform.platform))}. Puedes pegar el enlace completo: nos quedamos con el dominio.</small>
+          <small class="muted" id="stcDomainHint">Ej.: ${esc(domainExample(platform.platform))}. ${esc(platformUi(platform.platform).hint)}</small>
         </div>
         <div class="st-field">
           <label for="stcName">Nombre para reconocerla <span class="st-opt">(opcional)</span></label>
@@ -689,7 +703,7 @@
     // Si pegan un enlace, se deja solo el dominio
     form.addEventListener("change", (e) => {
       if (e.target.id !== "stcDomain") return;
-      e.target.value = parseDomainInput(e.target.value);
+      e.target.value = parseDomainInput(e.target.value, platform.platform);
     });
     $("[data-cancel]", dlg).addEventListener("click", () => dlg.close());
 
@@ -698,8 +712,8 @@
       e.preventDefault();
       if (sending) return;                                  // sin envíos dobles
       hideError(err);
-      const domain = parseDomainInput($("#stcDomain", dlg).value);
-      if (!domain) { showError(err, "Escribe la dirección de tu tienda."); $("#stcDomain", dlg).focus(); return; }
+      const domain = parseDomainInput($("#stcDomain", dlg).value, platform.platform);
+      if (!domain) { showError(err, `Escribe ${platformUi(platform.platform).label === "ID de la tienda" ? "el ID" : "la dirección"} de tu tienda.`); $("#stcDomain", dlg).focus(); return; }
       $("#stcDomain", dlg).value = domain;
       const c = readCredentials(form, platform, "stc");
       if (c.error) { showError(err, c.error); return; }

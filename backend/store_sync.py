@@ -56,6 +56,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import threading
@@ -283,7 +284,18 @@ def _https_image(url) -> str | None:
     return None
 
 
-def _snapshot(crow, imp, state: dict, as_draft: bool) -> tuple[dict | None, str, str]:
+OWNER_TAG = "dropfinder"
+
+
+def installation_tag(conn) -> str:
+    """Etiqueta propia de ESTA instalación (`dfi-<8 hex>`, aleatoria, guardada en `meta`). Junto con `dropfinder` es la
+    marca con la que los conectores reconocen lo que creó esta instalación: el SKU `DF-<id>` por sí solo no basta, porque
+    el id es local a cada base de datos y puede coincidir con un producto del cliente o de otra instalación."""
+    conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('installation_id', ?)", (secrets.token_hex(4),))
+    return "dfi-" + str(conn.execute("SELECT value FROM meta WHERE key = 'installation_id'").fetchone()[0])
+
+
+def _snapshot(crow, imp, state: dict, as_draft: bool, install_tag: str) -> tuple[dict | None, str, str]:
     """(payload del trabajo publish, razón de omisión, mensaje). payload None si no se puede publicar."""
     code = (crow["currency"] or "").upper()
     if code not in SUPPORTED_CURRENCIES:
@@ -295,7 +307,7 @@ def _snapshot(crow, imp, state: dict, as_draft: bool) -> tuple[dict | None, str,
     prod = {"title": imp["title"][:200], "price": price, "sku": f"DF-{imp['pid']}", "stock": _cap_stock(imp["stock"]),
             "description": _description(imp["title"], imp["category"]), "image_urls": [image] if image else [],
             "vendor": (crow["name"] or "")[:80], "product_type": (imp["category"] or "")[:100],
-            "tags": ["dropfinder"], "active": not as_draft}
+            "tags": [OWNER_TAG, install_tag], "active": not as_draft}
     return {"product": prod, "cost_usd": round(imp["cost"] + imp["shipping_cost"], 4), "currency": code}, "", ""
 
 
@@ -344,6 +356,7 @@ def publish(cid: int, body: dict) -> dict:
             raise ApiError(404, "Tienda no encontrada")
         as_draft = stores_mod.load_settings(crow)["publish_as_draft"] if as_draft_req is None else as_draft_req
         state = currency.get_state(conn, user_id=uid)
+        itag = installation_tag(conn)
         imps = {r["id"]: r for r in conn.execute(
             _IMP_SQL + f" WHERE i.user_id = ? AND i.id IN ({','.join('?' * len(ids))})", [uid, *ids])}
         existing = {r["imported_id"] for r in conn.execute(
@@ -364,7 +377,7 @@ def publish(cid: int, body: dict) -> dict:
             skipped.append({"imported_id": iid, "reason": "demo_not_allowed",
                             "message": "Es un producto de demostración (ficticio); confirma que quieres publicarlo"})
         else:
-            payload, reason, msg = _snapshot(crow, imp, state, as_draft)
+            payload, reason, msg = _snapshot(crow, imp, state, as_draft, itag)
             if payload is None:
                 skipped.append({"imported_id": iid, "reason": reason, "message": msg})
             else:
@@ -572,9 +585,15 @@ def _retry(conn, r, uid: int) -> str | None:
             warning = ("Es posible que el producto ya exista en tu tienda: si lo reintentas podría duplicarse. "
                        f"Revisa el SKU {_sku_of(old)} antes de continuar.")
         as_draft = not old.get("product", {}).get("active", not stores_mod.load_settings(crow)["publish_as_draft"])
-        payload, reason, msg = _snapshot(crow, imp, currency.get_state(conn, user_id=uid), as_draft)
+        payload, reason, msg = _snapshot(crow, imp, currency.get_state(conn, user_id=uid), as_draft, installation_tag(conn))
         if payload is None:
             raise ApiError(409, msg)
+        old_tags = (old.get("product") or {}).get("tags") if isinstance(old.get("product"), dict) else None
+        if isinstance(old_tags, list) and old_tags:
+            # Reintento: se reutilizan las etiquetas del intento fallido. Si cambió el `installation_id` y se
+            # regenerasen, el producto que ese intento pudo crear llevaría la `dfi-` vieja y el reintento chocaría
+            # con su propio producto (conflicto para siempre).
+            payload["product"]["tags"] = list(old_tags)
         conn.execute("UPDATE store_listings SET status = 'pending', external_id = NULL, external_variant_id = NULL, "
                      "external_inventory_id = NULL, external_url = NULL, last_error = NULL WHERE id = ?", (lid,))
         _enqueue(conn, uid, lid, "publish", payload)
@@ -837,9 +856,15 @@ class _Skip(Exception):
     """El trabajo ya no aplica (el anuncio cambió): se marca hecho sin llamar a la tienda."""
 
 
-def _ref(r) -> sc.ListingRef:
+def _ref(r, owner_tag: str = "") -> sc.ListingRef:
     return sc.ListingRef(external_id=r["external_id"] or "", variant_id=r["external_variant_id"] or "",
-                         inventory_item_id=r["external_inventory_id"] or "", url=r["external_url"] or "")
+                         inventory_item_id=r["external_inventory_id"] or "", url=r["external_url"] or "",
+                         owner_tag=owner_tag)
+
+
+def _owner_tag_of(tags) -> str:
+    """Etiqueta `dfi-…` de las etiquetas con las que se publicó un producto (vacía si no hay)."""
+    return next((t for t in tags or [] if isinstance(t, str) and t.lower().startswith("dfi-")), "")
 
 
 def _run_job(job, now: datetime) -> bool:
@@ -970,6 +995,7 @@ def _do_publish(job, lst, crow, connector, payload, now) -> None:
         return
     if not saved:
         try:                                     # compensación: no dejar un producto huérfano en la tienda
+            ref.owner_tag = _owner_tag_of(sp.tags)       # solo se borra si lleva ESA etiqueta de instalación
             connector.delete(ref)
             msg = "El anuncio se quitó durante la publicación; se eliminó el producto recién creado en la tienda"
         except sc.StoreError as e:
@@ -1078,7 +1104,8 @@ def _do_visibility(job, lst, crow, connector, payload, now) -> None:
 
 def _do_delete(job, lst, crow, connector, payload, now) -> None:
     if lst["external_id"] and lst["status"] != "removed":
-        connector.delete(_ref(lst))              # si ya no existe, el conector no lanza error
+        # Solo se borra un producto con `dropfinder` + la `dfi-` de ESTA instalación (el conector lo comprueba)
+        connector.delete(_ref(lst, _write(installation_tag)))   # si ya no existe, el conector no lanza error
 
     def save(c):
         _log(c, job["user_id"], lst["connection_id"], lst["id"], "delete", True,

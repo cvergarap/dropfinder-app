@@ -49,7 +49,7 @@ class Base(unittest.TestCase):
     def product(self, **kw):
         d = dict(title="Lámpara <LED> & más", price=19.9, sku="DF-1", stock=7, description="Línea 1\nLínea <b>2</b>",
                  image_urls=["https://cdn.x.com/a.jpg", "http://x.com/b.jpg", "javascript:alert(1)", "https://u:p@x.com/c.jpg"],
-                 compare_at_price=29.9, vendor="Prov", product_type="Hogar", tags=["a", "b,c"], cost=7.5)
+                 compare_at_price=29.9, vendor="Prov", product_type="Hogar", tags=["dropfinder", "dfi-test1"], cost=7.5)
         d.update(kw)
         return StoreProduct(**d)
 
@@ -158,7 +158,7 @@ class ValidateTest(Base):
 class PublishTest(Base):
     def test_happy_path_sequence_and_inputs(self):
         ref = self.conn().publish(self.product(active=False))
-        self.assertEqual(self.fake.ops(), ["locations", "products", "productCreate", "productVariantsBulkUpdate",
+        self.assertEqual(self.fake.ops(), ["locations", "products", "products", "productCreate", "productVariantsBulkUpdate",
                                             "inventorySetQuantities"])
         create = self.fake.requests_for("productCreate")[0]["body"]["variables"]
         p = create["product"]
@@ -166,7 +166,7 @@ class PublishTest(Base):
         self.assertEqual(p["tags"][-1], "df-sku:DF-1")
         self.assertEqual(p["title"], "Lámpara <LED> & más")
         self.assertEqual(p["descriptionHtml"], "Línea 1<br>Línea &lt;b&gt;2&lt;/b&gt;")
-        self.assertEqual((p["vendor"], p["productType"], p["tags"]), ("Prov", "Hogar", ["a", "b c", "df-sku:DF-1"]))
+        self.assertEqual((p["vendor"], p["productType"], p["tags"]), ("Prov", "Hogar", ["dropfinder", "dfi-test1", "df-sku:DF-1"]))
         self.assertEqual(create["media"], [{"originalSource": "https://cdn.x.com/a.jpg", "mediaContentType": "IMAGE",
                                             "alt": "Lámpara <LED> & más"}])
         bulk = self.fake.requests_for("productVariantsBulkUpdate")[0]["body"]["variables"]
@@ -244,7 +244,7 @@ class PublishTest(Base):
         self.fake.inject("http500", op="productCreate")
         with self.assertRaises(StoreError):
             self.conn().publish(self.product())
-        self.assertEqual(self.fake.ops(), ["locations", "products", "productCreate"])      # nada que limpiar
+        self.assertEqual(self.fake.ops(), ["locations", "products", "products", "productCreate"])      # nada que limpiar
 
     def test_missing_scope_on_publish(self):
         self.st["scopes"].discard("write_products")
@@ -258,6 +258,7 @@ class UpdateTest(Base):
     def setUp(self):
         super().setUp()
         self.ref = self.conn().publish(self.product())
+        self.ref.owner_tag = "dfi-test1"                         # etiqueta de la instalación (la pone el motor)
         self.fake.requests.clear()
 
     def test_update_price_stock(self):
@@ -290,7 +291,7 @@ class UpdateTest(Base):
         self.conn().delete(self.ref)
         self.assertEqual(self.st["products"], {})
         self.conn().delete(self.ref)
-        self.assertEqual(self.fake.ops()[-2:], ["productDelete", "productDelete"])
+        self.assertEqual(self.fake.ops()[-3:], ["product", "productDelete", "product"])   # 2.ª vez: ya no existe
 
     def test_bad_refs(self):
         for bad in (ListingRef("123"), ListingRef("gid://shopify/Product/1\"}"), ListingRef("")):
@@ -985,6 +986,202 @@ class FakeStrictnessTest(Base):
         resp = shttp.request_json("POST", self.fake.token_template.format(shop=SHOP),
                                   {"client_id": CID, "client_secret": CSECRET, "grant_type": "client_credentials"})
         self.assertEqual(resp.status, 400)
+
+
+class OwnershipTest(Base):
+    """El SKU DF-<id> es local a cada base de datos: solo se adopta o borra lo que lleva las etiquetas de DropFinder."""
+
+    def seed(self, tags):
+        return self.fake.seed_product(SHOP, tags)
+
+    def test_foreign_installation_tag_is_a_conflict(self):
+        gid = self.seed(["dropfinder", "dfi-otra", "df-sku:DF-1"])
+        with self.assertRaises(StoreValidationError) as cm:
+            self.conn().publish(self.product())
+        self.assertIn("no creó esta instalación", str(cm.exception))
+        self.assertEqual(self.fake.ops().count("productCreate"), 0)
+        self.assertNotIn("productVariantsBulkUpdate", self.fake.ops())
+        self.assertEqual(list(self.st["products"]), [gid])
+        self.assertEqual(self.st["variants"][self.st["products"][gid]["variant"]]["price"], "0.00")   # intacto
+
+    def test_customer_product_with_sku_tag_only_is_a_conflict(self):
+        self.seed(["df-sku:DF-1"])
+        with self.assertRaises(StoreValidationError):
+            self.conn().publish(self.product())
+        self.assertNotIn("productCreate", self.fake.ops())
+
+    def test_missing_dfi_or_dropfinder_is_a_conflict(self):
+        for tags in (["dropfinder", "df-sku:DF-1"], ["dfi-test1", "df-sku:DF-1"]):
+            self.fake.requests.clear()
+            self.st["products"].clear()
+            self.seed(tags)
+            with self.assertRaises(StoreValidationError, msg=tags):
+                self.conn().publish(self.product())
+            self.assertNotIn("productCreate", self.fake.ops())
+
+    def test_no_ownership_tags_never_adopts(self):
+        self.seed(["df-sku:DF-1"])
+        with self.assertRaises(StoreValidationError):
+            self.conn().publish(self.product(tags=[]))
+
+    def test_own_tags_adopted_case_insensitive(self):
+        gid = self.seed(["DropFinder", "DFI-TEST1", "df-sku:DF-1"])
+        ref = self.conn().publish(self.product())
+        self.assertEqual(ref.external_id, gid)
+        self.assertNotIn("productCreate", self.fake.ops())
+
+    def test_foreign_and_own_both_present_adopts_own(self):
+        self.seed(["dropfinder", "dfi-otra", "df-sku:DF-1"])
+        own = self.seed(["dropfinder", "dfi-test1", "df-sku:DF-1"])
+        self.assertEqual(self.conn().publish(self.product()).external_id, own)
+
+    def test_delete_refuses_foreign_products(self):
+        for tags in (["x"], [], ["dropfinder"], ["dfi-test1"], ["dropfinder", "dfi-"], ["dropfinder-x", "dfi"]):
+            self.fake.requests.clear()
+            gid = self.seed(tags)
+            with self.assertRaises(StoreValidationError, msg=tags):
+                self.conn().delete(ListingRef(gid, owner_tag="dfi-test1"))
+            self.assertNotIn("productDelete", self.fake.ops())
+            self.assertIn(gid, self.st["products"])
+
+    def test_delete_refuses_other_installation_and_names_its_tag(self):
+        """Regresión: antes bastaba `dropfinder` + ALGUNA `dfi-…`; un anuncio que apuntara a un producto de OTRA
+        instalación lo borraba."""
+        gid = self.seed(["dropfinder", "dfi-otra"])
+        with self.assertRaises(StoreValidationError) as cm:
+            self.conn().delete(ListingRef(gid, owner_tag="dfi-test1"))
+        self.assertIn("dfi-otra", str(cm.exception))
+        self.assertNotIn("productDelete", self.fake.ops())
+        self.assertIn(gid, self.st["products"])
+
+    def test_delete_without_owner_tag_never_deletes(self):
+        gid = self.seed(["dropfinder", "dfi-test1"])
+        for tag in ("", "dropfinder", "dfi-", "otra"):
+            with self.assertRaises(StoreValidationError, msg=tag):
+                self.conn().delete(ListingRef(gid, owner_tag=tag))
+        self.assertNotIn("productDelete", self.fake.ops())
+
+    def test_conflict_message_names_foreign_dfi_tag(self):
+        self.seed(["dropfinder", "dfi-otra", "df-sku:DF-1"])
+        with self.assertRaises(StoreValidationError) as cm:
+            self.conn().publish(self.product())
+        self.assertIn("dfi-otra", str(cm.exception))
+
+    def test_sku_tag_comparison_is_case_insensitive(self):
+        """Shopify no distingue mayúsculas en las etiquetas: una `DF-SKU:df-1` propia se adopta (no se duplica) y una
+        ajena es conflicto."""
+        own = self.seed(["dropfinder", "dfi-test1", "DF-SKU:DF-1"])
+        self.assertEqual(self.conn().publish(self.product()).external_id, own)
+        self.assertNotIn("productCreate", self.fake.ops())
+        self.st["products"].clear()
+        self.seed(["dropfinder", "dfi-otra", "DF-SKU:DF-1"])
+        with self.assertRaises(StoreValidationError):
+            self.conn().publish(self.product())
+
+    def test_customer_product_with_same_sku_and_no_tags_is_a_conflict(self):
+        """Un producto del cliente con el mismo SKU (sin etiqueta df-sku ni de propiedad) no se duplica ni se toca."""
+        gid = self.fake.seed_product(SHOP, ["ofertas"], sku="DF-1")
+        with self.assertRaises(StoreValidationError) as cm:
+            self.conn().publish(self.product())
+        self.assertIn("no creó esta instalación", str(cm.exception))
+        self.assertNotIn("productCreate", self.fake.ops())
+        self.assertEqual(list(self.st["products"]), [gid])
+
+    def test_own_product_found_by_sku_without_sku_tag_is_adopted(self):
+        gid = self.fake.seed_product(SHOP, ["dropfinder", "dfi-test1"], sku="df-1")
+        self.assertEqual(self.conn().publish(self.product()).external_id, gid)
+        self.assertNotIn("productCreate", self.fake.ops())
+
+    def test_hostile_tags_are_rejected_safely(self):
+        """`tags` hostiles de un producto ajeno (número, dict, None, mezclas) no provocan TypeError: rechazo limpio."""
+        for hostile in (5, {"a": "dropfinder"}, None, "dropfinder", [5, None, {"x": 1}, ["dropfinder"]]):
+            gid = self.fake.seed_product(SHOP, [], sku="DF-1")
+            self.st["products"][gid]["tags"] = hostile
+            with self.subTest(hostile=hostile):
+                with self.assertRaises(StoreValidationError) as cm:
+                    self.conn().delete(ListingRef(gid, owner_tag="dfi-test1"))
+                self.assertIn("no lleva las etiquetas", str(cm.exception))
+                with self.assertRaises(StoreValidationError) as cm:
+                    self.conn().publish(self.product())
+                self.assertIn("no creó esta instalación", str(cm.exception))
+                self.assertIn(gid, self.st["products"])
+            self.st["products"].clear()
+
+    def test_hostile_items_in_tags_next_to_the_sku_tag(self):
+        """Elementos no-str entre las etiquetas se ignoran (sin TypeError/AttributeError); lo propio se sigue adoptando
+        y lo ajeno sigue siendo conflicto."""
+        gid = self.seed(["dropfinder", "dfi-test1", "df-sku:DF-1", 5, None, {"a": 1}, ["x"]])
+        self.assertEqual(self.conn().publish(self.product()).external_id, gid)
+        self.st["products"].clear()
+        self.seed(["dfi-otra", "df-sku:DF-1", 5, None])
+        with self.assertRaises(StoreValidationError):
+            self.conn().publish(self.product())
+
+    def test_delete_own_and_gone(self):
+        gid = self.seed(["Dropfinder", "dfi-abc"])
+        self.conn().delete(ListingRef(gid, owner_tag="DFI-ABC"))
+        self.assertNotIn(gid, self.st["products"])
+        self.fake.requests.clear()
+        self.conn().delete(ListingRef(gid, owner_tag="dfi-abc"))                      # ya no existe: sin error y sin productDelete
+        self.assertNotIn("productDelete", self.fake.ops())
+
+    def test_orphan_cleanup_deletes_only_what_this_call_created(self):
+        foreign = self.seed(["x"])
+        self.fake.inject("http500", op="inventorySetQuantities")
+        with self.assertRaises(StoreError):
+            self.conn().publish(self.product())
+        self.assertEqual(list(self.st["products"]), [foreign])
+        deletes = self.fake.requests_for("productDelete")
+        self.assertEqual(len(deletes), 1)
+        self.assertNotEqual(deletes[0]["body"]["variables"]["input"]["id"], foreign)
+
+
+class InlineTimeBudgetTest(Base):
+    def test_cleanup_deadline(self):
+        self.fake.inject("throttled", op="productVariantsBulkUpdate")
+        self.fake.inject("throttled", op="productDelete", count=10)
+        clock = iter(range(0, 1000, 10))
+        with mock.patch.object(shopify, "_mono", lambda: next(clock)):
+            with self.assertRaises(StoreRateLimited) as cm:
+                self.conn().publish(self.product())
+        self.assertEqual(self.fake.ops().count("productDelete"), 1)          # 10 s + espera > 6 s: no se reintenta
+        self.assertTrue(cm.exception.orphan_external_id)
+        self.assertEqual(self.sleeps, [])
+
+    def test_total_sleeps_bounded_per_call(self):
+        self.fake.cost_available = 0                                          # cada respuesta pide esperar
+        self.conn().publish(self.product())
+        self.assertGreater(len(self.sleeps), 0)
+        self.assertLessEqual(sum(self.sleeps), shopify.MAX_INLINE_SLEEP)
+        self.sleeps.clear()
+        self.conn().validate()                                                # el presupuesto es por llamada
+        self.assertGreater(sum(self.sleeps), 0)
+
+    def test_cleanup_waits_fit_in_budget(self):
+        self.fake.cost_available = 0
+        self.fake.inject("throttled", op="productVariantsBulkUpdate")
+        self.fake.inject("throttled", op="productDelete", count=10)
+        with self.assertRaises(StoreRateLimited):
+            self.conn().publish(self.product())
+        self.assertLessEqual(sum(self.sleeps), shopify.MAX_INLINE_SLEEP)
+        self.assertLessEqual(shopify.CLEANUP_DEADLINE, 6.0)
+        self.assertEqual(self.fake.ops().count("productDelete"), 1)          # presupuesto agotado: sin reintentos inútiles
+
+    def test_total_timeout_passed_to_shared_client(self):
+        seen = []
+        real_json, real = shttp.request_json, shttp.request
+
+        def spy_json(*a, **k):
+            seen.append(k.get("total_timeout"))
+            return real_json(*a, **k)
+
+        def spy(*a, **k):
+            seen.append(k.get("total_timeout"))
+            return real(*a, **k)
+        with mock.patch.object(shttp, "request_json", spy_json), mock.patch.object(shttp, "request", spy):
+            self.conn("client").validate()
+        self.assertGreaterEqual(len(seen), 2)
+        self.assertTrue(all(t is not None and 0 < t <= 45.0 for t in seen), seen)
 
 
 if __name__ == "__main__":

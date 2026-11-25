@@ -79,6 +79,26 @@ monitor / cambios de costo ──► reglas de sincronización ─────�
 - Si sube el costo y el margen cae bajo el mínimo del usuario → **subir el precio** (con tope) o **avisar**.
 - Nunca bajar precios automáticamente sin que el usuario lo haya activado.
 
+## Propiedad de los productos de la tienda (reglas y límites conocidos)
+
+Solo se adopta o se borra un producto que lleve TODAS las etiquetas `dropfinder` + `dfi-<id de ESTA instalación>`
+(`installation_id` en `meta`). Un producto con el mismo SKU y sin ellas es un conflicto: nunca se crea encima, se adopta
+ni se borra. `delete()` recibe la etiqueta esperada en `ListingRef.owner_tag` y sin ella (o con la de otra
+instalación) se niega; el motor la pasa tanto en el borrado pedido por el usuario como en la compensación de un
+publish cuyo anuncio se quitó a mitad. En WooCommerce solo cuenta el `name` de la etiqueta (el slug lo puede fijar el
+cliente); en Shopify, además de la etiqueta `df-sku:`, se busca por SKU real. Las etiquetas hostiles (número, dict,
+None…) se tratan como "sin etiquetas".
+
+Límites conocidos:
+
+- Un reintento de publicación reutiliza las etiquetas del intento fallido (no regenera la `dfi-`), así que un cambio de
+  `installation_id` no deja al reintento chocando con su propio producto. Pero el borrado remoto usa la `dfi-` ACTUAL: si
+  `installation_id` cambia después de publicar, los productos ya publicados con la etiqueta vieja se niegan a borrarse
+  desde DropFinder (falla segura; hay que borrarlos a mano en la tienda).
+- `orphan_external_id` (el borrador incompleto que un conector no pudo limpiar) solo viaja en la excepción y en el
+  mensaje de error del anuncio: el motor no lo persiste ni lo usa para limpiar. Se recupera porque el siguiente
+  publish lo readopta (mismas etiquetas, ver arriba) o el usuario lo borra a mano con el id indicado en el mensaje.
+
 ## Cuándo revisar
 
 Migrar el cifrado a una biblioteca auditada y la cola a un sistema externo si: la app se ofrece como servicio a
