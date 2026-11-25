@@ -12,6 +12,7 @@
 <link rel="stylesheet" href="css/dashboard.css">
 <link rel="stylesheet" href="css/collections.css">
 <link rel="stylesheet" href="css/stores.css">
+<link rel="stylesheet" href="css/cj.css">
 <link rel="stylesheet" href="css/auth.css">
 </head>
 <body>
@@ -135,6 +136,34 @@
     <div class="row-actions owner-only"><button id="deleteDemo" class="ghost danger">Eliminar productos de demostración</button></div>
 
     <p class="note member-only">Solo el propietario de la instalación puede cargar o eliminar catálogos.</p>
+
+    <div class="panel cj-panel" id="cjPanel">
+      <h3>CJ Dropshipping (API)</h3>
+      <p class="cj-warn">⚠ <b>Sin verificar.</b> Este conector se escribió con la documentación pública de CJ y solo se probó con un servidor simulado,
+        no con la API real. Rutas, campos, límites y caducidad del token pueden diferir. Pruébalo con pocos productos y comprueba precio y stock en CJ antes de vender.</p>
+      <div id="cjStatus" class="cj-status" aria-live="polite"></div>
+      <form id="cjConnectForm" class="cj-form owner-only hidden" autocomplete="off">
+        <label class="field">API key de CJ<input name="api_key" type="password" autocomplete="off" spellcheck="false" maxlength="200" required></label>
+        <button class="primary" type="submit">Conectar y validar</button>
+        <p class="muted cj-help">Dónde obtenerla: en tu cuenta de CJ Dropshipping, <b>My CJ → Authorization → API</b>, genera una API key y pégala aquí
+          (ver <a href="https://developers.cjdropshipping.com/" target="_blank" rel="noopener noreferrer">developers.cjdropshipping.com</a>; la ruta del menú puede haber cambiado).
+          Se valida contra CJ antes de guardarse, se guarda <b>cifrada</b> y nunca vuelve al navegador.</p>
+      </form>
+      <form id="cjImportForm" class="cj-form owner-only hidden">
+        <label class="field">Palabra clave<input name="query" maxlength="100" placeholder="ej. lámpara"></label>
+        <label class="field">Categoría<select name="category_id"><option value="">Cualquiera</option></select></label>
+        <label class="field">Máx. productos<input name="limit" type="number" min="1" max="200" value="50" inputmode="numeric"></label>
+        <button class="primary" type="submit">Importar desde CJ</button>
+        <p class="muted cj-help">Usa la palabra clave, la categoría o ambas (máx. 200 por importación). CJ no informa pedidos, valoraciones ni envío en el listado:
+          esos datos quedan en 0 y el score será bajo. Reimportar actualiza costo y stock sin duplicar ni tocar lo que cargaste por CSV.</p>
+      </form>
+      <div id="cjProgress" class="cj-progress" aria-live="polite"></div>
+      <div class="cj-actions owner-only">
+        <button id="cjValidate" type="button" class="ghost hidden">Revisar conexión</button>
+        <button id="cjDisconnect" type="button" class="ghost danger hidden">Desconectar</button>
+      </div>
+    </div>
+
     <div class="panel owner-only">
       <h3>Cargar catálogo desde CSV</h3>
       <p class="muted">Sirve para el archivo que te envía un mayorista o para un Excel exportado como CSV.
@@ -213,6 +242,7 @@
 <script src="js/dashboard.js"></script>
 <script src="js/collections.js"></script>
 <script src="js/stores.js"></script>
+<script src="js/cj.js"></script>
 <script src="js/auth.js"></script>
 </body>
 </html>

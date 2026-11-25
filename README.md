@@ -19,8 +19,8 @@ El análisis completo (metodología RAE: ingeniería inversa → análisis → e
 - **Enlace al producto original** ("Ver en proveedor ↗") cuando el proveedor lo informa (columna `url`).
 - **Imágenes**: usa la foto del proveedor (columna `imagen`); si no hay o no carga, genera una ilustración
   local que no depende de internet.
-- **Conectores de proveedor** intercambiables (`backend/connectors/`): demo, CSV y un esqueleto para
-  CJ Dropshipping.
+- **Conectores de proveedor** intercambiables (`backend/connectors/`): demo, CSV y **CJ Dropshipping por API**
+  (importación de catálogo y monitor de precio/stock; **SIN VERIFICAR** contra la API real, ver más abajo).
 
 ## Productos de demostración
 Al iniciar por primera vez se cargan 1.500 productos **ficticios** (marcados como DEMO) para probar la app.
@@ -189,10 +189,51 @@ Diseño, seguridad y límites conocidos: [`docs/adr/0002-integracion-tiendas.md`
 [`docs/adr/0003-tiendanube-woocommerce.md`](docs/adr/0003-tiendanube-woocommerce.md) y contrato de la API en
 [`docs/stores-api.md`](docs/stores-api.md).
 
+## Proveedor CJ Dropshipping (API) — SIN VERIFICAR
+
+Desde **Proveedores → CJ Dropshipping (API)** el propietario conecta su cuenta de CJ con una **API key**, importa
+productos por palabra clave y/o categoría (hasta **200 por importación**, en segundo plano con barra de progreso) y el
+**monitor de precio/stock** revisa después esos productos contra CJ (alertas de subida/bajada de costo y de sin stock).
+
+> ⚠️ **El conector está SIN VERIFICAR contra la API real de CJ.** Se escribió con la documentación pública (API v2.0) y
+> solo se probó contra un servidor simulado (`tests/fake_cj.py`), porque el entorno de desarrollo no tiene internet. Pruébalo
+> primero con pocos productos y comprueba en CJ el costo y el stock antes de vender. Lo que **no** se pudo comprobar (la lista
+> completa y comentada está en el encabezado de `backend/connectors/cj.py`):
+> - **Rutas y métodos**: la base `https://developers.cjdropshipping.com/api2.0/v1` y las rutas `authentication/getAccessToken`,
+>   `authentication/refreshAccessToken`, `product/list`, `product/query`, `product/stock/getInventoryByPid` (stock por producto;
+>   si CJ solo ofrece stock por variante, hay que cambiarlo), `product/getCategory` y `logistic/freightCalculate`.
+> - **Parámetros**: `pageNum`, `pageSize` (hasta 100), `productNameEn` (palabra clave), `categoryId`, `pid`.
+> - **Token y caducidad**: cuerpo `{"apiKey": …}`, respuesta `data.accessToken / accessTokenExpiryDate / refreshToken /
+>   refreshTokenExpiryDate`, cabecera `CJ-Access-Token`, vigencias supuestas (~15 días acceso, ~180 refresco; si la fecha no se
+>   lee se usa 1 día) y que obtener un token esté limitado (~1 cada 5 minutos; por eso se guarda en memoria y se reutiliza).
+> - **Códigos de error**: HTTP 401 / código `1600001` = token inválido, HTTP 429 / código `1600200` = límite de tasa, sobre
+>   `{code, result, message, data}` con `code == 200` en éxito, cabecera `Retry-After`.
+> - **Límites**: se asume ~1 petición por segundo (`MIN_INTERVAL`); tu plan de CJ puede permitir más o menos.
+> - **Campos**: `pid`, `productNameEn`, `productImage`, `sellPrice` (puede ser un rango «1.2 -- 3.4»), `categoryName`, `variants[]`,
+>   `variantInventories[].inventory[].totalInventory`, `logisticPrice`/`logisticAging`; y el enlace de ficha
+>   `https://cjdropshipping.com/product/-p-<pid>.html`, que se construye aquí (no viene de la API).
+
+**Qué se guarda y qué no.** Del producto se toman título, categoría, imagen, enlace, **costo** (en un rango de precios, el
+máximo: nunca se promete un margen que no se pueda cumplir), stock y almacén (país con más existencias). CJ no informa pedidos,
+valoraciones ni tendencia: `orders`, `orders_7d`, `rating` y `reviews` quedan en **0** (el *score* de CJ será bajo; no se
+inventa). El costo de envío queda en **0** y los días de envío en 15 (valor por defecto nuestro) salvo que ajustes el producto:
+CJ lo calcula por destino y no viene en el listado. Reimportar es idempotente (clave `proveedor + pid`), actualiza costo y
+stock, genera alertas a quienes ya importaron el producto y **no pisa** filas con el mismo proveedor y código cargadas por CSV.
+
+**Seguridad.** La API key se guarda **cifrada** (`secrets_store`, mismo almacén y misma clave maestra que las tiendas) y nunca
+vuelve al navegador, a los registros ni a un mensaje de error. Solo el propietario conecta, valida, desconecta e importa (el
+catálogo es de la instalación); cualquier usuario ve el estado, y el monitor de cada usuario revisa los productos de CJ que
+importó (máximo 40 productos por ejecución, con el límite de tasa de CJ y fuera del bloqueo de escritura de la base).
+Host fijo `developers.cjdropshipping.com`, sin seguir redirecciones, tope de tamaño y de tiempo (cliente HTTPS compartido
+con las tiendas); todo texto de CJ se sanea y las URL se validan como http(s). Si pierdes `dropfinder.key`, hay que volver a
+conectar CJ (igual que las tiendas). Desconectar **no borra** los productos ya importados. Diseño:
+[`docs/adr/0004-proveedor-cj.md`](docs/adr/0004-proveedor-cj.md).
+
 ## Pruebas
 ```bash
-DROPFINDER_SYNTH_HISTORY=0 python3 -W error::ResourceWarning -m unittest discover tests   # 766 pruebas, ~80 s
+DROPFINDER_SYNTH_HISTORY=0 python3 -W error::ResourceWarning -m unittest discover tests   # 866 pruebas, ~90 s
 node tests/js/stores_helpers.test.js                                                      # ayudas de la interfaz
+node tests/js/cj_helpers.test.js                                                          # ayudas del panel de CJ
 ```
 Además hay una **prueba de punta a punta con navegador real** (Playwright) contra el servidor real y tiendas simuladas de
 Shopify, Tiendanube y WooCommerce: ver [`tests/e2e/README.md`](tests/e2e/README.md). No usa internet ni tiendas reales.
@@ -204,7 +245,8 @@ backend/
   auth.py              Cuentas, contraseñas, sesiones, límite de intentos y administración de usuarios
   db.py                Esquema SQLite, semilla y conexión
   metrics.py           Precio sugerido, ganancia, margen y score
-  connectors/          Interfaz SupplierConnector: demo (mock.py), CSV (csv_connector.py) y esqueleto de CJ
+  connectors/          Interfaz SupplierConnector: demo (mock.py), CSV (csv_connector.py) y CJ Dropshipping (cj.py)
+  cj_mod.py            API del proveedor CJ (conexión cifrada, importación en segundo plano, apoyo al monitor)
   store_connectors/    Conectores de tienda: base.py (contrato), http.py (cliente compartido anti-SSRF),
                        shopify.py, tiendanube.py, woocommerce.py y fake.py (tienda de pruebas en memoria)
   stores_mod.py        API de tiendas (conexiones, publicación, productos publicados, registro)
@@ -212,10 +254,10 @@ backend/
   secrets_store.py     Cifrado de las credenciales de las tiendas
 frontend/              SPA en HTML, CSS y JS vanilla (+ plantilla-proveedor.csv)
 docs/RAE-AutoDS.md     Ingeniería inversa, análisis y especificación
-docs/adr/              Decisiones de diseño (0002 integración de tiendas, 0003 Tiendanube y WooCommerce)
+docs/adr/              Decisiones de diseño (0002 integración de tiendas, 0003 Tiendanube y WooCommerce, 0004 proveedor CJ)
 docs/stores-api.md     Contrato de la API de tiendas
 tests/                 Pruebas de la API y de los conectores, con servidores simulados (fake_shopify.py,
-                       fake_tiendanube.py, fake_woocommerce.py)
+                       fake_tiendanube.py, fake_woocommerce.py, fake_cj.py)
 tests/js/              Pruebas de las ayudas de la interfaz (Node)
 tests/e2e/             Prueba de punta a punta con Playwright
 ```
