@@ -191,7 +191,7 @@ Diseño, seguridad y límites conocidos: [`docs/adr/0002-integracion-tiendas.md`
 
 ## Pruebas
 ```bash
-DROPFINDER_SYNTH_HISTORY=0 python3 -W error::ResourceWarning -m unittest discover tests   # ~760 pruebas, ~80 s
+DROPFINDER_SYNTH_HISTORY=0 python3 -W error::ResourceWarning -m unittest discover tests   # 766 pruebas, ~80 s
 node tests/js/stores_helpers.test.js                                                      # ayudas de la interfaz
 ```
 Además hay una **prueba de punta a punta con navegador real** (Playwright) contra el servidor real y tiendas simuladas de
