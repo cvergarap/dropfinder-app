@@ -107,6 +107,7 @@ UNKNOWN_WAREHOUSE = "—"
 _PID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _KEY_RE = re.compile(r"^[\x21-\x7e]{1,200}$")
 _TAG_RE = re.compile(r"<[^>]*>")
+_SCRIPT_RE = re.compile(r"<\s*(script|style)\b[^>]*>.*?<\s*/\s*\1\s*>", re.I | re.S)
 _NUM_RE = re.compile(r"\d+(?:\.\d+)?")
 
 
@@ -133,6 +134,7 @@ def clean_text(value, limit: int = 200) -> str:
         return ""
     s = str(value)[:limit * 4 + 200]
     s = html.unescape(s)
+    s = _SCRIPT_RE.sub(" ", s)                                         # el contenido de script/style también se descarta
     s = _TAG_RE.sub(" ", s).replace("<", " ").replace(">", " ")
     s = s.encode("utf-8", "ignore").decode("utf-8", "ignore")          # sin sustitutos sueltos
     s = "".join(" " if unicodedata.category(c) in ("Cc", "Zl", "Zp") else c
