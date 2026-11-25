@@ -89,7 +89,16 @@ límite de ~1 petición/s y de 1 token cada 5 min; que el listado traiga `sellPr
 construido.
 
 ## Pruebas
-`tests/test_cj.py` (conector, conexión, importación, monitor, permisos, HTTP real con CSRF, fugas de secretos),
-`tests/fake_cj.py` y `tests/js/cj_helpers.test.js`. Mutaciones propias (se aplica el cambio, se corre `tests.test_cj` y debe
-fallar): refresco de token (5), límite de tasa (9), saneado de campos (9) y no-fuga de secretos/permisos (8); resultados en el
-informe del sprint.
+`tests/test_cj.py` (82 pruebas: conector, conexión, importación, monitor, permisos, HTTP real con CSRF, fugas de secretos),
+`tests/fake_cj.py` y `tests/js/cj_helpers.test.js` (7). **Mutaciones propias** (se aplica el cambio a mano, se corre
+`tests.test_cj` y debe fallar): 31 de 31 detectadas —
+refresco de token (5: sin refresco con *refresh token*, 401 que no invalida, sin tope de un refresco por 401, caché de token
+ignorada, caducidad ilegible sin acotar), límite de tasa (9: backoff sin tope, sin límite de reintentos, escrituras
+reintentadas, sin plazo total, 429 no reconocido, `Retry-After` ignorado, sin separación mínima, monitor sin tope por
+ejecución, monitor que sigue tras un 429), saneado (9: etiquetas HTML, `javascript:`, usuario:clave en URL, precio
+negativo/NaN, imagen sin validar, título sin sanear, stock sin acotar, rango con el mínimo, id sin validar) y no-fuga/permisos
+(8: `scrub` quitado en la API, en el token y en el trabajo, `repr` con la clave, clave guardada en claro, estado que devuelve
+la credencial, miembro que puede conectar, ruta de importar sin clasificar). La primera pasada dejó **2 supervivientes**
+(quitar el `scrub` de la API o el del conector no se notaba porque cada capa tapaba a la otra): se añadieron pruebas por capa
+y las dos mutaciones quedaron detectadas. Escribir las pruebas además destapó un fallo real: los códigos propios de CJ
+(`1600xxx`) se clasificaban como «error del servidor» y se reintentaban; ahora solo 500-599 lo son.
