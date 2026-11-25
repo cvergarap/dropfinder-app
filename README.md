@@ -231,7 +231,7 @@ conectar CJ (igual que las tiendas). Desconectar **no borra** los productos ya i
 
 ## Pruebas
 ```bash
-DROPFINDER_SYNTH_HISTORY=0 python3 -W error::ResourceWarning -m unittest discover tests   # 866 pruebas, ~90 s
+DROPFINDER_SYNTH_HISTORY=0 python3 -W error::ResourceWarning -m unittest discover tests   # 868 pruebas, ~90 s
 node tests/js/stores_helpers.test.js                                                      # ayudas de la interfaz
 node tests/js/cj_helpers.test.js                                                          # ayudas del panel de CJ
 ```
