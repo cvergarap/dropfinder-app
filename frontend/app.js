@@ -217,7 +217,7 @@ function card(p) {
     <div class="body">
       <div class="title">${esc(p.title)}</div>
       <div class="meta"><span class="chip">${esc(p.supplier)}</span><span class="chip">${FLAGS[p.warehouse] || ""} ${p.warehouse}</span>
-        <span class="chip">🚚 ${p.shipping_days}d</span><span class="chip">⭐ ${p.rating}</span></div>
+        <span class="chip">🚚 ${p.shipping_known === false ? "envío no informado" : `${p.shipping_days}d`}</span><span class="chip">⭐ ${p.rating}</span></div>
       <div class="meta">${fmt(p.orders)} pedidos · ${p.stock > 0 ? `stock ${fmt(p.stock)}` : '<b class="bad">sin stock</b>'}</div>
       <div class="kpis">
         <div><b>${money(p.total_cost)}</b><span>Costo</span></div>
@@ -374,7 +374,7 @@ function renderDetail(p) {
         <dt>Pedidos totales</dt><dd>${fmt(p.orders)}</dd>
         <dt>Rating</dt><dd>⭐ ${p.rating} (${fmt(p.reviews)} reseñas)</dd>
         <dt>Costo producto</dt><dd>${money(p.cost)}</dd>
-        <dt>Envío</dt><dd>${p.shipping_cost ? money(p.shipping_cost) : "Gratis"} · ${p.shipping_days} días desde ${FLAGS[p.warehouse] || ""} ${p.warehouse}</dd>
+        <dt>Envío</dt><dd>${p.shipping_known === false ? "Envío no informado por el proveedor (el costo total no lo incluye)" : `${p.shipping_cost ? money(p.shipping_cost) : "Gratis"} · ${p.shipping_days} días desde ${FLAGS[p.warehouse] || ""} ${p.warehouse}`}</dd>
         <dt>Precio sugerido</dt><dd>${money(p.suggested_price, { kind: "price" })}${vat ? `<small class="vat">con IVA: ${vat}</small>` : ""}</dd>
         <dt>Punto de equilibrio</dt><dd>${money(p.break_even)}</dd>
         <dt>Ganancia estimada</dt><dd class="${p.profit >= 0 ? "good" : "bad"}">${money(p.profit)} (${p.margin}%)</dd>

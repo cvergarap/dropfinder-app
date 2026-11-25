@@ -51,11 +51,15 @@ def key_path() -> str:
 
 
 def _has_encrypted_data() -> bool:
-    """¿Hay credenciales ya cifradas? Entonces una clave ausente es una pérdida, no un primer arranque."""
+    """¿Hay credenciales ya cifradas (tiendas o proveedores)? Entonces una clave ausente es una pérdida, no un primer
+    arranque."""
     try:
         with db.connect() as conn:
-            return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'store_connections'").fetchone()
-                        and conn.execute("SELECT 1 FROM store_connections LIMIT 1").fetchone())
+            for table in ("store_connections", "supplier_connections"):
+                if (conn.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (table,)).fetchone()
+                        and conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()):
+                    return True
+            return False
     except Exception:  # noqa: BLE001 — sin base legible no se puede afirmar nada
         return False
 

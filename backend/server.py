@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlparse
 
 import auth
 import auth_context
+import cj_mod
 import compare
 import dashboard
 import collections_mod
@@ -34,7 +35,7 @@ import saved_searches
 import store_sync
 import stores_mod
 import search
-from connectors import CsvSupplierConnector, MockSupplierConnector
+from connectors import CsvSupplierConnector, MockSupplierConnector, cj
 from connectors.base import PriceStock
 from metrics import DEFAULT_SETTINGS, profit_for
 
@@ -69,6 +70,9 @@ def _item(r) -> dict:
     d = dict(r)
     d["tags"] = [t for t in (d.get("tags") or "").split(",") if t]
     d["trending"] = bool(d["trending"])
+    # CJ no informa el envío en el listado: costo 0 y 15 días son valores por defecto nuestros, no datos reales
+    d["shipping_known"] = not (d.get("source") == "api" and d.get("supplier") == cj.SUPPLIER
+                               and d.get("shipping_cost") == 0 and d.get("shipping_days") == cj.DEFAULT_SHIPPING_DAYS)
     return d
 
 
@@ -378,12 +382,16 @@ def run_monitor(user_id: int | None = None, force: bool = False) -> dict:
     force = bool(force) and auth_context.is_owner()
     created, checked, skipped, changed, cooled = [], 0, 0, [], 0
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=MONITOR_COOLDOWN_MIN)).isoformat(timespec="seconds")
+    # Los productos de CJ se consultan ANTES de tomar el bloqueo de escritura: con el límite de tasa de CJ las
+    # consultas tardan segundos y no deben dejar la base bloqueada para el resto de la aplicación.
+    cj_prices, cj_note = _prefetch_cj(uid, force, cutoff)
     with db.connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         s = db.get_settings(conn)
         for r in conn.execute(IMPORT_SQL + " WHERE i.user_id = ?", (uid,)).fetchall():
+            is_cj = r["source"] == "api" and r["supplier"] == cj.SUPPLIER
             connector = LIVE_CONNECTORS.get(r["source"])
-            if connector is None:
+            if connector is None and not is_cj:
                 skipped += 1
                 continue
             last = conn.execute("SELECT checked_at FROM monitor_checks WHERE product_id = ?",
@@ -393,7 +401,7 @@ def run_monitor(user_id: int | None = None, force: bool = False) -> dict:
                 _check_imported(conn, r, PriceStock(r["cost"], r["shipping_cost"], r["stock"]), s, created)
                 continue
             cur = PriceStock(r["cost"], r["shipping_cost"], r["stock"])
-            new = connector.get_price_stock(r["supplier"], current=cur)
+            new = cj_prices.get(r["product_id"]) if is_cj else connector.get_price_stock(r["supplier"], current=cur)
             if new is None:
                 skipped += 1
                 continue
@@ -408,7 +416,39 @@ def run_monitor(user_id: int | None = None, force: bool = False) -> dict:
         db.recompute_metrics(conn, s, ids=changed)
         hooks.run_catalog_write(conn, changed)
     mine = [{k: v for k, v in a.items() if k != "user_id"} for a in created if a["user_id"] == uid]
-    return {"checked": checked, "skipped": skipped, "cooldown": cooled, "alerts": mine}
+    out = {"checked": checked, "skipped": skipped, "cooldown": cooled, "alerts": mine}
+    if cj_note:
+        out["notice"] = cj_note
+    return out
+
+
+def _prefetch_cj(uid: int, force: bool, cutoff: str) -> tuple[dict, str | None]:
+    """Precio y stock actuales de los productos de CJ que importó el usuario y que toca revisar (sin transacción de
+    escritura abierta). Ver cj_mod.prefetch_for_monitor."""
+    with db.connect() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT DISTINCT p.id AS product_id, p.supplier_sku, p.cost, p.shipping_cost, p.stock, m.checked_at "
+            "FROM imported_products i JOIN products p ON p.id = i.product_id "
+            "LEFT JOIN monitor_checks m ON m.product_id = p.id "
+            "WHERE i.user_id = ? AND p.source = 'api' AND p.supplier = ? "
+            "ORDER BY m.checked_at IS NOT NULL, m.checked_at, p.id", (uid, cj.SUPPLIER))]   # nunca revisados y más viejos primero
+    return cj_mod.prefetch_for_monitor([r for r in rows if force or not (r["checked_at"] and r["checked_at"] > cutoff)])
+
+
+def _alerts_for_products(conn, product_ids) -> int:
+    """Tras importar de una API: alertas de costo/stock para los usuarios que ya tenían esos productos importados
+    (igual que al volver a cargar un CSV)."""
+    created: list = []
+    s = db.get_settings(conn)
+    ids = list(product_ids)
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        for r in conn.execute(IMPORT_SQL + f" WHERE p.id IN ({','.join('?' * len(chunk))})", chunk).fetchall():
+            _check_imported(conn, r, PriceStock(r["cost"], r["shipping_cost"], r["stock"]), s, created)
+    return len(created)
+
+
+cj_mod.set_after_import(_alerts_for_products)
 
 
 # ---------------------------------------------------------------- proveedores / catálogo
@@ -572,7 +612,7 @@ ROUTES = [
 ]
 
 # Rutas de los módulos de funcionalidades (cada uno define su propia lista ROUTES)
-for _module in (auth, history, compare, saved_searches, dashboard, collections_mod, stores_mod, store_sync, profit):
+for _module in (auth, history, compare, saved_searches, dashboard, collections_mod, stores_mod, store_sync, cj_mod, profit):
     ROUTES.extend(_module.ROUTES)
 store_sync.set_monitor_runner(run_monitor)      # monitor programado de tiendas (mismo código que el botón)
 
@@ -591,6 +631,12 @@ OWNER_ONLY = {
     ("DELETE", r"/api/catalog"): "eliminar catálogos",
     ("POST", r"/api/currency/refresh"): "actualizar la TRM de la instalación",
     ("PUT", r"/api/stores/monitor-schedule"): "programar el monitor de precios y stock",
+    # CJ Dropshipping: conexión e importación son de la instalación (catálogo compartido), como la carga de CSV
+    ("POST", r"/api/suppliers/cj"): "conectar CJ Dropshipping",
+    ("DELETE", r"/api/suppliers/cj"): "desconectar CJ Dropshipping",
+    ("POST", r"/api/suppliers/cj/validate"): "revisar la conexión con CJ Dropshipping",
+    ("GET", r"/api/suppliers/cj/categories"): "consultar las categorías de CJ Dropshipping",
+    ("POST", r"/api/suppliers/cj/import"): "importar el catálogo de CJ Dropshipping",
     **auth.OWNER_ONLY,
 }
 USER_ROUTES = {
@@ -631,6 +677,8 @@ USER_ROUTES = {
     ("POST", r"/api/store-listings/(\d+)/(sync|hide|show|retry)"), ("DELETE", r"/api/store-listings/(\d+)"),
     ("GET", r"/api/stores/(\d+)/log"), ("POST", r"/api/stores/sync"), ("GET", r"/api/stores/queue"),
     ("GET", r"/api/stores/monitor-schedule"),
+    # estado de CJ Dropshipping (solo lectura, sin ningún dato de la clave)
+    ("GET", r"/api/suppliers/cj"),
     # calculadora de rentabilidad contraentrega (supuestos propios; el cálculo no toca datos de otros)
     ("POST", r"/api/profit/calc"), ("GET", r"/api/profit/defaults"), ("PUT", r"/api/profit/defaults"),
     ("GET", r"/api/products/(\d+)/profit"),
@@ -656,7 +704,7 @@ MAX_BODY_DEFAULT = 1024 * 1024
 
 
 def body_limit(method: str, path: str) -> int:
-    if path.startswith(("/api/auth/", "/api/users", "/api/profit/")):
+    if path.startswith(("/api/auth/", "/api/users", "/api/suppliers/cj", "/api/profit/")):
         return MAX_BODY_AUTH
     if method == "POST" and path == "/api/catalog/csv":
         return MAX_BODY

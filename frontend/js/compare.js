@@ -181,7 +181,7 @@
         <td class="num">${money(x.total_cost)}</td>
         <td class="num">${money(x.suggested_price, { kind: "price" })}</td>
         <td class="num">${x.margin}%</td>
-        <td class="num">${x.shipping_days} d</td>
+        <td class="num">${x.shipping_known === false ? "no informado" : `${x.shipping_days} d`}</td>
         <td class="num">⭐ ${x.rating}</td>
         <td class="num">${x.stock > 0 ? fmt(x.stock) : '<span class="bad">0</span>'}</td>
       </tr>`;
@@ -234,6 +234,7 @@
     ["score", "Score ganador", (v) => `★ ${v}/100`],
     ["stock", "Stock", (v) => (v > 0 ? fmt(v) : '<span class="bad">Sin stock</span>')],
   ];
+  const SHIP_FIELDS = new Set(["total_cost", "suggested_price", "profit", "margin", "shipping_days"]);
   let last = null;        // última respuesta de /api/compare (re-render al cambiar la moneda)
   let single = null;      // producto cuando solo hay 1 seleccionado
   let loadSeq = 0;
@@ -327,8 +328,11 @@
       const winner = best[field];
       const winVal = winner == null ? null : (items.find((x) => x.id === winner) || {})[field];
       const cells = items.map((p) => {
-        const isBest = winner != null && p[field] === winVal;     // empates: se marcan todos los ganadores
-        return `<td class="num${isBest ? " best" : ""}">${f(p[field])}${isBest ? ` <span class="cmp-best">✓ mejor</span>` : ""}</td>`;
+        // CJ no informa el envío: su costo total/días son valores por defecto y no compiten por «mejor»
+        const unk = p.shipping_known === false && SHIP_FIELDS.has(field);
+        const isBest = !unk && winner != null && p[field] === winVal;     // empates: se marcan todos los ganadores
+        const text = unk && field === "shipping_days" ? "Envío no informado" : f(p[field]);
+        return `<td class="num${isBest ? " best" : ""}">${text}${unk && field !== "shipping_days" ? ` <span class="muted small">(sin envío)</span>` : ""}${isBest ? ` <span class="cmp-best">✓ mejor</span>` : ""}</td>`;
       }).join("");
       return `<tr><th scope="row">${label}</th>${cells}</tr>`;
     }).join("");
