@@ -36,6 +36,7 @@ DECIMALS = {"USD": 2, "COP": 0}
 SYMBOLS = {"USD": "US$", "COP": "$"}
 # Tope razonable por monto (≈ 100.000 USD): rechaza typos y entradas hostiles sin estorbar ningún producto real
 MAX_MONEY = {"USD": Decimal(100_000), "COP": Decimal(400_000_000)}
+INPUT_STEP = Decimal("0.0001")
 MAX_ROAS = Decimal(100)
 MIN_ROAS = Decimal("0.01")
 
@@ -89,8 +90,11 @@ def _dec(value, key: str, label: str) -> Decimal:
     if isinstance(value, float):
         if not math.isfinite(value):
             raise ProfitError(f"{label} debe ser un número finito", key)
-        return Decimal(repr(value))
-    return Decimal(value)          # int de cualquier tamaño: el tope lo rechaza (sin OverflowError)
+        n = Decimal(repr(value))
+    else:
+        n = Decimal(value)         # int de cualquier tamaño: el tope lo rechaza (sin OverflowError)
+    # Máximo 4 decimales (0,0001): evita valores como 1e-300 que desbordarían los cocientes (margen, ROAS)
+    return n if abs(n) > MAX_MONEY["COP"] * 10 else n.quantize(INPUT_STEP, rounding=ROUND_HALF_UP)
 
 
 def _currency(value) -> str:
@@ -186,6 +190,13 @@ def calculate(inputs: dict, defaults: dict | None = None) -> dict:
     return_product_loss_pct, cpa | target_roas. Los opcionales ausentes (o None) salen de `defaults` (misma
     moneda que las entradas; por defecto los de fábrica) y se listan en `defaults_used`.
     """
+    try:
+        return _calculate(inputs, defaults)
+    except ArithmeticError:        # InvalidOperation/Overflow de Decimal: combinación de valores extrema
+        raise ProfitError("Los valores indicados dan un resultado fuera de rango") from None
+
+
+def _calculate(inputs, defaults) -> dict:
     code, v = _clean(inputs)
     dflt = builtin_defaults(code)
     if defaults:
