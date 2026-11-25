@@ -113,31 +113,63 @@ actúen como ese usuario (sin contraseña ni CSRF). Solo vale para peticiones di
 `DROPFINDER_TRUSTED_PROXY`, hosts permitidos que no son locales o un `--host` que no es local. Nunca lo uses con
 datos reales.
 
-## Conectar una tienda (Shopify)
+## Conectar una tienda (Shopify, Tiendanube o WooCommerce)
 
-Desde la pestaña **Tiendas** conectas tu tienda y desde **Mis productos** publicas con «Publicar en tienda». DropFinder
-mantiene después el stock al día y, si lo activas, sube el precio cuando sube el costo. **Todo producto se publica como
-borrador**: lo revisas en tu tienda y solo lo haces visible tú, con confirmación.
+Desde la pestaña **Tiendas** conectas tu tienda (eliges la plataforma en el asistente) y desde **Mis productos**
+publicas con «Publicar en tienda». DropFinder mantiene después el stock al día y, si lo activas, sube el precio cuando
+sube el costo. **Todo producto se publica como borrador**: lo revisas en tu tienda y solo lo haces visible tú, con
+confirmación.
 
-> ⚠️ **Antes de usarlo con una tienda de verdad: pruébalo primero en una tienda de desarrollo de Shopify.**
-> El conector se escribió contra la documentación pública de Shopify y se probó contra un servidor simulado, porque
-> el entorno de desarrollo no tiene acceso a internet. No se pudo verificar contra la Shopify real:
-> la versión de API que se usa (`API_VERSION` en `backend/store_connectors/shopify.py`), la forma exacta de algunas
-> operaciones, el flujo de credenciales de cliente (ID y secreto), si las operaciones de inventario exigen una clave de
-> idempotencia desde la versión `2026-04`, y el texto de ayuda para crear la aplicación. Si Shopify devuelve un error
-> de directiva o de versión en la primera conexión, cambia `API_VERSION` a `2026-01` (variable de entorno
-> `DROPFINDER_SHOPIFY_API_VERSION`). La lista completa está en el encabezado de ese archivo.
+> ⚠️ **Las tres APIs están SIN VERIFICAR contra tiendas reales. Pruébalo primero en una tienda de desarrollo o de
+> staging, nunca en tu tienda de verdad.**
+> Los tres conectores se escribieron contra la documentación pública de cada plataforma y solo se probaron contra
+> servidores simulados (`tests/fake_*.py`), porque el entorno de desarrollo no tiene acceso a internet. Rutas, nombres
+> de campo, códigos de error, límites y cabeceras pueden diferir de la API real. La lista exacta de supuestos sin
+> comprobar está en el encabezado de cada conector (`backend/store_connectors/shopify.py`, `tiendanube.py` y
+> `woocommerce.py`) y en [`docs/adr/0003-tiendanube-woocommerce.md`](docs/adr/0003-tiendanube-woocommerce.md).
+> En Shopify, por ejemplo, no se pudo verificar la versión de API (`API_VERSION`; si devuelve un error de directiva o de
+> versión en la primera conexión, cambia a `2026-01` con la variable `DROPFINDER_SHOPIFY_API_VERSION`), el flujo de
+> credenciales de cliente (ID y secreto) ni si las operaciones de inventario exigen clave de idempotencia desde `2026-04`.
 
 **Cómo conectar** (la pantalla de conexión repite estos pasos y puede quedar desactualizada: verifica en la
-documentación de Shopify):
+documentación de cada plataforma):
+
+*Shopify*
 1. En tu panel de Shopify crea una aplicación con estos permisos de la API de administración: `write_products`,
    `write_inventory` y `read_locations` (se piden también lectura de productos).
 2. Usa la forma que tu tienda permita: el **token de acceso** de una aplicación personalizada, o el **ID y el secreto**
    de una aplicación del Dev Dashboard instalada en tu tienda.
-3. En **Tiendas → Conectar una tienda** pega el dominio (`tutienda.myshopify.com`; puedes pegar el enlace completo) y
-   las credenciales. DropFinder las valida contra tu tienda antes de guardarlas.
+3. En **Tiendas → Conectar una tienda** elige Shopify, pega el dominio (`tutienda.myshopify.com`; puedes pegar el enlace
+   completo) y las credenciales. DropFinder las valida contra tu tienda antes de guardarlas.
 
-**Reglas de seguridad y de dinero que conviene conocer**
+*Tiendanube*
+1. Crea una aplicación en el portal de socios de Tiendanube con permisos de productos (lectura y escritura:
+   `read_products`, `write_products`) e instálala en tu tienda (mejor, una tienda de desarrollo). Al terminar el flujo
+   OAuth, Tiendanube entrega el **token de acceso** (`access_token`) y el ID de la tienda.
+2. En **Tiendas → Conectar una tienda** elige Tiendanube y escribe el **ID numérico de la tienda** (se ve en la URL de
+   tu panel; también puedes pegar esa URL y DropFinder extrae el número; no sirve el nombre ni el dominio).
+3. Pega el **token de la app** y un **correo de contacto** (Tiendanube exige identificar la aplicación con un correo).
+
+*WooCommerce*
+1. Escribe la **URL exacta de tu tienda**, con el dominio tal como carga en el navegador (con o sin `www`). Debe usar
+   **HTTPS** estándar (sin puerto) y DropFinder **no sigue redirecciones**: si tu sitio redirige de un dominio a otro,
+   la conexión falla y debes poner el dominio de destino. Se requieren enlaces permanentes «bonitos» (no «Simple»).
+2. En WordPress: WooCommerce → Ajustes → Avanzado → API REST → Añadir clave, con permisos de **Lectura/Escritura**.
+3. Pega la **clave de cliente** (`ck_…`) y el **secreto de cliente** (`cs_…`); el secreto se muestra una sola vez.
+4. **Si al conectar da un error 401** aunque las claves sean correctas, lo más probable es que tu hosting elimine la
+   cabecera `Authorization`: pide a tu proveedor que la deje pasar (en Apache suele resolverse con una regla en
+   `.htaccess`; en Cloudflare o un cortafuegos de WordPress, revisa que no bloqueen `/wp-json`).
+
+**Qué productos toca DropFinder (regla de propiedad)**
+- Al publicar, DropFinder marca el producto con las etiquetas **`dropfinder`** y **`dfi-<id>`** (identifican esta
+  instalación) y le pone el SKU `DF-<id>`. **Solo adopta y solo borra productos que lleven esas etiquetas.**
+- Si en tu tienda ya existe un producto con el mismo SKU `DF-<id>` pero **sin** esas etiquetas (p. ej. uno tuyo o de otra
+  instalación), es un **conflicto**: DropFinder no lo adopta, no lo modifica ni lo borra, y la publicación falla con un
+  mensaje claro. **Lo resuelves tú**: cambia el SKU del producto ajeno (o publica otro) y reintenta.
+- **No quites esas etiquetas a mano** de los productos publicados: sin ellas DropFinder deja de reconocerlos como suyos
+  (no podrá adoptarlos ni borrarlos).
+
+**Reglas de seguridad y de dinero que conviene conocer** (iguales en las tres plataformas)
 - Las credenciales se guardan **cifradas** y nunca vuelven al navegador. La clave de cifrado vive en
   `%LOCALAPPDATA%\DropFinder\dropfinder.key` (Linux/macOS: `~/.local/share/dropfinder/`), **fuera del proyecto y de la base
   de datos**. **Respáldala aparte**: si se pierde, hay que volver a conectar las tiendas (la app te lo dice con claridad).
@@ -153,23 +185,37 @@ documentación de Shopify):
   sincronizarlos.
 - Un monitor programado (solo el propietario, apagado por defecto) puede revisar precios y stock cada cierto tiempo.
 
-Diseño, seguridad y límites conocidos: [`docs/adr/0002-integracion-tiendas.md`](docs/adr/0002-integracion-tiendas.md) y
-contrato de la API en [`docs/stores-api.md`](docs/stores-api.md).
+Diseño, seguridad y límites conocidos: [`docs/adr/0002-integracion-tiendas.md`](docs/adr/0002-integracion-tiendas.md),
+[`docs/adr/0003-tiendanube-woocommerce.md`](docs/adr/0003-tiendanube-woocommerce.md) y contrato de la API en
+[`docs/stores-api.md`](docs/stores-api.md).
 
 ## Pruebas
 ```bash
-python3 -W error::ResourceWarning -m unittest discover tests
+DROPFINDER_SYNTH_HISTORY=0 python3 -W error::ResourceWarning -m unittest discover tests   # ~760 pruebas, ~80 s
+node tests/js/stores_helpers.test.js                                                      # ayudas de la interfaz
 ```
+Además hay una **prueba de punta a punta con navegador real** (Playwright) contra el servidor real y tiendas simuladas de
+Shopify, Tiendanube y WooCommerce: ver [`tests/e2e/README.md`](tests/e2e/README.md). No usa internet ni tiendas reales.
 
 ## Estructura
 ```
 backend/
-  server.py        API REST + servidor de archivos estáticos (autenticación, CSRF, cabeceras de seguridad)
-  auth.py          Cuentas, contraseñas, sesiones, límite de intentos y administración de usuarios
-  db.py            Esquema SQLite, semilla y conexión
-  metrics.py       Precio sugerido, ganancia, margen y score
-  connectors/      Interfaz SupplierConnector: demo (mock.py), CSV (csv_connector.py) y esqueleto de CJ
-frontend/          SPA en HTML, CSS y JS vanilla (+ plantilla-proveedor.csv)
-docs/RAE-AutoDS.md Ingeniería inversa, análisis y especificación
-tests/             Pruebas de la API
+  server.py            API REST + servidor de archivos estáticos (autenticación, CSRF, cabeceras de seguridad)
+  auth.py              Cuentas, contraseñas, sesiones, límite de intentos y administración de usuarios
+  db.py                Esquema SQLite, semilla y conexión
+  metrics.py           Precio sugerido, ganancia, margen y score
+  connectors/          Interfaz SupplierConnector: demo (mock.py), CSV (csv_connector.py) y esqueleto de CJ
+  store_connectors/    Conectores de tienda: base.py (contrato), http.py (cliente compartido anti-SSRF),
+                       shopify.py, tiendanube.py, woocommerce.py y fake.py (tienda de pruebas en memoria)
+  stores_mod.py        API de tiendas (conexiones, publicación, productos publicados, registro)
+  store_sync.py        Motor de sincronización de stock/precio y monitor programado
+  secrets_store.py     Cifrado de las credenciales de las tiendas
+frontend/              SPA en HTML, CSS y JS vanilla (+ plantilla-proveedor.csv)
+docs/RAE-AutoDS.md     Ingeniería inversa, análisis y especificación
+docs/adr/              Decisiones de diseño (0002 integración de tiendas, 0003 Tiendanube y WooCommerce)
+docs/stores-api.md     Contrato de la API de tiendas
+tests/                 Pruebas de la API y de los conectores, con servidores simulados (fake_shopify.py,
+                       fake_tiendanube.py, fake_woocommerce.py)
+tests/js/              Pruebas de las ayudas de la interfaz (Node)
+tests/e2e/             Prueba de punta a punta con Playwright
 ```
