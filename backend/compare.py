@@ -282,6 +282,9 @@ def _best(items: list, field: str, higher: bool, tiebreak=None):
 # ---------------------------------------------------------------- handlers
 
 # Ganadores del grupo: orden SQL (con desempates) → el primero gana
+# Producto de CJ con envío NO informado (costo 0 y 15 días por defecto): no compite por precio total ni por rapidez
+_SHIP_UNKNOWN = "(p.source = 'api' AND p.supplier = 'CJ Dropshipping' AND p.shipping_cost = 0 AND p.shipping_days = 15)"
+_SHIP_FIELDS = {"total_cost", "suggested_price", "profit", "margin", "shipping_days"}
 _BEST_ORDER = {
     "cheapest": "p.total_cost, p.shipping_days, p.id",
     "fastest": "p.shipping_days, p.total_cost, p.id",
@@ -303,12 +306,16 @@ def alternatives(pid: int) -> dict:
         key = me["match_key"] or match_key(me["title"], me["category"])
         where, args = "(p.match_key = ? OR p.id = ?)", (key, pid)
         total = conn.execute(f"SELECT COUNT(*) FROM products p WHERE {where}", args).fetchone()[0]
-        best = {name: conn.execute(f"SELECT p.id FROM products p WHERE {where} ORDER BY {order} LIMIT 1",
-                                   args).fetchone()[0] for name, order in _BEST_ORDER.items()}
+        best = {}
+        for name, order in _BEST_ORDER.items():
+            extra = f" AND NOT {_SHIP_UNKNOWN}" if name in ("cheapest", "fastest") else ""
+            row = conn.execute(f"SELECT p.id FROM products p WHERE {where}{extra} ORDER BY {order} LIMIT 1",
+                               args).fetchone()
+            best[name] = row[0] if row else None
         rows = conn.execute(f"{_select()} WHERE {where} ORDER BY p.total_cost, p.id LIMIT ?",
                             (*args, MAX_ALTERNATIVES)).fetchall()
         items = {r["id"]: srv._item(r) for r in rows}
-        items.update(_fetch(conn, [i for i in {pid, *best.values()} if i not in items]))
+        items.update(_fetch(conn, [i for i in {pid, *best.values()} if i is not None and i not in items]))
     ordered = sorted(items.values(), key=lambda d: (d["total_cost"], d["id"]))
     return {"product_id": pid, "match_key": key, "total": total, "items": ordered, "best": best}
 
@@ -343,8 +350,9 @@ def compare(qs: dict) -> dict:
     items = [found[i] for i in ids if i in found]
     best = {}
     for field, higher in COMPARE_FIELDS.items():
-        values = {d[field] for d in items}
-        best[field] = _best(items, field, higher) if len(values) > 1 else None
+        pool = [d for d in items if d.get("shipping_known", True)] if field in _SHIP_FIELDS else items
+        values = {d[field] for d in pool}
+        best[field] = _best(pool, field, higher) if len(values) > 1 else None
     return {"items": items, "best": best, "missing": [i for i in ids if i not in found]}
 
 

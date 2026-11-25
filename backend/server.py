@@ -70,6 +70,9 @@ def _item(r) -> dict:
     d = dict(r)
     d["tags"] = [t for t in (d.get("tags") or "").split(",") if t]
     d["trending"] = bool(d["trending"])
+    # CJ no informa el envío en el listado: costo 0 y 15 días son valores por defecto nuestros, no datos reales
+    d["shipping_known"] = not (d.get("source") == "api" and d.get("supplier") == cj.SUPPLIER
+                               and d.get("shipping_cost") == 0 and d.get("shipping_days") == cj.DEFAULT_SHIPPING_DAYS)
     return d
 
 
@@ -427,7 +430,8 @@ def _prefetch_cj(uid: int, force: bool, cutoff: str) -> tuple[dict, str | None]:
             "SELECT DISTINCT p.id AS product_id, p.supplier_sku, p.cost, p.shipping_cost, p.stock, m.checked_at "
             "FROM imported_products i JOIN products p ON p.id = i.product_id "
             "LEFT JOIN monitor_checks m ON m.product_id = p.id "
-            "WHERE i.user_id = ? AND p.source = 'api' AND p.supplier = ? ORDER BY p.id", (uid, cj.SUPPLIER))]
+            "WHERE i.user_id = ? AND p.source = 'api' AND p.supplier = ? "
+            "ORDER BY m.checked_at IS NOT NULL, m.checked_at, p.id", (uid, cj.SUPPLIER))]   # nunca revisados y más viejos primero
     return cj_mod.prefetch_for_monitor([r for r in rows if force or not (r["checked_at"] and r["checked_at"] > cutoff)])
 
 

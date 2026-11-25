@@ -63,7 +63,10 @@
     if (job.alerts) out.push(`${job.alerts} alertas generadas para tus productos importados.`);
     if (job.invalid) out.push(`${job.invalid} productos de CJ omitidos por datos inválidos (sin precio o título).`);
     if (job.conflicts) out.push(`${job.conflicts} omitidos porque ya existen cargados por ti (CSV) con el mismo código.`);
-    if (job.stock_unknown) out.push(`${job.stock_unknown} sin dato de stock en CJ (quedan en 0 hasta la próxima revisión).`);
+    if (job.stock_unknown) {
+      out.push(`${job.stock_unknown} sin dato de stock en CJ: los nuevos no se importaron (no se asume 0) y los ya importados ` +
+        "conservan su stock anterior." + (job.unknown_skipped ? ` No importados: ${job.unknown_skipped}.` : ""));
+    }
     if (job.stock_failed) out.push(`${job.stock_failed} no se importaron porque no se pudo consultar su stock; vuelve a importar.`);
     return out;
   }
@@ -74,7 +77,13 @@
       .slice(0, 2000).map((c) => ({ id: c.id, label: String(c.path || c.name).slice(0, 120) }));
   }
 
-  const pure = { MAX_IMPORT, cleanApiKey, importBody, statusInfo, progressInfo, resultLines, categoryOptions };
+  /* Qué botones se pueden usar: mientras corre una importación no se importa, ni se revisa la conexión, ni se desconecta. */
+  function controlsState(st) {
+    const running = !!(st && st.import && st.import.state === "running");
+    return { importDisabled: running, validateDisabled: running, disconnectDisabled: running };
+  }
+
+  const pure = { MAX_IMPORT, cleanApiKey, importBody, statusInfo, progressInfo, resultLines, categoryOptions, controlsState };
   if (typeof module !== "undefined" && module.exports) { module.exports = pure; return; }
 
   /* ============================================================ navegador */
@@ -101,9 +110,10 @@
     $("#cjImportForm").classList.toggle("hidden", !connected);
     $("#cjValidate").classList.toggle("hidden", !connected);
     $("#cjDisconnect").classList.toggle("hidden", !connected);
-    const running = !!(st && st.import && st.import.state === "running");
-    $$("button, input, select", $("#cjImportForm")).forEach((el) => { el.disabled = running; });
-    $("#cjDisconnect").disabled = running;
+    const c = controlsState(st);
+    $$("button, input, select", $("#cjImportForm")).forEach((el) => { el.disabled = c.importDisabled; });
+    $("#cjDisconnect").disabled = c.disconnectDisabled;
+    $("#cjValidate").disabled = c.validateDisabled;
   }
 
   function renderProgress() {
@@ -112,7 +122,7 @@
     const box = $("#cjProgress");
     if (!p) { box.innerHTML = ""; return; }
     if (p.running) {
-      box.innerHTML = `<p class="muted">${esc(p.text)}</p><progress max="100" value="${Number(p.percent) || 0}"></progress>`;
+      box.innerHTML = `<p class="muted">${esc(p.text)}</p><progress max="100" value="${Number(p.percent) || 0}" aria-label="Progreso de la importación de CJ"></progress>`;
       return;
     }
     const lines = resultLines(job);
@@ -140,6 +150,7 @@
       schedulePoll();
     } catch (e) {
       $("#cjStatus").innerHTML = `<span class="cj-error">${esc(e.message || "No se pudo cargar el estado de CJ")}</span>`;
+      schedulePoll();                 // un fallo de red pasajero no congela el progreso: se vuelve a intentar
     }
   }
 

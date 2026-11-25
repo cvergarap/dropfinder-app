@@ -48,6 +48,8 @@ class FakeCJ:
         self.access_tokens: dict[str, float] = {}       # token -> caducidad (época)
         self.refresh_tokens: dict[str, float] = {}
         self.max_page_size = 100
+        self.omit_total = False                          # CJ sin `total` (inconclusivo)
+        self.clip_page_size = None                       # CJ que recorta pageSize (y lo informa)
         self.httpd = None
         self.thread = None
         self.port = 0
@@ -238,14 +240,18 @@ class FakeCJ:
         if op == "categories":
             return self._envelope(h, self.categories)
         if op == "list":
-            page, size = int(qs.get("pageNum", 1)), min(int(qs.get("pageSize", 20)), self.max_page_size)
+            page, size = int(qs.get("pageNum", 1)), min(int(qs.get("pageSize", 20)), self.max_page_size,
+                                                        self.clip_page_size or 10 ** 6)
             with self.lock:
                 items = [p for p in self.products.values()
                          if qs.get("productNameEn", "").lower() in str(p.get("productNameEn", "")).lower()
                          and (not qs.get("categoryId") or p.get("categoryId") == qs["categoryId"])]
             chunk = items[(page - 1) * size: page * size]
             listing = [{k: v for k, v in p.items() if k not in ("stock", "variants")} for p in chunk]
-            return self._envelope(h, {"pageNum": page, "pageSize": size, "total": len(items), "list": listing})
+            out = {"pageNum": page, "pageSize": size, "list": listing}
+            if not self.omit_total:
+                out["total"] = len(items)
+            return self._envelope(h, out)
         if op == "freight":
             return self._envelope(h, [{"logisticName": "CJPacket", "logisticPrice": 4.5, "logisticAging": "7-12"},
                                       {"logisticName": "Express", "logisticPrice": 12, "logisticAging": "3-5"}])

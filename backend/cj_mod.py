@@ -307,7 +307,7 @@ def start_import(body) -> dict:
             raise ApiError(409, "Ya hay una importación en curso", "import_running")
         _job = {"id": int(time.time() * 1000), "state": "running", "phase": "search",
                 "message": "Buscando productos en CJ…", **params, "fetched": 0, "total": 0, "done": 0, "new": 0,
-                "updated": 0, "invalid": 0, "conflicts": 0, "stock_unknown": 0, "stock_failed": 0,
+                "updated": 0, "invalid": 0, "conflicts": 0, "stock_unknown": 0, "unknown_skipped": 0, "stock_failed": 0,
                 "rate_limited": False, "alerts": 0, "error": None, "warnings": [], "started_at": db.now(),
                 "finished_at": None}
         _thread = threading.Thread(target=_run_import, args=(c, key, params, uid), daemon=True, name="cj-import")
@@ -319,9 +319,9 @@ def start_import(body) -> dict:
 def _run_import(c: cj.CJConnector, key: str, params: dict, uid: int) -> None:
     try:
         with auth_context.as_user(uid, "owner"):
-            products = _gather(c, params)
+            products, unknown = _gather(c, params)
             _set(phase="save", message="Guardando en el catálogo…")
-            _save(products)
+            _save(products, unknown)
         _set(state="done", phase="done", message="Importación terminada", finished_at=db.now())
     except StoreAuthError as e:
         mark_error(str(e))
@@ -343,10 +343,11 @@ def _warn(msg: str) -> None:
             _job["warnings"].append(msg)
 
 
-def _gather(c: cj.CJConnector, params: dict) -> list:
+def _gather(c: cj.CJConnector, params: dict) -> tuple[list, set]:
     deadline = time.monotonic() + IMPORT_DEADLINE
     limit = params["limit"]
     items, seen, page = [], set(), 1
+    raw_seen, last = 0, None
     size = min(cj.PAGE_SIZE, limit)               # constante en todo el recorrido: las páginas de CJ se numeran con él
     while len(items) < limit and page <= MAX_PAGES:
         try:
@@ -358,6 +359,8 @@ def _gather(c: cj.CJConnector, params: dict) -> list:
             _set(rate_limited=True)
             _warn("CJ pidió esperar durante la búsqueda: se importan solo los productos encontrados hasta ahora")
             break
+        last = res
+        raw_seen += res.raw_count
         _bump("invalid", res.skipped)
         for p in res.items:
             if p.supplier_sku not in seen:
@@ -370,9 +373,18 @@ def _gather(c: cj.CJConnector, params: dict) -> list:
             _warn("Se agotó el tiempo de la importación durante la búsqueda")
             break
         page += 1
+    if len(items) < limit and last is not None:
+        if last.has_more:
+            _warn("La búsqueda se cortó antes de llegar al máximo pedido (límite de páginas o de tiempo); "
+                  "puede haber más productos en CJ. Afina la palabra clave o importa de nuevo.")
+        elif last.total_known and last.total > raw_seen:
+            _warn(f"CJ anunció {last.total} productos pero solo devolvió {raw_seen}: puede que recorte el tamaño de "
+                  "página. Vuelve a importar o afina la búsqueda.")
+        elif not last.total_known and len(items) and raw_seen >= limit:
+            _warn("CJ no informó el total de resultados: no se puede asegurar que se hayan traído todos.")
     items = items[:limit]
     _set(phase="stock", total=len(items), done=0, message="Consultando stock…")
-    ready = []
+    ready, unknown = [], set()
     for i, p in enumerate(items):
         if time.monotonic() > deadline:
             _bump("stock_failed", len(items) - i)
@@ -392,15 +404,16 @@ def _gather(c: cj.CJConnector, params: dict) -> list:
             _bump("stock_failed")
             continue
         if st is None:
-            _bump("stock_unknown")                  # CJ no dio stock: se guarda 0 y el monitor lo corrige
+            _bump("stock_unknown")                  # sin dato real de stock: NO se asume 0 (ver _save)
+            unknown.add(p.supplier_sku)
         else:
             p.stock, p.warehouse = st.total, st.warehouse or cj.UNKNOWN_WAREHOUSE
         ready.append(p)
         _set(done=i + 1)
-    return ready
+    return ready, unknown
 
 
-def _save(products: list) -> None:
+def _save(products: list, unknown: set = frozenset()) -> None:
     """Mismos caminos que el CSV: upsert por UNIQUE(supplier, sku), hooks de catálogo y alertas de los importados.
     No pisa filas del mismo proveedor y sku que cargó el usuario por CSV o la demo (source distinto de 'api')."""
     with db.connect() as conn:
@@ -409,6 +422,20 @@ def _save(products: list) -> None:
         taken = {r[0] for r in conn.execute("SELECT supplier_sku FROM products WHERE supplier = ? AND source != 'api'",
                                             (cj.SUPPLIER,))}
         keep = [p for p in products if p.supplier_sku not in taken]
+        # Stock desconocido: un producto NUEVO no se importa (no hay un cero verdadero que guardar) y uno ya importado
+        # conserva su stock y almacén anteriores (así no nace una alerta falsa de «sin stock»).
+        prev = {r[0]: (r[1], r[2]) for r in conn.execute(
+            "SELECT supplier_sku, stock, warehouse FROM products WHERE supplier = ? AND source = 'api'", (cj.SUPPLIER,))}
+        final, unknown_skipped = [], 0
+        for p in keep:
+            if p.supplier_sku in unknown:
+                if p.supplier_sku not in prev:
+                    unknown_skipped += 1
+                    continue
+                p.stock, p.warehouse = prev[p.supplier_sku]
+            final.append(p)
+        conflicts = len(products) - len(keep)
+        keep = final
         touched: list = []
         new = updated = 0
         if keep:
@@ -419,7 +446,7 @@ def _save(products: list) -> None:
             alerts = _after_import(conn, touched) or 0
         conn.execute("UPDATE supplier_connections SET last_import_at = ?, status = 'active', last_error = NULL "
                      "WHERE supplier = ?", (db.now(), PROVIDER))
-    _set(new=new, updated=updated, conflicts=len(products) - len(keep), alerts=alerts)
+    _set(new=new, updated=updated, conflicts=conflicts, alerts=alerts, unknown_skipped=unknown_skipped)
 
 
 # ---------------------------------------------------------------- monitor de precio/stock
@@ -452,6 +479,7 @@ def prefetch_for_monitor(rows: list[dict]) -> tuple[dict, str | None]:
         if time.monotonic() > deadline:
             note = "Se agotó el tiempo de revisión de CJ; el resto se revisará en la siguiente ejecución"
             break
+        c.call_deadline = max(1.0, min(cj.CALL_DEADLINE, (deadline - time.monotonic()) / 2))   # acota el peor caso
         try:
             new = c.get_price_stock(r["supplier_sku"], current=PriceStock(r["cost"], r["shipping_cost"], r["stock"]))
         except StoreAuthError as e:
@@ -463,6 +491,10 @@ def prefetch_for_monitor(rows: list[dict]) -> tuple[dict, str | None]:
             break
         except StoreError:
             note = "Algunos productos de CJ no se pudieron consultar ahora"
+            continue
+        except Exception:  # noqa: BLE001 — un dato hostil de un producto no debe tumbar el monitor entero
+            log.exception("Error inesperado al revisar un producto de CJ")
+            note = "Algunos productos de CJ no se pudieron revisar (datos inesperados)"
             continue
         if new is not None:
             out[r["product_id"]] = new

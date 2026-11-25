@@ -160,7 +160,8 @@ def safe_url(value, limit: int = 500) -> str:
     if not isinstance(value, str):
         return ""
     u = value.strip()
-    if not u or len(u) > limit or any(ord(c) <= 32 or ord(c) == 127 for c in u):
+    # sin espacios, control, no ASCII ni caracteres que rompen un atributo HTML (" ' < > ` \): se rechaza, no se arregla
+    if not u or len(u) > limit or any(ord(c) <= 32 or ord(c) >= 127 or c in "\"'<>`\\" for c in u):
         return ""
     try:
         parts = urlsplit(u)
@@ -204,21 +205,37 @@ def parse_money(value) -> Decimal | None:
 
 
 def parse_int(value, default: int = 0, hi: int = MAX_STOCK) -> int:
-    """Entero ≥ 0 acotado; basura → default."""
+    """Entero ≥ 0 acotado; basura → default. Nunca lanza (ni con 10**400)."""
     if isinstance(value, bool):
         return default
+    if isinstance(value, int):
+        return min(max(value, 0), hi)
     try:
         if isinstance(value, str):
             f = float(value.strip()[:30])
-        elif isinstance(value, (int, float)):
-            f = float(value)
+        elif isinstance(value, float):
+            f = value
         else:
             return default
-    except ValueError:
+    except (ValueError, OverflowError):
         return default
     if not math.isfinite(f):
         return default
     return int(min(max(f, 0), hi))
+
+
+def parse_stock(value) -> int | None:
+    """Existencias de un dato de CJ: entero ≥ 0 acotado SOLO si es un número real (int/float no bool, o texto numérico).
+    Cualquier otra cosa («N/A», «», {}, [1], True, «unlimited») es None = desconocido, NUNCA cero."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return min(max(value, 0), MAX_STOCK)
+    if isinstance(value, float):
+        return int(min(max(value, 0), MAX_STOCK)) if math.isfinite(value) else None
+    if isinstance(value, str) and re.fullmatch(r"\s*-?\d{1,30}(\.\d{1,10})?\s*", value):
+        return int(min(max(float(value), 0), MAX_STOCK))
+    return None
 
 
 def parse_country(value) -> str:
@@ -271,6 +288,7 @@ class SearchPage:
     raw_count: int = 0                              # elementos recibidos (incluye los descartados por inválidos)
     skipped: int = 0                                # descartados por no tener id, título o precio válidos
     has_more: bool = False
+    total_known: bool = True                        # False si CJ no informó un total (no se puede saber si hay más)
 
 
 @dataclass
@@ -295,7 +313,8 @@ class _Token:
     refresh_exp: float = 0.0
 
 
-_LOCK = threading.RLock()
+_LOCK = threading.RLock()                # solo secciones CORTAS (nunca durante la E/S de red)
+_KEY_LOCKS: dict[str, threading.Lock] = {}   # un candado por clave: la E/S del token solo frena a quien usa esa clave
 _TOKENS: dict[str, _Token] = {}
 _NEXT_OK: dict[str, float] = {}                     # clave -> instante (reloj monótono) antes del cual no se pide
 _MAX_ENTRIES = 20
@@ -306,6 +325,19 @@ def forget_tokens() -> None:
     with _LOCK:
         _TOKENS.clear()
         _NEXT_OK.clear()
+
+
+def _key_lock(key: str) -> threading.Lock:
+    with _LOCK:
+        lk = _KEY_LOCKS.get(key)
+        if lk is None:
+            lk = _KEY_LOCKS[key] = threading.Lock()
+            if len(_KEY_LOCKS) > _MAX_ENTRIES:
+                for old in list(_KEY_LOCKS):
+                    if old != key and not _KEY_LOCKS[old].locked():
+                        del _KEY_LOCKS[old]
+                        break
+        return lk
 
 
 def _cache_key(base_url: str, api_key: str) -> str:
@@ -375,14 +407,15 @@ class CJConnector(SupplierConnector):
             return
         with _LOCK:
             now = self._clock()
-            wait = _NEXT_OK.get(self._key, 0.0) - now
-            _NEXT_OK[self._key] = max(now, _NEXT_OK.get(self._key, 0.0)) + self.min_interval
-            if len(_NEXT_OK) > _MAX_ENTRIES:
-                _NEXT_OK.pop(next(iter(_NEXT_OK)))
-        if wait > 0:
-            if now + wait > deadline:
+            start = max(now, _NEXT_OK.get(self._key, 0.0))
+            wait = start - now
+            if now + wait > deadline:             # no cabe en el plazo: NO se reserva el hueco
                 raise CJRateLimited("Se alcanzó el plazo mientras se respetaba el límite de peticiones de CJ",
                                     retry_after=wait)
+            _NEXT_OK[self._key] = start + self.min_interval
+            while len(_NEXT_OK) > _MAX_ENTRIES:
+                _NEXT_OK.pop(next(iter(_NEXT_OK)))
+        if wait > 0:
             self._sleep(wait)
 
     def _wait_after_limit(self, wait: float) -> None:
@@ -429,16 +462,19 @@ class CJConnector(SupplierConnector):
         return code, clean_text(body.get("message"), 200), body.get("data")
 
     def _get_token(self, deadline: float) -> str:
-        with _LOCK:
-            now = self._wall()
-            t = _TOKENS.get(self._key)
-            if t and t.access_exp - TOKEN_SAFETY_MARGIN > now:
-                return t.access
-            if t and t.refresh and t.refresh_exp - TOKEN_SAFETY_MARGIN > now:
+        with _key_lock(self._key):                    # una sola petición de token por clave a la vez
+            with _LOCK:
+                now = self._wall()
+                t = _TOKENS.get(self._key)
+                if t and t.access_exp - TOKEN_SAFETY_MARGIN > now:
+                    return t.access
+                refresh = t.refresh if t and t.refresh and t.refresh_exp - TOKEN_SAFETY_MARGIN > now else ""
+            if refresh:
                 try:
-                    return self._auth_call("refresh", {"refreshToken": t.refresh}, deadline).access
+                    return self._auth_call("refresh", {"refreshToken": refresh}, deadline).access
                 except CJAuthError:
-                    _TOKENS.pop(self._key, None)             # refresco rechazado: se cae a la API key
+                    with _LOCK:
+                        _TOKENS.pop(self._key, None)         # refresco rechazado: se cae a la API key
             return self._auth_call("token", {"apiKey": self._api_key}, deadline).access
 
     def _auth_call(self, which: str, payload: dict, deadline: float) -> _Token:
@@ -470,14 +506,15 @@ class CJConnector(SupplierConnector):
         if not access:
             raise CJError("CJ devolvió un token de acceso inválido", retryable=True)
         now = self._wall()
-        old = _TOKENS.get(self._key)
-        refresh = _token_text(data.get("refreshToken")) or (old.refresh if old else "")
-        t = _Token(access, _parse_expiry(data.get("accessTokenExpiryDate"), now), refresh,
-                   _parse_expiry(data.get("refreshTokenExpiryDate"), now) if data.get("refreshToken") else
-                   (old.refresh_exp if old else 0.0))
-        _TOKENS[self._key] = t
-        if len(_TOKENS) > _MAX_ENTRIES:
-            _TOKENS.pop(next(iter(_TOKENS)))
+        with _LOCK:
+            old = _TOKENS.get(self._key)
+            refresh = _token_text(data.get("refreshToken")) or (old.refresh if old else "")
+            t = _Token(access, _parse_expiry(data.get("accessTokenExpiryDate"), now), refresh,
+                       _parse_expiry(data.get("refreshTokenExpiryDate"), now) if data.get("refreshToken") else
+                       (old.refresh_exp if old else 0.0))
+            _TOKENS[self._key] = t
+            while len(_TOKENS) > _MAX_ENTRIES:
+                _TOKENS.pop(next(iter(_TOKENS)))
         return t
 
     def _invalidate_access(self, bad: str) -> None:
@@ -527,7 +564,7 @@ class CJConnector(SupplierConnector):
                                  CJRateLimited("CJ pidió esperar (límite de peticiones)"))
                 continue
             if kind == "server":
-                err = CJError(f"CJ tuvo un error interno ({scrub(message or code)})", retryable=True)
+                err = CJError(f"CJ tuvo un error interno ({scrub(message or code, [self._api_key])})", retryable=True)
                 if safe and attempt < self.max_retries:
                     attempt += 1
                     self._retry_wait(attempt, None, deadline, err)
@@ -574,11 +611,9 @@ class CJConnector(SupplierConnector):
 
     # ------------------------------------------------------------ operaciones
     def validate(self) -> dict:
-        """Comprueba la API key con una llamada real (token + una lectura mínima). Lanza CJAuthError si no sirve."""
-        deadline = self._clock() + self.call_deadline
-        with _LOCK:
-            _TOKENS.pop(self._key, None)                     # siempre se prueba la clave de verdad, no un token viejo
-            self._auth_call("token", {"apiKey": self._api_key}, deadline)
+        """Comprueba la API key con una lectura mínima real. NO borra el token en caché (CJ limita getAccessToken: si la
+        petición nueva diera 429 la caché quedaría vacía y se bloquearía todo ~5 min). Con una clave nueva no hay token
+        en caché y se pide uno; con la misma clave se usa el que hay (si CJ ya lo rechaza, el 401 lo renueva solo)."""
         page = self.search("", page=1, page_size=1)
         return {"ok": True, "total": page.total}
 
@@ -605,8 +640,12 @@ class CJConnector(SupplierConnector):
                 seen.add(p.supplier_sku)
                 items.append(p)
         total = parse_int(data.get("total"), 0)
+        eff = min(parse_int(data.get("pageSize"), size) or size, size)       # tamaño que CJ aplicó de verdad
+        # Sigue si la página vino llena, si CJ no informó total, o si el total dice que faltan. Una página corta con total
+        # alcanzado es la última. (Si CJ recorta el tamaño sin decirlo, el llamador lo detecta: ver cj_mod._gather.)
+        has_more = bool(raw) and (len(raw) >= eff or total == 0 or page * eff < total)
         return SearchPage(items=items, total=total, page=page, raw_count=len(raw), skipped=len(raw) - len(items),
-                          has_more=bool(raw) and page * size < total)
+                          has_more=has_more, total_known=total > 0)
 
     def iter_catalog(self, query: str = "", *, category_id: str = "", limit: int = 200):
         """Productos (sin stock) de una búsqueda, hasta `limit`. CJ no ofrece «todo el catálogo»: hace falta consulta."""
@@ -713,14 +752,18 @@ class CJConnector(SupplierConnector):
             for e in entries[:50]:
                 if not isinstance(e, dict):
                     continue
-                n = e.get("totalInventory", e.get("storageNum"))
-                if n is None and ("cjInventory" in e or "factoryInventory" in e):
-                    n = parse_int(e.get("cjInventory")) + parse_int(e.get("factoryInventory"))
+                n = parse_stock(e.get("totalInventory"))
+                if n is None:
+                    n = parse_stock(e.get("storageNum"))
+                if n is None:
+                    parts = [x for x in (parse_stock(e.get("cjInventory")), parse_stock(e.get("factoryInventory")))
+                             if x is not None]
+                    n = sum(parts) if parts else None
                 if n is None:
                     continue
                 seen = True
                 c = parse_country(e.get("countryCode")) or UNKNOWN_WAREHOUSE
-                by_country[c] = min(MAX_STOCK, by_country.get(c, 0) + parse_int(n))
+                by_country[c] = min(MAX_STOCK, by_country.get(c, 0) + n)
         if not seen:
             return None
         known = {c: n for c, n in by_country.items() if c != UNKNOWN_WAREHOUSE}

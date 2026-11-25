@@ -73,4 +73,17 @@ t("categoryOptions: descarta basura y acota", () => {
   assert.equal(h.categoryOptions(Array.from({ length: 3000 }, (_, i) => ({ id: `i${i}`, name: "n" }))).length, 2000);
 });
 
+t("controlsState: nada de importar, revisar ni desconectar mientras corre una importación", () => {
+  assert.deepEqual(h.controlsState({ import: { state: "running" } }), { importDisabled: true, validateDisabled: true, disconnectDisabled: true });
+  assert.deepEqual(h.controlsState({ import: { state: "done" } }), { importDisabled: false, validateDisabled: false, disconnectDisabled: false });
+  assert.equal(h.controlsState(null).validateDisabled, false);
+});
+
+t("resultLines: stock desconocido no se asume 0", () => {
+  const l = h.resultLines({ state: "done", new: 1, updated: 0, stock_unknown: 2, unknown_skipped: 1 });
+  assert.match(l[1], /no se importaron/);
+  assert.match(l[1], /conservan su stock/);
+  assert.doesNotMatch(l[1], /quedan en 0/);
+});
+
 console.log(`${n} pruebas OK`);

@@ -142,13 +142,14 @@
 
     <div class="panel cj-panel" id="cjPanel">
       <h3>CJ Dropshipping (API)</h3>
-      <p class="cj-warn">⚠ <b>Sin verificar.</b> Este conector se escribió con la documentación pública de CJ y solo se probó con un servidor simulado,
-        no con la API real. Rutas, campos, límites y caducidad del token pueden diferir. Pruébalo con pocos productos y comprueba precio y stock en CJ antes de vender.</p>
+      <div class="cj-warn">⚠ <b>Sin verificar</b> contra la API real de CJ: pruébalo con pocos productos y comprueba precio y stock en CJ antes de vender.
+        <details><summary>Más detalles</summary>Este conector se escribió con la documentación pública de CJ y solo se probó con un servidor simulado.
+        Rutas, campos, límites y caducidad del token pueden diferir. CJ no informa el envío en el listado: esos productos se marcan «envío no informado» y no compiten por precio o rapidez en el comparador.</details></div>
       <div id="cjStatus" class="cj-status" aria-live="polite"></div>
       <form id="cjConnectForm" class="cj-form owner-only hidden" autocomplete="off">
-        <label class="field">API key de CJ<input name="api_key" type="password" autocomplete="off" spellcheck="false" maxlength="200" required></label>
+        <label class="field">API key de CJ<input name="api_key" type="password" autocomplete="off" spellcheck="false" maxlength="200" required aria-describedby="cjKeyHelp"></label>
         <button class="primary" type="submit">Conectar y validar</button>
-        <p class="muted cj-help">Dónde obtenerla: en tu cuenta de CJ Dropshipping, <b>My CJ → Authorization → API</b>, genera una API key y pégala aquí
+        <p class="muted cj-help" id="cjKeyHelp">Dónde obtenerla: en tu cuenta de CJ Dropshipping, <b>My CJ → Authorization → API</b>, genera una API key y pégala aquí
           (ver <a href="https://developers.cjdropshipping.com/" target="_blank" rel="noopener noreferrer">developers.cjdropshipping.com</a>; la ruta del menú puede haber cambiado).
           Se valida contra CJ antes de guardarse, se guarda <b>cifrada</b> y nunca vuelve al navegador.</p>
       </form>

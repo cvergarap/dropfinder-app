@@ -814,12 +814,23 @@ class ImportTest(ModBase):
                          ("Taza x", "Cat", "", 3.4))
         self.assertEqual(prods["h4"]["stock"], 0)
 
-    def test_stock_unknown_is_counted_and_not_failed(self):
-        self.seed_many(2)
+    def test_unknown_stock_does_not_import_new_and_keeps_previous_stock(self):
+        self.seed_many(3)
         self.connect()
-        self.fake.inject("raw", op="stock", count=1, data={"variantInventories": []})
+        self.run_import(query="gadget", limit=10)
+        before = self.products()["c001"]["stock"]
+        self.assertGreater(before, 0)
+        pid = self.products()["c001"]["id"]
+        self.import_for(1, pid)
+        self.fake.add_product("c999", name="Gadget nuevo", price="2.00")
+        for sku in ("c001", "c999"):
+            self.fake.set_product(sku, stock={"US": "N/A"})                       # sin dato real de stock
         job = self.run_import(query="gadget", limit=10)
-        self.assertEqual((job["new"], job["stock_unknown"], job["stock_failed"]), (2, 1, 0))
+        self.assertEqual((job["new"], job["stock_unknown"], job["unknown_skipped"], job["stock_failed"]), (0, 2, 1, 0))
+        self.assertNotIn("c999", self.products())                                 # nuevo sin stock real: no se importa
+        self.assertEqual(self.products()["c001"]["stock"], before)                # el existente conserva su stock
+        with db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM alerts WHERE type = 'out_of_stock'").fetchone()[0], 0)
 
     def test_rate_limit_during_stock_imports_what_it_has_and_reports(self):
         self.seed_many(6)
@@ -1157,6 +1168,250 @@ class HttpTest(ModBase):
     def test_oversized_body_is_refused(self):
         st, data = self.call("POST", "/api/suppliers/cj", {"api_key": "x" * 20000})
         self.assertEqual(st, 413)
+
+
+# ====================================================================== revisión independiente (PR #22)
+
+class ReviewConnectorTest(CJBase):
+    def test_validate_never_empties_the_token_cache_even_if_get_token_is_rate_limited(self):
+        self.seed()
+        c = self.conn()
+        c.search("")
+        self.fake.token_rate_limited = True
+        self.assertTrue(c.validate()["ok"])                         # usa el token en caché
+        self.assertEqual(len(c.search("").items), 3)                # y todo lo demás sigue funcionando
+        self.assertEqual(self.fake.ops().count("token"), 1)
+        self.assertIn(c._key, cj._TOKENS)
+
+    def test_stock_garbage_is_unknown_never_zero(self):
+        self.seed(1)
+        c = self.conn()
+        for bad in ("N/A", "", {}, [1], True, "unlimited", None, [], "1e5", "0x10", float("nan")):
+            data = {"variantInventories": [{"inventory": [{"countryCode": "US", "totalInventory": bad}]}]}
+            with self.fake.lock:
+                self.fake.injections = [{"kind": "raw", "op": "stock", "count": 1, "data": data}]
+            self.assertIsNone(c.get_stock("p0"), repr(bad))
+        for good, want in (("0", 0), (0, 0), ("12", 12), (7.9, 7), (-3, 0), ("-3", 0)):
+            data = {"variantInventories": [{"inventory": [{"countryCode": "US", "totalInventory": good}]}]}
+            with self.fake.lock:
+                self.fake.injections = [{"kind": "raw", "op": "stock", "count": 1, "data": data}]
+            self.assertEqual(c.get_stock("p0").total, want, repr(good))
+
+    def test_huge_numbers_do_not_raise(self):
+        self.seed(1)
+        c = self.conn()
+        self.assertEqual(cj.parse_int(10 ** 400), cj.MAX_STOCK)
+        self.assertEqual(cj.parse_int("9" * 29), cj.MAX_STOCK)
+        self.assertEqual(cj.parse_stock(10 ** 400), cj.MAX_STOCK)
+        self.assertIsNone(cj.parse_money(10 ** 400))
+        data = {"variantInventories": [{"inventory": [{"countryCode": "US", "totalInventory": 10 ** 400}]}]}
+        with self.fake.lock:
+            self.fake.injections = [{"kind": "raw", "op": "stock", "count": 1, "data": data}]
+        self.assertEqual(c.get_stock("p0").total, cj.MAX_STOCK)
+        with self.fake.lock:
+            self.fake.injections = [{"kind": "raw", "op": "list", "count": 1, "data": {"total": 10 ** 400, "list": []}}]
+        self.assertEqual(c.search("").total, cj.MAX_STOCK)
+
+    def test_has_more_without_total_and_with_clipped_page_size(self):
+        for i in range(120):
+            self.fake.add_product(f"p{i:03d}", name=f"Lámpara {i}", price="2.00")
+        c = self.conn()
+        self.fake.omit_total = True
+        res = c.search("lámpara", page=1, page_size=50)
+        self.assertEqual((res.total, res.total_known, res.has_more), (0, False, True))
+        self.assertEqual(len(list(c.iter_catalog("lámpara", limit=200))), 120)      # sigue hasta una página vacía/corta
+        self.fake.omit_total = False
+        self.fake.clip_page_size = 20                                               # CJ recorta pageSize y lo informa
+        self.assertEqual(len(list(c.iter_catalog("lámpara", limit=200))), 120)
+        self.assertEqual(len(list(c.iter_catalog("lámpara", limit=70))), 70)
+
+    def test_concurrent_token_requests_collapse_to_one(self):
+        self.seed()
+        self.fake.inject("sleep", op="token", count=1, seconds=0.4)
+        errors = []
+
+        def go():
+            try:
+                self.conn().search("")
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+        ts = [threading.Thread(target=go) for _ in range(8)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(errors, [])
+        self.assertEqual(self.fake.ops().count("token"), 1)
+
+    def test_token_io_does_not_hold_the_global_lock(self):
+        self.seed()
+        self.fake.inject("sleep", op="token", count=1, seconds=0.8)
+        t = threading.Thread(target=lambda: self.conn().search(""))
+        t.start()
+        time.sleep(0.3)
+        got = cj._LOCK.acquire(timeout=0.2)                                         # otra clave/estado no queda bloqueado
+        if got:
+            cj._LOCK.release()
+        t.join()
+        self.assertTrue(got)
+
+    def test_invalidate_only_affects_the_given_token(self):
+        self.seed()
+        c = self.conn()
+        c.search("")
+        good = cj._TOKENS[c._key].access
+        c._invalidate_access("otro-token-viejo")                                    # otro hilo ya lo renovó
+        self.assertEqual(cj._TOKENS[c._key].access_exp > 0, True)
+        c._invalidate_access(good)
+        self.assertEqual(cj._TOKENS[c._key].access_exp, 0.0)
+
+    def test_pace_does_not_reserve_a_slot_when_it_gives_up(self):
+        c = self.conn(min_interval=5.0)
+        with cj._LOCK:
+            cj._NEXT_OK[c._key] = self.clock.t + 100
+        with self.assertRaises(StoreRateLimited):
+            c._pace(self.clock.t + 10)
+        self.assertEqual(cj._NEXT_OK[c._key], self.clock.t + 100)
+
+    def test_token_cache_is_bounded(self):
+        self.seed(1)
+        for i in range(cj._MAX_ENTRIES + 6):
+            key = f"clave{i}@api@" + "x" * 12
+            self.fake.api_keys.add(key)
+            self.conn(key).search("")
+        self.assertLessEqual(len(cj._TOKENS), cj._MAX_ENTRIES)
+        self.assertLessEqual(len(cj._NEXT_OK), cj._MAX_ENTRIES)
+
+    def test_safe_url_rejects_attribute_breaking_characters(self):
+        for bad in ('https://img.example.com/b.jpg"onerror="alert(1)', "https://a.com/x'y", "https://a.com/<x>",
+                    "https://a.com/ñ.jpg", "https://a.com/`x", "https://a.com/x\\y", "https://a.com/a b"):
+            self.assertEqual(cj.safe_url(bad), "", bad)
+        self.assertEqual(cj.safe_url("https://a.com/p%20q.jpg?x=1&y=2"), "https://a.com/p%20q.jpg?x=1&y=2")
+
+    def test_server_error_message_is_scrubbed_of_the_key(self):
+        self.seed(1)
+        c = self.conn(max_retries=0)
+        c.search("")
+        self.fake.inject("code", op="list", count=1, code=503, message=f"boom {API_KEY}")
+        with self.assertRaises(StoreError) as cm:
+            c.search("")
+        self.assertNotIn(API_KEY, str(cm.exception))
+
+
+class ReviewModuleTest(ModBase):
+    def test_monitor_never_starves_products_beyond_the_cap(self):
+        n = cj_mod.MONITOR_MAX_PRODUCTS + 10
+        self.seed_many(n)
+        self.connect()
+        self.run_import(query="gadget", limit=200)
+        with db.connect() as conn:
+            ids = [r[0] for r in conn.execute("SELECT id FROM products WHERE source = 'api' ORDER BY id")]
+        for pid in ids:
+            self.import_for(1, pid)
+        checked = set()
+
+        def checked_ids():
+            with db.connect() as conn:
+                return {r[0] for r in conn.execute("SELECT product_id FROM monitor_checks")}
+        r1 = server.run_monitor(user_id=1)
+        self.assertEqual(r1["checked"], cj_mod.MONITOR_MAX_PRODUCTS)
+        r2 = server.run_monitor(user_id=1)                                          # los 40 primeros están en enfriamiento
+        self.assertEqual(r2["checked"], 10)
+        self.assertEqual(checked_ids(), set(ids))                                   # todos revisados al menos una vez
+        old = "2000-01-01T00:00:00+00:00"                                           # pasa el enfriamiento
+        with db.connect() as conn:
+            conn.execute("UPDATE monitor_checks SET checked_at = ?", (old,))
+            conn.execute("UPDATE monitor_checks SET checked_at = ? WHERE product_id IN (%s)" % ",".join(map(str, ids[:5])),
+                         ("2001-01-01T00:00:00+00:00",))
+        self.fake.requests.clear()
+        server.run_monitor(user_id=1)
+        asked = [r["qs"]["pid"] for r in self.fake.requests_for("detail")]
+        self.assertEqual(len(asked), cj_mod.MONITOR_MAX_PRODUCTS)
+        self.assertEqual(asked[:1] and len(set(asked)), cj_mod.MONITOR_MAX_PRODUCTS)
+
+    def test_monitor_survives_hostile_values_and_unexpected_exceptions(self):
+        from unittest import mock
+        self.seed_many(2)
+        self.connect()
+        self.run_import(query="gadget", limit=10)
+        for pid in [v["id"] for v in self.products().values()]:
+            self.import_for(1, pid)
+        data = {"variantInventories": [{"inventory": [{"countryCode": "US", "totalInventory": 10 ** 400}]}]}
+        self.fake.inject("raw", op="stock", count=1, data=data)
+        res = server.run_monitor(user_id=1)
+        self.assertEqual(res["checked"], 2)
+        with mock.patch.object(cj.CJConnector, "get_price_stock", side_effect=ValueError("dato hostil")), \
+                self.assertLogs("dropfinder.cj", "ERROR"):
+            res = server.run_monitor(user_id=1, force=True)
+        self.assertEqual((res["checked"], res["skipped"]), (0, 2))
+        self.assertIn("datos inesperados", res["notice"])
+
+    def test_pagination_cut_warns(self):
+        self.seed_many(130)
+        self.connect()
+        old = cj_mod.MAX_PAGES
+        cj_mod.MAX_PAGES = 2
+        self.addCleanup(lambda: setattr(cj_mod, "MAX_PAGES", old))
+        job = self.run_import(query="gadget", limit=200)
+        self.assertEqual(job["new"], 100)
+        self.assertTrue(any("se cortó" in w for w in job["warnings"]), job["warnings"])
+
+    def test_import_without_total_still_gets_everything(self):
+        self.seed_many(120)
+        self.connect()
+        self.fake.omit_total = True
+        job = self.run_import(query="gadget", limit=200)
+        self.assertEqual(job["new"], 120)
+
+    def test_monitor_only_treats_cj_supplier_as_cj(self):
+        with db.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO products(supplier, supplier_sku, source, title, category, image, cost, shipping_cost, "
+                "shipping_days, warehouse, stock, orders, orders_7d, orders_prev_7d, rating, reviews, updated_at) "
+                "VALUES ('Otra API', 'x1', 'api', 'Otro', 'Hogar', '', 5, 1, 7, 'US', 5, 0, 0, 0, 4, 1, ?)", (db.now(),))
+            pid = cur.lastrowid
+            conn.execute("INSERT INTO monitor_checks(product_id, checked_at) VALUES (?, ?)", (pid, db.now()))
+        self.import_for(1, pid)
+        res = server.run_monitor(user_id=1)
+        self.assertEqual((res["checked"], res["skipped"], res["cooldown"]), (0, 1, 0))
+        self.assertEqual(self.fake.requests, [])
+
+    def test_unknown_shipping_is_flagged_and_excluded_from_best(self):
+        import compare
+        self.seed_many(1)
+        self.connect()
+        self.run_import(query="gadget", limit=5)
+        cjp = self.products()["c000"]
+        with db.connect() as conn:
+            conn.execute("UPDATE products SET title = 'Lámpara mesa roja', category = 'Hogar', match_key = ? WHERE id = ?",
+                         (compare.match_key("Lámpara mesa roja", "Hogar"), cjp["id"]))
+            ids = []
+            for sup, cost, ship, days in (("Tienda A", 10.0, 2.0, 8), ("Tienda B", 12.0, 1.0, 5)):
+                ids.append(conn.execute(
+                    "INSERT INTO products(supplier, supplier_sku, source, title, category, image, cost, shipping_cost, "
+                    "shipping_days, warehouse, stock, orders, orders_7d, orders_prev_7d, rating, reviews, updated_at) "
+                    "VALUES (?, 'k1', 'csv', 'Lámpara mesa roja', 'Hogar', '', ?, ?, ?, 'US', 5, 0, 0, 0, 4, 1, ?)",
+                    (sup, cost, ship, days, db.now())).lastrowid)
+            db.recompute_metrics(conn)
+        item = server.get_product(cjp["id"])
+        self.assertFalse(item["shipping_known"])
+        self.assertTrue(server.get_product(ids[0])["shipping_known"])
+        alts = compare.alternatives(ids[0])
+        self.assertEqual(alts["total"], 3)
+        self.assertNotEqual(alts["best"]["cheapest"], cjp["id"])                    # CJ es el más barato en el papel
+        self.assertNotEqual(alts["best"]["fastest"], cjp["id"])
+        cmp = compare.compare({"ids": [f"{cjp['id']},{ids[0]},{ids[1]}"]})
+        for field in ("total_cost", "shipping_days", "margin", "profit", "suggested_price"):
+            self.assertNotEqual(cmp["best"][field], cjp["id"], field)
+        self.assertEqual(cmp["best"]["total_cost"], ids[0])
+        self.assertEqual(cmp["best"]["shipping_days"], ids[1])
+
+    def test_supplier_stats_ignore_unknown_shipping(self):
+        import history
+        self.seed_many(2)
+        self.connect()
+        self.run_import(query="gadget", limit=5)
+        out = history.supplier_stats({})
+        row = next(i for i in out["items"] if i["source"] == "api")
+        self.assertIsNone(row["avg_shipping_days"])
 
 
 if __name__ == "__main__":
