@@ -49,21 +49,12 @@ class SupplierConnector(ABC):
     def get_price_stock(self, supplier_sku: str) -> PriceStock | None:
         """Consulta precio y stock actuales (usado por el monitor)."""
 
+    # Proveedores con API de consulta (CJ…) implementan además búsqueda y detalle. No son abstractos: el demo y el CSV
+    # no tienen fuente en vivo.
+    def search(self, query: str = "", **kwargs):
+        """Busca productos en el proveedor y los devuelve normalizados."""
+        raise NotImplementedError
 
-class CJDropshippingConnector(SupplierConnector):
-    """Esqueleto para el conector real de CJ Dropshipping (Fase 2).
-
-    API: https://developers.cjdropshipping.com/  — requiere API key.
-    - Catálogo: GET /api2.0/v1/product/list
-    - Stock:    GET /api2.0/v1/product/stock/queryByVid
-    """
-    name = "CJ Dropshipping"
-
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-
-    def iter_catalog(self):
-        raise NotImplementedError("Implementar en Fase 2")
-
-    def get_price_stock(self, supplier_sku: str):
-        raise NotImplementedError("Implementar en Fase 2")
+    def get_product(self, supplier_sku: str, **kwargs) -> NormalizedProduct | None:
+        """Detalle de un producto del proveedor, normalizado (None si no existe)."""
+        raise NotImplementedError
