@@ -46,7 +46,7 @@ Idempotencia al publicar: ANTES de crear se busca por SKU y se ADOPTA el product
 si lleva todas las etiquetas de esta instalación (`tags_match`: `dropfinder` y `dfi-<id>`); el SKU solo no prueba nada
 (el id es local a cada base de datos). Un producto con nuestro SKU y sin nuestras etiquetas es un CONFLICTO
 (StoreValidationError): ni se adopta ni se crea encima. Si la creación responde "SKU repetido" se vuelve a buscar con la
-misma regla. delete() solo borra productos con la etiqueta `dropfinder` y alguna `dfi-…` (los comprueba con un GET).
+misma regla. delete() solo borra productos con la etiqueta `dropfinder` y la `dfi-` EXACTA de esta instalación (ref.owner_tag; los comprueba con un GET).
 Un producto adoptado nunca se borra en la limpieza (puede ser anterior), y adoptar nunca cambia la visibilidad de un
 producto existente. El producto se crea SIEMPRE como borrador y solo se muestra al final si `product.active`.
 Si ese último paso falla se intenta borrar lo creado (reintentos acotados) y se relanza el error ORIGINAL; si no se
@@ -67,7 +67,7 @@ import unicodedata
 import urllib.parse
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
-from . import http as shttp, register, scrub, tags_match
+from . import http as shttp, is_owned_by, register, safe_tags, scrub, tags_match
 from .base import (ListingRef, StoreAuthError, StoreConnector, StoreError, StoreInfo, StoreNotFound,
                    StoreProduct, StoreRateLimited, StoreValidationError)
 
@@ -533,12 +533,15 @@ class WooCommerceConnector(StoreConnector):
 
     @staticmethod
     def _tag_names(prod: dict) -> list[str]:
-        """Nombres y slugs de las etiquetas de un producto de la tienda (WooCommerce: [{id, name, slug}])."""
+        """Nombres de las etiquetas de un producto de la tienda (WooCommerce: [{id, name, slug}]). Solo el `name`: el slug
+        lo puede fijar el cliente en una etiqueta suya (slug `dropfinder` con otro nombre) y no prueba propiedad.
+        Tolera datos hostiles (`tags` no lista, elementos que no son dict, name que no es str)."""
+        tags = prod.get("tags") if isinstance(prod, dict) else None
         out = []
-        for t in prod.get("tags") or []:
-            if isinstance(t, dict):
-                out += [t[k] for k in ("name", "slug") if isinstance(t.get(k), str)]
-        return out
+        for t in tags if isinstance(tags, list) else []:
+            if isinstance(t, dict) and isinstance(t.get("name"), str) and t["name"].strip():
+                out.append(t["name"].strip())
+        return safe_tags(out)
 
     def _find_by_sku(self, sku: str) -> dict | None:
         """Producto con ESE SKU (sin distinguir mayúsculas: MySQL no las distingue). Ignora variaciones, papelera y
@@ -554,9 +557,12 @@ class WooCommerceConnector(StoreConnector):
     def _own_or_conflict(self, existing: dict, tags: list[dict], sku: str) -> dict:
         """Solo se ADOPTA un producto que lleve TODAS las etiquetas de esta instalación. El SKU `DF-<id>` solo no
         prueba nada (el id es local a cada base de datos): sería un producto del cliente u de otra instalación."""
-        if not tags_match(self._tag_names(existing), [t["name"] for t in tags]):
+        names = self._tag_names(existing)
+        if not tags_match(names, [t["name"] for t in tags]):
+            found = sorted({n for n in names if n.lower().startswith(INSTALL_TAG_PREFIX)})
+            extra = f" (lleva la etiqueta {', '.join(found)[:80]})" if found else ""
             raise StoreValidationError(
-                f"Ya existe en tu tienda un producto con el SKU {sku} que no creó esta instalación de DropFinder: "
+                f"Ya existe en tu tienda un producto con el SKU {sku} que no creó esta instalación de DropFinder{extra}: "
                 "cámbiale el SKU o bórralo antes de publicar")
         return existing
 
@@ -691,18 +697,21 @@ class WooCommerceConnector(StoreConnector):
 
     @_foreign_errors
     def delete(self, ref: ListingRef) -> None:
-        """Solo borra un producto que creó DropFinder: debe llevar la etiqueta `dropfinder` y alguna `dfi-…`. Uno al que
+        """Solo borra un producto que creó DropFinder: debe llevar `dropfinder` y la `dfi-` EXACTA de esta instalación (ref.owner_tag). Uno al que
         el usuario le quitó las etiquetas a mano (o que nunca las tuvo) NO se borra: sería destruir datos ajenos."""
         pid = self._check_ref(ref)
         try:
             prod = self._call("GET", f"/products/{pid}", ref_op=True)
         except StoreNotFound:
             return
-        names = {n.strip().lower() for n in self._tag_names(prod if isinstance(prod, dict) else {})}
-        if OWN_TAG not in names or not any(n.startswith(INSTALL_TAG_PREFIX) and len(n) > len(INSTALL_TAG_PREFIX) for n in names):
+        names = self._tag_names(prod)
+        if not is_owned_by(names, ref.owner_tag):
+            found = sorted({n for n in names if n.lower().startswith(INSTALL_TAG_PREFIX)})
+            extra = f" (lleva {', '.join(found)[:80]}" + (f", no {ref.owner_tag[:40]})" if ref.owner_tag else ")") if found else ""
             raise StoreValidationError(
-                f"El producto {pid} de tu tienda no lleva las etiquetas de DropFinder (¿se las quitaste a mano?), así que "
-                "DropFinder no lo borra: bórralo desde WooCommerce si ya no lo quieres")
+                f"El producto {pid} de tu tienda no lleva las etiquetas de DropFinder de esta instalación{extra} "
+                "(¿se las quitaste a mano, o lo creó otra instalación?), así que DropFinder no lo borra: bórralo desde "
+                "WooCommerce si ya no lo quieres")
         try:
             self._call("DELETE", f"/products/{pid}", query={"force": "true"}, ref_op=True)
         except StoreNotFound:

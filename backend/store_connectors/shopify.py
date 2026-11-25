@@ -60,7 +60,7 @@ import urllib.parse
 import uuid
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
-from . import http as shttp, register, scrub, tags_match
+from . import http as shttp, is_owned_by, register, safe_tags, scrub, tags_match
 from .base import (ListingRef, StoreAuthError, StoreConnector, StoreError, StoreInfo, StoreNotFound,
                    StoreProduct, StoreRateLimited, StoreValidationError)
 
@@ -114,7 +114,7 @@ Q_VALIDATE = """query DropFinderValidate {
 Q_LOCATIONS = """query DropFinderLocations { locations(first: 10) { nodes { id name isActive } } }"""
 Q_FIND_BY_TAG = """query DropFinderFindByTag($q: String!) {
   products(first: 5, query: $q) {
-    nodes { id status tags variants(first: 1) { nodes { id inventoryItem { id } } } }
+    nodes { id status tags variants(first: 10) { nodes { id sku inventoryItem { id } } } }
   }
 }"""
 Q_PRODUCT_TAGS = """query DropFinderProductTags($id: ID!) { product(id: $id) { id tags } }"""
@@ -722,22 +722,44 @@ class ShopifyConnector(StoreConnector):
             raise StoreError("Shopify creó el producto sin artículo de inventario", retryable=True)
         return vid, inv_id
 
-    def _find_existing(self, tag: str, expected_tags: list[str]) -> dict | None:
+    def _find_existing(self, tag: str, expected_tags: list[str], sku: str = "") -> dict | None:
         """Producto que esta instalación ya creó con esa etiqueta de SKU (publicación idempotente).
         El SKU no prueba propiedad (DF-<id> es local a cada base de datos): también se exigen las etiquetas de
         propiedad (`dropfinder` + `dfi-…`) de ESTA instalación. Si hay un producto con la etiqueta de SKU pero de
-        otra instalación o ajeno, es un conflicto: ni se adopta ni se crea otro."""
+        otra instalación o ajeno, es un conflicto: ni se adopta ni se crea otro. Además se busca por SKU real: un
+        producto del cliente con ese SKU y sin nuestras etiquetas también es conflicto (no se crea un duplicado)."""
+        def conflict(node) -> StoreValidationError:
+            found = sorted({t for t in safe_tags(node.get("tags")) if t.lower().startswith(OWN_TAG_PREFIX)})
+            extra = f" (lleva la etiqueta {', '.join(found)[:80]})" if found else ""
+            return StoreValidationError("Ya existe en la tienda un producto con ese SKU que no creó esta instalación"
+                                        f"{extra}; no se toca ni se duplica (revísalo o cambia su SKU)")
+        want = tag.lower()
         data = self._graphql(Q_FIND_BY_TAG, {"q": f"tag:'{tag}'"})
-        foreign = False
+        foreign = None
         for n in ((data.get("products") or {}).get("nodes")) or []:
-            if not (isinstance(n, dict) and tag in (n.get("tags") or []) and _GID_PRODUCT_RE.fullmatch(str(n.get("id")))):
+            if not (isinstance(n, dict) and _GID_PRODUCT_RE.fullmatch(str(n.get("id")))):
                 continue
-            if tags_match(n.get("tags"), expected_tags):
+            ntags = safe_tags(n.get("tags"))
+            if want not in {t.lower() for t in ntags}:           # Shopify no distingue mayúsculas en las etiquetas
+                continue
+            if tags_match(ntags, expected_tags):
                 return n
-            foreign = True
+            foreign = n
         if foreign:
-            raise StoreValidationError("Ya existe en la tienda un producto con ese SKU que no creó esta instalación; "
-                                       "no se toca ni se duplica (revísalo o cambia su SKU)")
+            raise conflict(foreign)
+        if sku:
+            q = sku.replace("\\", "\\\\").replace("'", "\\'")
+            data = self._graphql(Q_FIND_BY_TAG, {"q": f"sku:'{q}'"})
+            for n in ((data.get("products") or {}).get("nodes")) or []:
+                if not (isinstance(n, dict) and _GID_PRODUCT_RE.fullmatch(str(n.get("id")))):
+                    continue
+                skus = {str(v.get("sku", "")).lower() for v in ((n.get("variants") or {}).get("nodes") or [])
+                        if isinstance(v, dict)}
+                if sku.lower() not in skus:
+                    continue
+                if tags_match(safe_tags(n.get("tags")), expected_tags):
+                    return n
+                raise conflict(n)
         return None
 
     @_foreign_errors
@@ -765,7 +787,7 @@ class ShopifyConnector(StoreConnector):
             m["alt"] = title[:250]
 
         # 2. Adoptar un producto ya creado por un intento anterior, o crearlo
-        existing = self._find_existing(tag, tags[:-1])
+        existing = self._find_existing(tag, tags[:-1], sku)
         adopted = existing is not None
         if adopted:
             prod, gid = existing, existing["id"]
@@ -877,10 +899,12 @@ class ShopifyConnector(StoreConnector):
         node = data.get("product")
         if node is None:
             return                                           # ya no existe: idempotente
-        tags = [str(t).strip().lower() for t in ((node or {}).get("tags") or [])] if isinstance(node, dict) else []
-        if OWN_TAG not in tags or not any(t.startswith(OWN_TAG_PREFIX) and len(t) > len(OWN_TAG_PREFIX) for t in tags):
-            raise StoreValidationError("El producto de la tienda no lleva las etiquetas de DropFinder: no lo creó esta "
-                                       "aplicación y no se borra (bórralo a mano si es lo que quieres)")
+        tags = safe_tags(node.get("tags")) if isinstance(node, dict) else []
+        if not is_owned_by(tags, ref.owner_tag):
+            found = sorted({t for t in tags if t.lower().startswith(OWN_TAG_PREFIX)})
+            extra = f" (lleva {', '.join(found)[:80]}" + (f", no {ref.owner_tag[:40]})" if ref.owner_tag else ")") if found else ""
+            raise StoreValidationError("El producto de la tienda no lleva las etiquetas de DropFinder de esta instalación: "
+                                       f"no lo creó esta aplicación y no se borra{extra} (bórralo a mano si es lo que quieres)")
         try:
             self._mutate(M_PRODUCT_DELETE, "productDelete", {"input": {"id": ref.external_id}}, ref_op=True)
         except StoreNotFound:

@@ -26,6 +26,23 @@ def tags_match(existing, expected) -> bool:
     return bool(want) and want <= have
 
 
+def is_owned_by(existing, owner_tag) -> bool:
+    """¿Un producto de la tienda es de ESTA instalación? Lleva `dropfinder` y la `dfi-<id>` EXACTA `owner_tag`. Si el
+    llamador no sabe cuál es (owner_tag vacía o que no empieza por `dfi-`), nunca es propio: no se borra a ciegas."""
+    tag = str(owner_tag or "").strip().lower()
+    return len(tag) > 4 and tag.startswith("dfi-") and tags_match(existing, ["dropfinder", tag])
+
+
+def safe_tags(value) -> list[str]:
+    """Etiquetas de un producto ajeno como lista de str, aunque la tienda devuelva basura (número, dict, None, mezclas).
+    Una cadena se parte por comas; los elementos que no son str se descartan (nunca TypeError)."""
+    if isinstance(value, str):
+        value = value.split(",")
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [t.strip() for t in value if isinstance(t, str) and t.strip()][:200]
+
+
 def scrub(text, secrets=(), limit: int = 300) -> str:
     """Quita de un mensaje de error todo lo que parezca una credencial (y los valores secretos conocidos) y lo
     acorta. Se aplica a CUALQUIER texto que venga de una tienda antes de guardarlo, registrarlo o mostrarlo."""
@@ -104,6 +121,9 @@ class ListingRef:
     variant_id: str = ""
     inventory_item_id: str = ""
     url: str = ""                           # enlace al producto en la tienda (admin o público)
+    # Etiqueta `dfi-<id>` de ESTA instalación: delete() solo borra un producto que lleve `dropfinder` + esta etiqueta
+    # exacta (sin ella nunca borra: no hay forma de probar que el producto es nuestro).
+    owner_tag: str = ""
 
 
 @dataclass

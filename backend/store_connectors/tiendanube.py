@@ -66,7 +66,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from . import http as shttp, register, scrub
 from .base import (ListingRef, StoreAuthError, StoreConnector, StoreError, StoreInfo, StoreNotFound,
-                   StoreProduct, StoreRateLimited, StoreValidationError, tags_match)
+                   StoreProduct, StoreRateLimited, StoreValidationError, is_owned_by, tags_match)
 
 log = logging.getLogger("dropfinder.tiendanube")
 
@@ -243,10 +243,10 @@ def _parse_tags(value) -> list[str]:
     return [t.strip() for t in value if isinstance(t, str) and t.strip()][:200] if isinstance(value, list) else []
 
 
-def _is_owned(tags) -> bool:
-    """¿Lo creó DropFinder (alguna instalación)? Etiqueta genérica `dropfinder` y alguna `dfi-…`."""
-    low = {t.lower() for t in _parse_tags(tags)}
-    return "dropfinder" in low and any(t.startswith("dfi-") and len(t) > 4 for t in low)
+def _is_owned(tags, owner_tag: str = "") -> bool:
+    """¿Lo creó ESTA instalación de DropFinder? Debe llevar `dropfinder` y la etiqueta `dfi-<id>` exacta de la instalación
+    (`owner_tag`); sin ella nunca es propio (una `dfi-` de otra instalación no basta)."""
+    return is_owned_by(_parse_tags(tags), owner_tag)
 
 
 def _pick_name(name, default: str = "") -> str:
@@ -524,15 +524,17 @@ class TiendanubeConnector(StoreConnector):
         ni se crea encima). 404 / lista vacía / null = no existe."""
         data = self._call("GET", "/products/sku/" + urllib.parse.quote(sku, safe=""), missing="ok")
         cands = data if isinstance(data, list) else [data]
-        foreign = False
+        foreign = None
         for p in cands:
             if isinstance(p, dict) and _as_id(p.get("id")) and self._variant_for(p, sku):
                 if tags_match(_parse_tags(p.get("tags")), tags):
                     return p
-                foreign = True
-        if foreign:
+                foreign = p
+        if foreign is not None:
+            found = sorted({t for t in _parse_tags(foreign.get("tags")) if t.lower().startswith("dfi-")})
+            extra = f" (lleva la etiqueta {', '.join(found)[:80]})" if found else ""
             raise StoreValidationError(
-                f"Ya existe en tu tienda un producto con el SKU {sku} que no creó esta instalación de DropFinder: "
+                f"Ya existe en tu tienda un producto con el SKU {sku} que no creó esta instalación de DropFinder{extra}: "
                 "cámbiale el SKU o bórralo antes de publicar")
         return None
 
@@ -656,9 +658,13 @@ class TiendanubeConnector(StoreConnector):
         self._check_ref(ref)
         try:
             prod = self._call("GET", f"/products/{ref.external_id}", missing="product")
-            if not isinstance(prod, dict) or not _is_owned(prod.get("tags")):
-                raise StoreValidationError("No se borra: ese producto de la tienda no lleva las etiquetas de DropFinder "
-                                           "(no lo creó DropFinder). Bórralo a mano en Tiendanube si de verdad quieres quitarlo")
+            if not isinstance(prod, dict) or not _is_owned(prod.get("tags"), ref.owner_tag):
+                found = sorted({t for t in _parse_tags(prod.get("tags") if isinstance(prod, dict) else None)
+                                if t.lower().startswith("dfi-")})
+                extra = f" (lleva {', '.join(found)[:80]}" + (f", no {ref.owner_tag[:40]})" if ref.owner_tag else ")") if found else ""
+                raise StoreValidationError("No se borra: ese producto de la tienda no lleva las etiquetas de DropFinder de "
+                                           f"esta instalación (no lo creó esta aplicación){extra}. Bórralo a mano en "
+                                           "Tiendanube si de verdad quieres quitarlo")
             self._call("DELETE", f"/products/{ref.external_id}", missing="product")
         except StoreNotFound:
             return
