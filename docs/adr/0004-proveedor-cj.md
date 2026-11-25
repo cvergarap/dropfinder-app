@@ -80,6 +80,23 @@ base. Desconectar borra la fila y olvida los tokens, **no** borra los productos 
 - La interfaz de importación no se probó en un navegador real (no hay Playwright en este entorno): solo funciones puras (Node) y la
   API de punta a punta con el servidor real.
 
+## Cambios tras la revisión independiente (PR #22)
+- `validate()` ya no borra el token en caché (si `getAccessToken` daba 429 se bloqueaba todo ~5 min): valida con una lectura; se pide
+  token nuevo solo con una clave nueva.
+- **Stock desconocido ≠ 0** también en la importación: solo un número real cuenta como existencias (`parse_stock`); un producto
+  nuevo sin dato de stock **no se importa** (se cuenta `stock_unknown`/`unknown_skipped` y se avisa) y uno ya importado conserva
+  su stock y almacén (sin alerta falsa de «sin stock»).
+- Monitor: orden `nunca revisados, luego más viejos primero` (sin starvation con el tope de 40); un error inesperado en un
+  producto no tumba el monitor; el plazo por producto se acota a la mitad del presupuesto restante.
+- Paginación: sigue mientras la página venga llena, no haya total o el total diga que faltan; avisa en `warnings` si se corta
+  antes del tope pedido.
+- Envío no informado: sin columna nueva, se **deriva** (`source='api'`, proveedor CJ, envío 0 y 15 días = valores por defecto):
+  `shipping_known=false` en la API de productos; no compite por «más barato/más rápido» ni por los mejores del comparador, la UI
+  dice «envío no informado» y el promedio de envío del proveedor lo ignora. Limitación: un producto de CJ con envío real de
+  exactamente 0 y 15 días se vería como no informado. El nombre mostrado sigue siendo «CJ Dropshipping» (la clave `supplier` es
+  la misma que la de la demo; se distingue por Origen): no se cambió la presentación.
+- Candados: uno por clave para la E/S del token (el global solo en secciones cortas); `_pace` no reserva hueco si desiste por plazo.
+
 ## Lo que NO se verificó contra la API real (resumen; detalle en `cj.py` y el README)
 Rutas y métodos; nombres de parámetros (`pageNum`, `pageSize`, `productNameEn`, `categoryId`, `pid`); formato del sobre
 `{code, result, message, data}`; cuerpo y respuesta de `getAccessToken`/`refreshAccessToken` y formato de las fechas de caducidad;

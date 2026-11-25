@@ -1324,8 +1324,11 @@ class ReviewModuleTest(ModBase):
         self.fake.requests.clear()
         server.run_monitor(user_id=1)
         asked = [r["qs"]["pid"] for r in self.fake.requests_for("detail")]
+        with db.connect() as conn:
+            sku = dict(conn.execute("SELECT id, supplier_sku FROM products WHERE source = 'api'").fetchall())
+        # los más viejos primero: los 5 revisados «más recientemente» (2001) quedan fuera del tope de 40, no los de id alto
+        self.assertEqual(set(asked), {sku[i] for i in ids[5:45]})
         self.assertEqual(len(asked), cj_mod.MONITOR_MAX_PRODUCTS)
-        self.assertEqual(asked[:1] and len(set(asked)), cj_mod.MONITOR_MAX_PRODUCTS)
 
     def test_monitor_survives_hostile_values_and_unexpected_exceptions(self):
         from unittest import mock
